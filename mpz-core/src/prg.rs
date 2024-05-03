@@ -1,32 +1,42 @@
 //! Implement AES-based PRG.
 
+use std::collections::HashMap;
+
 use crate::{aes::AesEncryptor, Block};
 use rand::Rng;
 use rand_core::{
     block::{BlockRng, BlockRngCore},
     CryptoRng, RngCore, SeedableRng,
 };
+
 /// Struct of PRG Core
 #[derive(Clone)]
 struct PrgCore {
     aes: AesEncryptor,
-    state: u64,
+    // Stores the counter for each stream id.
+    state: HashMap<u64, u64>,
+    stream_id: u64,
+    counter: u64,
 }
 
-// This implementation is somehow standard, and is adapted from Swanky.
 impl BlockRngCore for PrgCore {
     type Item = u32;
     type Results = [u32; 4 * AesEncryptor::AES_BLOCK_COUNT];
 
-    // Compute [AES(state)..AES(state+8)]
+    // Compute 8 encrypted counter blocks at a time.
     #[inline(always)]
     fn generate(&mut self, results: &mut Self::Results) {
         let mut states = [0; AesEncryptor::AES_BLOCK_COUNT].map(
             #[inline(always)]
             |_| {
-                let x = self.state;
-                self.state += 1;
-                Block::from(bytemuck::cast::<_, [u8; 16]>([x, 0u64]))
+                let mut block = [0u8; 16];
+                let counter = self.counter;
+                self.counter += 1;
+
+                block[..8].copy_from_slice(&counter.to_le_bytes());
+                block[8..].copy_from_slice(&self.stream_id.to_le_bytes());
+
+                Block::from(block)
             },
         );
         self.aes.encrypt_many_blocks(&mut states);
@@ -40,13 +50,24 @@ impl SeedableRng for PrgCore {
     #[inline(always)]
     fn from_seed(seed: Self::Seed) -> Self {
         let aes = AesEncryptor::new(seed);
-        Self { aes, state: 0u64 }
+        Self {
+            aes,
+            state: Default::default(),
+            stream_id: 0u64,
+            counter: 0u64,
+        }
     }
 }
 
 impl CryptoRng for PrgCore {}
 
-/// Struct of PRG
+/// AES-based PRG.
+///
+/// This PRG is based on AES128 used in counter-mode to generate pseudo-random data streams.
+///
+/// # Stream ID
+///
+/// The PRG is configurable with a stream ID, which can be used to generate distinct streams using the same seed. See [`Prg::set_stream_id`].
 #[derive(Clone)]
 pub struct Prg(BlockRng<PrgCore>);
 
@@ -92,8 +113,28 @@ impl Prg {
     /// New Prg with random seed.
     #[inline(always)]
     pub fn new() -> Self {
-        let seed = rand::random::<Block>();
-        Prg::from_seed(seed)
+        Prg::from_seed(rand::random::<Block>())
+    }
+
+    /// Returns the current counter.
+    pub fn counter(&self) -> u64 {
+        self.0.core.counter
+    }
+
+    /// Returns the stream id.
+    pub fn stream_id(&self) -> u64 {
+        self.0.core.stream_id
+    }
+
+    /// Sets the stream id.
+    pub fn set_stream_id(&mut self, stream_id: u64) {
+        let state = &mut self.0.core.state;
+        state.insert(self.0.core.stream_id, self.0.core.counter);
+
+        let counter = state.get(&stream_id).copied().unwrap_or(0);
+
+        self.0.core.stream_id = stream_id;
+        self.0.core.counter = counter;
     }
 
     /// Generate a random bool value.
@@ -141,10 +182,43 @@ impl Default for Prg {
     }
 }
 
-#[test]
-fn prg_test() {
-    let mut prg = Prg::new();
-    let mut x = vec![Block::ZERO; 2];
-    prg.random_blocks(&mut x);
-    assert_ne!(x[0], x[1]);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prg_ne() {
+        let mut prg = Prg::new();
+        let mut x = vec![Block::ZERO; 2];
+        prg.random_blocks(&mut x);
+        assert_ne!(x[0], x[1]);
+    }
+
+    #[test]
+    fn test_prg_streams_are_distinct() {
+        let mut prg = Prg::from_seed(Block::ZERO);
+        let mut x = vec![Block::ZERO; 2];
+        prg.random_blocks(&mut x);
+
+        let mut y = vec![Block::ZERO; 2];
+        prg.set_stream_id(1);
+        prg.random_blocks(&mut y);
+
+        assert_ne!(x[0], y[0]);
+    }
+
+    #[test]
+    fn test_prg_state_persisted() {
+        let mut prg = Prg::from_seed(Block::ZERO);
+        let mut x = vec![Block::ZERO; 2];
+        prg.random_blocks(&mut x);
+
+        let counter = prg.counter();
+        assert_ne!(counter, 0);
+
+        prg.set_stream_id(1);
+        prg.set_stream_id(0);
+
+        assert_eq!(prg.counter(), counter);
+    }
 }
