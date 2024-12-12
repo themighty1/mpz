@@ -48,7 +48,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Contributors
 
 - [TLSNotary](https://github.com/tlsnotary)
-- [PADO Labs](https://github.com/pado-labs)
+- [Primus (formerly "PADO")](https://github.com/primus-labs)
 
 
 ### Pronunciation
