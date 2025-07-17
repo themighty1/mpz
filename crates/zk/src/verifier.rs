@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use blake3::Hasher;
 use mpz_common::{Context, Flush};
@@ -13,21 +15,22 @@ use mpz_vm_core::{
 };
 use mpz_zk_core::{Verifier as Core, VerifierError, store::VerifierStore};
 use serio::stream::IoStreamExt;
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub struct Verifier<OT> {
     store: VerifierStore,
-    ot: OT,
+    ot: Arc<Mutex<OT>>,
     callstack: Vec<(Call, Slice)>,
     transcript: Hasher,
 }
 
 impl<OT> Verifier<OT> {
-    /// Creates a new prover.
+    /// Creates a new verifier.
     pub fn new(delta: Delta, ot: OT) -> Self {
         Self {
             store: VerifierStore::new(delta),
-            ot,
+            ot: Arc::new(Mutex::new(ot)),
             callstack: Vec::default(),
             transcript: Hasher::default(),
         }
@@ -47,6 +50,12 @@ impl<OT> Verifier<OT> {
 
         Ok(keys)
     }
+
+    /// Returns a handle on the OT.
+    /// TODO: we need to put this method behind a feature flag.
+    pub fn ot(&self) -> Arc<Mutex<OT>> {
+        Arc::clone(&self.ot)
+    }
 }
 
 #[async_trait]
@@ -55,17 +64,26 @@ where
     OT: RCOTSender<Block> + Flush + Send + 'static,
 {
     fn wants_flush(&self) -> bool {
-        self.ot.wants_flush() || self.store.wants_keys() || self.store.wants_flush()
+        self.ot.try_lock().expect("OT is not locked").wants_flush()
+            || self.store.wants_keys()
+            || self.store.wants_flush()
     }
 
     async fn flush(&mut self, ctx: &mut Context) -> VmResult<()> {
-        if self.ot.wants_flush() {
-            self.ot.flush(ctx).await.map_err(VmError::execute)?;
+        if self.ot.try_lock().expect("OT is not locked").wants_flush() {
+            self.ot
+                .try_lock()
+                .expect("OT is not locked")
+                .flush(ctx)
+                .await
+                .map_err(VmError::execute)?;
         }
 
         if self.store.wants_keys() {
             let RCOTSenderOutput { keys, .. } = self
                 .ot
+                .try_lock()
+                .expect("OT is not locked")
                 .try_send_rcot(self.store.key_count())
                 .map_err(VmError::execute)?;
             let keys = Key::from_blocks(keys);
@@ -134,6 +152,8 @@ where
                     keys: gate_keys, ..
                 } = self
                     .ot
+                    .try_lock()
+                    .expect("OT is not locked")
                     .try_send_rcot(circ.and_count())
                     .map_err(VmError::execute)?;
                 let gate_keys = Key::from_blocks(gate_keys);
@@ -177,7 +197,12 @@ where
         if verifier.wants_check() {
             let RCOTSenderOutput {
                 keys: svole_keys, ..
-            } = self.ot.try_send_rcot(128).map_err(VmError::execute)?;
+            } = self
+                .ot
+                .try_lock()
+                .expect("OT is not locked")
+                .try_send_rcot(128)
+                .map_err(VmError::execute)?;
 
             let uv = ctx.io_mut().expect_next().await?;
             verifier
@@ -203,7 +228,11 @@ where
                 count += 128
             }
 
-            self.ot.alloc(count).map_err(VmError::execute)?;
+            self.ot
+                .try_lock()
+                .expect("OT is not locked")
+                .alloc(count)
+                .map_err(VmError::execute)?;
         }
 
         self.callstack.push((call, output));
@@ -269,7 +298,11 @@ where
 
     fn mark_blind_raw(&mut self, slice: Slice) -> VmResult<()> {
         self.store.mark_blind_raw(slice).map_err(VmError::view)?;
-        self.ot.alloc(slice.len()).map_err(VmError::view)?;
+        self.ot
+            .try_lock()
+            .expect("OT is not locked")
+            .alloc(slice.len())
+            .map_err(VmError::view)?;
 
         Ok(())
     }

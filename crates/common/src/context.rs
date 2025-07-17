@@ -254,6 +254,7 @@ impl ContextError {
 pub(crate) enum ErrorKind {
     Mux,
     Thread,
+    Other,
 }
 
 impl fmt::Display for ErrorKind {
@@ -261,6 +262,7 @@ impl fmt::Display for ErrorKind {
         match self {
             ErrorKind::Mux => write!(f, "multiplexer error"),
             ErrorKind::Thread => write!(f, "thread error"),
+            ErrorKind::Other => write!(f, "other error"),
         }
     }
 }

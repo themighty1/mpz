@@ -21,10 +21,11 @@ pub(crate) struct MtConfig {
     concurrency: usize,
 }
 
-/// A multi-threaded context.
+/// A multi-threaded context provider.
 #[derive(Debug)]
 pub struct Multithread {
-    current_id: ThreadId,
+    /// The id to be assigned to the new context.
+    next_id: u8,
     config: Arc<MtConfig>,
     builder: Arc<Mutex<ThreadBuilder>>,
 }
@@ -37,18 +38,24 @@ impl Multithread {
 
     /// Creates a new multi-threaded context.
     pub async fn new_context(&mut self) -> Result<Context, ContextError> {
-        let id = self.current_id.increment().ok_or_else(|| {
-            ContextError::new(ErrorKind::Thread, "thread ID overflow".to_string())
+        let id = self.next_id;
+
+        self.next_id = id.checked_add(1).ok_or_else(|| {
+            ContextError::new(ErrorKind::Other, "context ID overflow".to_string())
         })?;
 
-        let io_fut = { self.builder.lock().unwrap().mux.open(id.clone()) };
+        // The first segment of the thread id contains the context id. This
+        // ensures that thread ids are unique even across different contexts.
+        let thread_id = ThreadId::new_from_bytes(vec![id, 0]);
+
+        let io_fut = { self.builder.lock().unwrap().mux.open(thread_id.clone()) };
 
         let io = io_fut
             .await
             .map_err(|e| ContextError::new(ErrorKind::Mux, e))?;
 
         let ctx =
-            Context::new_multi_threaded(id.clone(), io, self.config.clone(), self.builder.clone());
+            Context::new_multi_threaded(thread_id, io, self.config.clone(), self.builder.clone());
 
         Ok(ctx)
     }
