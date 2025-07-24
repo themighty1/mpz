@@ -50,7 +50,7 @@ where
         };
 
         Ok(Multithread {
-            current_id: ThreadId::default(),
+            next_id: Default::default(),
             config: Arc::new(MtConfig {
                 concurrency: self.concurrency,
             }),

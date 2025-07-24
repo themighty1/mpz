@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use blake3::Hasher;
 use mpz_common::{Context, Flush};
@@ -9,11 +11,12 @@ use mpz_vm_core::{
 };
 use mpz_zk_core::{Prover as Core, ProverError, store::ProverStore};
 use serio::SinkExt;
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub struct Prover<OT> {
     store: ProverStore,
-    ot: OT,
+    ot: Arc<Mutex<OT>>,
     callstack: Vec<(Call, Slice)>,
     transcript: Hasher,
 }
@@ -23,7 +26,7 @@ impl<OT> Prover<OT> {
     pub fn new(ot: OT) -> Self {
         Self {
             store: ProverStore::new(),
-            ot,
+            ot: Arc::new(Mutex::new(ot)),
             callstack: Vec::default(),
             transcript: Hasher::default(),
         }
@@ -43,6 +46,12 @@ impl<OT> Prover<OT> {
 
         Ok(macs)
     }
+
+    /// Returns a handle on the OT.
+    /// TODO: we need to put this method behind a feature flag.
+    pub fn ot(&self) -> Arc<Mutex<OT>> {
+        Arc::clone(&self.ot)
+    }
 }
 
 #[async_trait]
@@ -51,12 +60,19 @@ where
     OT: RCOTReceiver<bool, Block> + Flush + Send + 'static,
 {
     fn wants_flush(&self) -> bool {
-        self.ot.wants_flush() || self.store.wants_macs() || self.store.wants_flush()
+        self.ot.try_lock().expect("OT is not locked").wants_flush()
+            || self.store.wants_macs()
+            || self.store.wants_flush()
     }
 
     async fn flush(&mut self, ctx: &mut Context) -> VmResult<()> {
-        if self.ot.wants_flush() {
-            self.ot.flush(ctx).await.map_err(VmError::execute)?;
+        if self.ot.try_lock().expect("OT is not locked").wants_flush() {
+            self.ot
+                .try_lock()
+                .expect("OT is not locked")
+                .flush(ctx)
+                .await
+                .map_err(VmError::execute)?;
         }
 
         if self.store.wants_macs() {
@@ -66,6 +82,8 @@ where
                 ..
             } = self
                 .ot
+                .try_lock()
+                .expect("OT is not locked")
                 .try_recv_rcot(self.store.mac_count())
                 .map_err(VmError::execute)?;
             let masks = BitVec::from_iter(masks);
@@ -140,6 +158,8 @@ where
                     ..
                 } = self
                     .ot
+                    .try_lock()
+                    .expect("OT is not locked")
                     .try_recv_rcot(circ.and_count())
                     .map_err(VmError::execute)?;
                 let gate_macs = Mac::from_blocks(gate_macs);
@@ -189,7 +209,12 @@ where
                 choices: svole_choices,
                 msgs: svole_ev,
                 ..
-            } = self.ot.try_recv_rcot(128).map_err(VmError::execute)?;
+            } = self
+                .ot
+                .try_lock()
+                .expect("OT is not locked")
+                .try_recv_rcot(128)
+                .map_err(VmError::execute)?;
 
             let uv = prover
                 .check(&mut self.transcript, &svole_choices, &svole_ev)
@@ -215,7 +240,11 @@ where
                 count += 128
             }
 
-            self.ot.alloc(count).map_err(VmError::execute)?;
+            self.ot
+                .try_lock()
+                .expect("OT is not locked")
+                .alloc(count)
+                .map_err(VmError::execute)?;
         }
 
         self.callstack.push((call, output));
@@ -276,7 +305,11 @@ where
     fn mark_private_raw(&mut self, slice: Slice) -> VmResult<()> {
         self.store.mark_private_raw(slice).map_err(VmError::view)?;
 
-        self.ot.alloc(slice.len()).map_err(VmError::view)?;
+        self.ot
+            .try_lock()
+            .expect("OT is not locked")
+            .alloc(slice.len())
+            .map_err(VmError::view)?;
 
         Ok(())
     }

@@ -20,6 +20,12 @@ impl ThreadId {
         Self(vec![id].into())
     }
 
+    /// Creates a new thread ID from the provided bytes.
+    #[inline]
+    pub fn new_from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes.into())
+    }
+
     /// Returns the thread ID as a byte slice.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
