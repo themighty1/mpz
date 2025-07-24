@@ -124,6 +124,7 @@ where
 
     async fn execute(&mut self, ctx: &mut Context) -> VmResult<()> {
         let mut prover = Core::default();
+
         while !self.callstack.is_empty() {
             let ready_calls: Vec<_> = self
                 .callstack
@@ -165,7 +166,13 @@ where
                 let gate_macs = Mac::from_blocks(gate_macs);
 
                 let execute = prover
-                    .execute(circ, &input_macs, &gate_masks, &gate_macs)
+                    .execute(
+                        circ,
+                        input_macs,
+                        gate_masks,
+                        gate_macs,
+                        self.transcript.clone(),
+                    )
                     .map_err(VmError::execute)?;
                 tasks.push((execute, output));
             }
@@ -176,7 +183,8 @@ where
                     async move |ctx, (mut execute, output)| {
                         let mut iter = execute.iter();
                         loop {
-                            // Stream the `adjust` bits to avoid buffering them in memory.
+                            // Stream the `adjust` bits to avoid buffering them in
+                            // memory.
                             let adjust: BitVec = BitVec::from_iter(iter.by_ref().take(8000));
 
                             if !adjust.is_empty() {
@@ -213,11 +221,11 @@ where
                 .ot
                 .try_lock()
                 .expect("OT is not locked")
-                .try_recv_rcot(128)
+                .try_recv_rcot(prover.total_circuits() * 128)
                 .map_err(VmError::execute)?;
 
             let uv = prover
-                .check(&mut self.transcript, &svole_choices, &svole_ev)
+                .check(&svole_choices, &svole_ev)
                 .map_err(VmError::execute)?;
             ctx.io_mut().send(uv).await?;
         }
@@ -235,10 +243,8 @@ where
 
         let mut count = call.circ().and_count();
         if count > 0 {
-            // If the callstack is empty, we allocate more for the consistency check.
-            if self.callstack.is_empty() {
-                count += 128
-            }
+            // Allocate for the consistency check of this circuit.
+            count += 128;
 
             self.ot
                 .try_lock()
