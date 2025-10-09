@@ -169,48 +169,37 @@ where
     /// Evaluates the next encrypted gate in the circuit.
     #[inline]
     pub fn next(&mut self, encrypted_gate: EncryptedGate) {
-        while let Some(gate) = self.gates.next() {
+        let labels = &mut self.labels;
+        let gates = &mut self.gates;
+        while let Some(gate) = gates.next() {
             match gate {
-                Gate::Xor {
-                    x: node_x,
-                    y: node_y,
-                    z: node_z,
-                } => {
-                    let x = self.labels[node_x.id()];
-                    let y = self.labels[node_y.id()];
-                    self.labels[node_z.id()] = x ^ y;
+                Gate::Xor { x, y, z } => {
+                    let x_label = labels[x.id()];
+                    let y_label = labels[y.id()];
+                    labels[z.id()] = x_label ^ y_label;
                 }
-                Gate::And {
-                    x: node_x,
-                    y: node_y,
-                    z: node_z,
-                } => {
-                    let x = self.labels[node_x.id()];
-                    let y = self.labels[node_y.id()];
-                    let z = and_gate(self.cipher, &x, &y, &encrypted_gate, self.gid);
-                    self.labels[node_z.id()] = z;
+                Gate::And { x, y, z } => {
+                    let x_label = labels[x.id()];
+                    let y_label = labels[y.id()];
+                    let z_label =
+                        and_gate(self.cipher, &x_label, &y_label, &encrypted_gate, self.gid);
+                    labels[z.id()] = z_label;
 
                     self.gid += 2;
                     self.counter += 1;
 
                     // If we have more AND gates to evaluate, return.
-                    if self.wants_gates() {
+                    if self.counter != self.and_count {
                         return;
                     }
                 }
-                Gate::Inv {
-                    x: node_x,
-                    z: node_z,
-                } => {
-                    let x = self.labels[node_x.id()];
-                    self.labels[node_z.id()] = x;
+                Gate::Inv { x, z } => {
+                    let x_label = labels[x.id()];
+                    labels[z.id()] = x_label;
                 }
-                Gate::Id {
-                    x: node_x,
-                    z: node_z,
-                } => {
-                    let x = self.labels[node_x.id()];
-                    self.labels[node_z.id()] = x;
+                Gate::Id { x, z } => {
+                    let x = labels[x.id()];
+                    labels[z.id()] = x;
                 }
             }
         }

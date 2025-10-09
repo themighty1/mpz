@@ -13,7 +13,7 @@ use std::{
 };
 
 /// A block of 128 bits
-#[repr(transparent)]
+#[repr(C, align(16))]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Serialize, Deserialize, Pod, Zeroable)]
 pub struct Block([u8; 16]);
 
