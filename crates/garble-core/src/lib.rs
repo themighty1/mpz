@@ -52,13 +52,14 @@ mod tests {
     use crate::evaluator::evaluate_garbled_circuits;
 
     use super::*;
+    use mpz_core::aes::FixedKeyAes;
 
     #[test]
     fn test_and_gate() {
         use crate::{evaluator as ev, garbler as gb};
 
         let mut rng = ChaCha12Rng::seed_from_u64(0);
-        let cipher = &(*FIXED_KEY_AES);
+        let mut cipher = FixedKeyAes::new([1u8; 16]);
 
         let delta = Delta::random(&mut rng);
         let x_0 = Block::random(&mut rng);
@@ -67,13 +68,25 @@ mod tests {
         let y_1 = y_0 ^ delta.as_block();
         let gid: usize = 1;
 
-        let (z_0, encrypted_gate) = gb::and_gate(cipher, &x_0, &y_0, &delta, gid);
+        let (z_0, encrypted_gate) = gb::and_gate(&mut cipher, &x_0, &y_0, &delta, gid);
         let z_1 = z_0 ^ delta.as_block();
 
-        assert_eq!(ev::and_gate(cipher, &x_0, &y_0, &encrypted_gate, gid), z_0);
-        assert_eq!(ev::and_gate(cipher, &x_0, &y_1, &encrypted_gate, gid), z_0);
-        assert_eq!(ev::and_gate(cipher, &x_1, &y_0, &encrypted_gate, gid), z_0);
-        assert_eq!(ev::and_gate(cipher, &x_1, &y_1, &encrypted_gate, gid), z_1);
+        assert_eq!(
+            ev::and_gate(&mut cipher, &x_0, &y_0, &encrypted_gate, gid),
+            z_0
+        );
+        assert_eq!(
+            ev::and_gate(&mut cipher, &x_0, &y_1, &encrypted_gate, gid),
+            z_0
+        );
+        assert_eq!(
+            ev::and_gate(&mut cipher, &x_1, &y_0, &encrypted_gate, gid),
+            z_0
+        );
+        assert_eq!(
+            ev::and_gate(&mut cipher, &x_1, &y_1, &encrypted_gate, gid),
+            z_1
+        );
     }
 
     #[test]

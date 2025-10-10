@@ -38,7 +38,7 @@ pub(crate) fn and_gate(
     let k = Block::new(((gid + 1) as u128).to_be_bytes());
 
     let mut h = [*x_0, *y_0, x_1, y_1];
-    cipher.tccr_many(&[j, k, j, k], &mut h);
+    cipher.tccr_many_mi(&[j, k, j, k], &mut h);
 
     let [hx_0, hy_0, hx_1, hy_1] = h;
 

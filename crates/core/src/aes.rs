@@ -14,12 +14,15 @@ pub const FIXED_KEY: [u8; 16] = [
 /// Fixed-key AES cipher
 pub static FIXED_KEY_AES: Lazy<FixedKeyAes> = Lazy::new(|| FixedKeyAes {
     aes: Aes128Enc::new_from_slice(&FIXED_KEY).unwrap(),
+    aes1: Aes128Enc::new_from_slice(&FIXED_KEY).unwrap(),
+    hasher: blake3::Hasher::new(),
 });
 
 /// Fixed-key AES cipher
 pub struct FixedKeyAes {
     aes: Aes128Enc,
 }
+use blake3::{self, hazmat::HasherExt};
 
 impl FixedKeyAes {
     /// Create a fixed-key AES cipher with a given key.
@@ -27,6 +30,69 @@ impl FixedKeyAes {
         Self {
             aes: Aes128Enc::new(&key.into()),
         }
+    }
+
+    /// Multi-instance TCCR hash. See https://eprint.iacr.org/2019/1168
+    /// (Section 4.2)
+    ///
+    /// E(i, σ(x)) ⊕ σ(x), where E is AES modelled as an ideal cipher.
+    #[inline]
+    pub fn tccr_many_mi<const N: usize>(&self, tweaks: &[Block; N], blocks: &mut [Block; N]) {
+        // TODO: since we know that we only use 2 distinct tweaks in garbling, we
+        // one need 2 AES instances.
+
+        let aes0 = Aes128Enc::new(&tweaks[0].to_bytes().into());
+        let aes1 = Aes128Enc::new(&tweaks[1].to_bytes().into());
+
+        // sigmas for blocks with even indices 0, 2, etc
+        let mut sigmas_even = blocks
+            .iter_mut()
+            .step_by(2)
+            .map(|b| Block::sigma(*b))
+            .collect::<Vec<_>>();
+
+        // sigmas for blocks with even indices 1, 3 etc
+        let mut sigmas_odd = blocks
+            .iter_mut()
+            .skip(1)
+            .step_by(2)
+            .map(|b| Block::sigma(*b))
+            .collect::<Vec<_>>();
+
+        let h_even: Vec<Block> = sigmas_even.clone();
+        let h_odd: Vec<Block> = sigmas_odd.clone();
+
+        // Encrypt potentially multiple messages in one call.
+        aes0.encrypt_blocks(Block::as_array_mut_slice(&mut sigmas_even));
+        aes1.encrypt_blocks(Block::as_array_mut_slice(&mut sigmas_odd));
+
+        blocks
+            .iter_mut()
+            .step_by(2)
+            .zip(sigmas_even.iter())
+            .zip(h_even.iter())
+            .for_each(|((block, sigma), h)| *block = sigma ^ h);
+
+        blocks
+            .iter_mut()
+            .skip(1)
+            .step_by(2)
+            .zip(sigmas_odd.iter())
+            .zip(h_odd.iter())
+            .for_each(|((block, sigma), h)| *block = sigma ^ h);
+    }
+
+    /// Use blake3 to hash.
+    #[inline]
+    pub fn hash_many_blake<const N: usize>(&self, tweaks: &[Block; N], blocks: &mut [Block; N]) {
+        let mut input = [0u8; 32];
+        blocks.iter_mut().zip(tweaks).for_each(|(block, tweak)| {
+            input[0..16].copy_from_slice(block.as_bytes());
+            input[16..32].copy_from_slice(tweak.as_bytes());
+
+            let hash = blake3::hash(&input);
+            *block = Block::new(hash.as_bytes()[0..16].try_into().unwrap());
+        });
     }
 
     /// Tweakable circular correlation-robust hash function instantiated
@@ -37,6 +103,12 @@ impl FixedKeyAes {
     /// `π(π(x) ⊕ i) ⊕ π(x)`, where `π` is instantiated using fixed-key AES.
     #[inline]
     pub fn tccr(&self, tweak: Block, block: Block) -> Block {
+        // let mut buf = [0u8; 32];
+        // buf[0..16].copy_from_slice(tweak.as_bytes());
+        // buf[16..32].copy_from_slice(block.as_bytes());
+        // let hash = blake3::hash(&buf);
+        // Block::new(hash.as_bytes()[0..16].try_into().unwrap())
+
         let mut h1 = block;
         self.aes.encrypt_block(h1.as_array_mut());
 
