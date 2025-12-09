@@ -77,7 +77,8 @@ where
 
     /// Returns `true` if the receiver wants to bootstrap.
     pub fn wants_bootstrap(&self) -> bool {
-        self.macs.len() < self.config.bootstrap_cost()
+        // The necessary amount of MACs for an iteration was manually set.
+        false
     }
 
     /// Returns `true` if the receiver wants to extend.
@@ -292,6 +293,12 @@ where
                 choices,
             });
         }
+    }
+
+    /// Sets choices and MACs.
+    pub fn set_choices_and_macs(&mut self, choices: Vec<bool>, macs: Vec<Block>) {
+        self.choices = choices;
+        self.macs = macs;
     }
 }
 

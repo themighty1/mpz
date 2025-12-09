@@ -78,7 +78,8 @@ where
 
     /// Returns `true` if the sender wants to bootstrap.
     pub fn wants_bootstrap(&self) -> bool {
-        self.keys.len() < self.config.bootstrap_cost()
+        // The necessary amount of keys for an iteration was manually set.
+        false
     }
 
     /// Returns `true` if the sender wants to extend.
@@ -264,6 +265,11 @@ where
 
             next.sender.send(RCOTSenderOutput { id, keys });
         }
+    }
+
+    /// Sets keys.
+    pub fn set_keys(&mut self, keys: Vec<Block>) {
+        self.keys = keys;
     }
 }
 
