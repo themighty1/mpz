@@ -42,6 +42,7 @@
 pub mod matrices;
 pub mod control;
 pub mod slicing;
+pub mod garbling;
 
 #[cfg(test)]
 mod tests;
