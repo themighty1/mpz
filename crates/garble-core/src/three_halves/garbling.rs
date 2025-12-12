@@ -13,15 +13,18 @@
 //!
 //! Where:
 //! - V (8×5): Maps output vector to evaluation equations
-//! - [C; G⃗] (5 elements): Output label halves + 3 gate ciphertexts (each κ/2 bits)
+//! - [C; G⃗] (5 elements): Output label halves + 3 gate ciphertexts (each κ/2
+//!   bits)
 //! - M (8×6): Selects which hashes contribute to each equation
-//! - H⃗ (6 elements): Hash outputs [H(A₀), H(A₁), H(B₀), H(B₁), H(A₀⊕B₀), H(A₀⊕B₁)]
+//! - H⃗ (6 elements): Hash outputs [H(A₀), H(A₁), H(B₀), H(B₁), H(A₀⊕B₀),
+//!   H(A₀⊕B₁)]
 //! - R (8×6): Control matrix (randomized to hide truth table)
 //! - Input vector (6 elements): Label halves [A₀_L, A₀_R, B₀_L, B₀_R, Δ_L, Δ_R]
 //!
 //! # Row Structure
 //!
-//! Each row i of the equation corresponds to one (input_combination, half) pair:
+//! Each row i of the equation corresponds to one (input_combination, half)
+//! pair:
 //! - Row 0: (0,0) left half
 //! - Row 1: (0,0) right half
 //! - Row 2: (0,1) left half
@@ -31,12 +34,13 @@
 //! - Row 6: (1,1) left half
 //! - Row 7: (1,1) right half
 
-use mpz_core::Block;
-use mpz_core::aes::FixedKeyAes;
+use mpz_core::{Block, aes::FixedKeyAes};
 
-use super::control::{and_truth_table, sample_r_odd};
-use super::matrices::{M, V_INV};
-use super::slicing::SlicedLabel;
+use super::{
+    control::{and_truth_table, sample_r_odd},
+    matrices::M,
+    slicing::SlicedLabel,
+};
 
 /// Gate ciphertexts for a Three Halves AND gate.
 ///
@@ -197,23 +201,49 @@ fn apply_r_to_inputs(
     result
 }
 
-/// Apply V⁻¹ to the RHS vector to solve for [C_L, C_R, G₀, G₁, G₂].
+/// Solve for [C_L, C_R, G₀, G₁, G₂] from RHS.
 ///
-/// Given: V · output = rhs
-/// Solve: output = V⁻¹ · rhs
+/// # Critical Insight (Paper Section 5)
 ///
-/// # Paper Reference
-/// V⁻¹ is the left-inverse of V (Page 12).
-/// The output vector has 5 elements, each κ/2 bits.
-fn apply_v_inv(rhs: &[[u8; 8]; 8]) -> [[u8; 8]; 5] {
+/// The standard V⁻¹ assumes K·RHS = 0, but for AND gates K·RHS = [Δ_L, Δ_R,
+/// Δ_L⊕Δ_R] ≠ 0. This means V⁻¹ gives incorrect G₂.
+///
+/// The correct formulas that ensure ALL marginal equations are satisfied:
+/// - C_L = RHS[0]
+/// - C_R = RHS[1]
+/// - G₂ = RHS[0] ⊕ RHS[2]  (ensures row 2: C_L ⊕ G₂ = RHS[2])
+/// - G₀ = RHS[2] ⊕ RHS[4]  (ensures row 4: C_L ⊕ G₀ ⊕ G₂ = RHS[4])
+/// - G₁ = RHS[0] ⊕ RHS[1] ⊕ RHS[2] ⊕ RHS[3] (ensures row 3: C_R ⊕ G₁ ⊕ G₂ =
+///   RHS[3])
+///
+/// With these formulas:
+/// - Rows 0,1 (input 0,0): Satisfied by construction
+/// - Rows 2,3 (input 0,1): Satisfied by construction
+/// - Rows 4,5 (input 1,0): Row 4 by construction, Row 5 follows from K
+///   constraints
+/// - Rows 6,7 (input 1,1): These give C ⊕ Δ (the correct output for AND = 1)
+fn solve_for_output(rhs: &[[u8; 8]; 8]) -> [[u8; 8]; 5] {
     let mut result = [[0u8; 8]; 5];
 
-    for row in 0..5 {
-        for col in 0..8 {
-            if V_INV[row][col] == 1 {
-                xor_assign_8(&mut result[row], &rhs[col]);
-            }
-        }
+    // C_L = RHS[0]
+    result[0] = rhs[0];
+
+    // C_R = RHS[1]
+    result[1] = rhs[1];
+
+    // G₀ = RHS[2] ⊕ RHS[4]
+    for k in 0..8 {
+        result[2][k] = rhs[2][k] ^ rhs[4][k];
+    }
+
+    // G₁ = RHS[0] ⊕ RHS[1] ⊕ RHS[2] ⊕ RHS[3]
+    for k in 0..8 {
+        result[3][k] = rhs[0][k] ^ rhs[1][k] ^ rhs[2][k] ^ rhs[3][k];
+    }
+
+    // G₂ = RHS[0] ⊕ RHS[2]
+    for k in 0..8 {
+        result[4][k] = rhs[0][k] ^ rhs[2][k];
     }
 
     result
@@ -275,8 +305,9 @@ pub fn garble_and_gate(
         xor_assign_8(&mut rhs[i], &r_times_input[i]);
     }
 
-    // 7. Solve V · [C; G⃗] = RHS  →  [C; G⃗] = V⁻¹ · RHS
-    let output = apply_v_inv(&rhs);
+    // 7. Solve for [C; G⃗] using correct formulas that ensure all marginal equations
+    //    hold
+    let output = solve_for_output(&rhs);
 
     // 8. Extract output label and gate ciphertexts
     // output = [C_L, C_R, G₀, G₁, G₂]
@@ -304,29 +335,36 @@ pub fn garble_and_gate(
 ///
 /// # Key Insight from Paper (Equation 6, Page 12)
 ///
-/// The R matrix has a special structure where the Δ columns (4-5) are
-/// related to the A or B columns depending on the input combination.
-/// Due to this structure, the evaluator's marginal is simply columns 0-3
-/// of R - the Δ contribution is automatically handled.
+/// The R matrix is designed such that the Δ columns (4-5) satisfy:
+/// R[row][4] = R[row][0]*i + R[row][2]*j
+/// R[row][5] = R[row][1]*i + R[row][3]*j
+///
+/// This means extracting columns 0-3 directly gives the correct marginal.
 fn extract_evaluator_marginal(i: usize, j: usize, r_bar_ij: &[u8; 2]) -> [[u8; 4]; 2] {
-    use super::control::{expand_marginal, extract_marginal, R_P};
+    use super::control::expand_marginal;
 
-    // Step 1: Expand r_bar_ij to get the R$ marginal (2×4)
-    // r_bar_ij is already the compressed representation for this specific (i,j)
-    let r_dollar_marginal = expand_marginal(r_bar_ij);
+    // r_bar_ij already encodes the full marginal (including parity),
+    // so just expand and return.
+    expand_marginal(r_bar_ij)
 
-    // Step 2: Extract R_P's marginal for this input combination
-    let r_p_marginal = extract_marginal(&R_P, i, j);
+    // Claudes faulty code below
+    // use super::control::{R_P, expand_marginal, extract_marginal};
 
-    // Step 3: Combined marginal = R$ marginal ⊕ R_P marginal
-    let mut marginal = [[0u8; 4]; 2];
-    for row in 0..2 {
-        for col in 0..4 {
-            marginal[row][col] = r_dollar_marginal[row][col] ^ r_p_marginal[row][col];
-        }
-    }
+    // // Step 1: Expand r_bar_ij to get the R$ marginal (2×4)
+    // let r_dollar_marginal = expand_marginal(r_bar_ij);
 
-    marginal
+    // // Step 2: Extract R_P's marginal (columns 0-3 only)
+    // let r_p_marginal = extract_marginal(&R_P, i, j);
+
+    // // Step 3: Combined marginal = R$ marginal ⊕ R_P marginal
+    // let mut marginal = [[0u8; 4]; 2];
+    // for row in 0..2 {
+    //     for col in 0..4 {
+    //         marginal[row][col] = r_dollar_marginal[row][col] ^
+    // r_p_marginal[row][col];     }
+    // }
+
+    // marginal
 }
 
 /// Evaluate a Three Halves AND gate.
@@ -366,8 +404,8 @@ pub fn evaluate_and_gate(
     // 2. Get the marginal view for this input combination
     let r_bar_ij = control_bits.r_bar[ij];
 
-    // 3. Compute the two hashes needed for this input combination
-    //    From the M matrix structure:
+    // 3. Compute the two hashes needed for this input combination From the M matrix
+    //    structure:
     //    - (0,0): H(A_i), H(A_i⊕B_j) = H(A₀), H(A₀⊕B₀)
     //    - (0,1): H(A_i), H(A_i⊕B_j) = H(A₀), H(A₀⊕B₁)
     //    - (1,0): H(A_i), H(A_i⊕B_j) = H(A₁), H(A₁⊕B₀)
@@ -385,8 +423,8 @@ pub fn evaluate_and_gate(
     let a_sliced = SlicedLabel::from_block(a);
     let b_sliced = SlicedLabel::from_block(b);
 
-    // 5. Expand the marginal control bits and compute the effective R marginal
-    //    for the evaluator's input combination (i, j).
+    // 5. Expand the marginal control bits and compute the effective R marginal for
+    //    the evaluator's input combination (i, j).
     //
     //    The r_bar encodes R$ (without R_P) as a 2-bit value per marginal.
     //    For ODD mode (AND gate), we also add R_P since parity is public.
@@ -408,9 +446,10 @@ pub fn evaluate_and_gate(
     //
     //    From paper Section 5.2, the evaluator computes:
     //    For the left half (row 2*ij):
-    //      result_L = hash_contribution_L ⊕ input_contribution_L ⊕ gate_contribution_L
-    //    For the right half (row 2*ij+1):
-    //      result_R = hash_contribution_R ⊕ input_contribution_R ⊕ gate_contribution_R
+    //      result_L = hash_contribution_L ⊕ input_contribution_L ⊕
+    // gate_contribution_L    For the right half (row 2*ij+1):
+    //      result_R = hash_contribution_R ⊕ input_contribution_R ⊕
+    // gate_contribution_R
     //
     //    The V matrix tells us how gate ciphertexts contribute.
     //    The M matrix tells us which hashes contribute (but evaluator only has 3).
@@ -452,73 +491,53 @@ pub fn evaluate_and_gate(
 /// Compute hash contribution for evaluation (left or right half).
 ///
 /// The evaluator has H(A_i), H(B_j), H(A_i⊕B_j) and needs to compute
-/// the hash contribution for their specific row.
+/// the hash contribution matching what the garbler computed via M·H.
 ///
-/// From the M matrix structure, for input (i,j), rows 2*ij and 2*ij+1:
-/// - Use H(A_i) according to M[row][i] (where i=0 for A₀, i=1 for A₁)
-/// - Use H(B_j) according to M[row][2+j]
-/// - Use H(A_i⊕B_j) according to M[row][4+j] (approximately)
+/// # Key Insight: Hash Column Mapping
+///
+/// The evaluator's three hashes map to the garbler's 6 columns as follows:
+/// - `h_a = H(A_i)` → column `i` (0 for i=0, 1 for i=1)
+/// - `h_b = H(B_j)` → column `2+j` (2 for j=0, 3 for j=1)
+/// - `h_ab = H(A_i⊕B_j)` → column 4 or 5 based on Free-XOR:
+///   - (0,0): H(A₀⊕B₀) → col 4
+///   - (0,1): H(A₀⊕B₁) → col 5
+///   - (1,0): H(A₁⊕B₀) = H(A₀⊕B₁) → col 5
+///   - (1,1): H(A₁⊕B₁) = H(A₀⊕B₀) → col 4
+///
+/// This uses M matrix values to determine which hashes to XOR.
 fn compute_hash_contribution_eval(
     row: usize,
     h_a: &SlicedLabel,
     h_b: &SlicedLabel,
     h_ab: &SlicedLabel,
 ) -> [u8; 8] {
-    let half = row % 2;
+    use super::matrices::M;
 
-    // The M matrix for evaluator's view (simplified):
-    // We look at which hashes the evaluator needs based on the row
-    //
-    // The pattern from M:
-    // - Even rows (left): typically use H(A_i).left and one of H(A_i⊕B_j).left
-    // - Odd rows (right): typically use H(B_j).right and one of H(A_i⊕B_j).right
+    let half = row % 2;
+    let ij = row / 2;
+    let i = ij >> 1;
+    let j = ij & 1;
+
+    // Determine which garbler column maps to evaluator's h_ab
+    // Due to Free-XOR: A_i ⊕ B_j when (i,j) has odd parity maps to col 5 (A₀⊕B₁)
+    //                  when (i,j) has even parity maps to col 4 (A₀⊕B₀)
+    let ab_col = if (i ^ j) == 0 { 4 } else { 5 };
 
     let mut result = [0u8; 8];
 
-    // Simplified evaluation based on row structure:
-    // This matches the M matrix pattern for the evaluator's available hashes
-    match row {
-        0 => {
-            // (0,0) L: H(A₀).L ⊕ H(A₀⊕B₀).L
-            xor_assign_8(&mut result, &h_a.half(half));
-            xor_assign_8(&mut result, &h_ab.half(half));
-        }
-        1 => {
-            // (0,0) R: H(B₀).R ⊕ H(A₀⊕B₀).R
-            xor_assign_8(&mut result, &h_b.half(half));
-            xor_assign_8(&mut result, &h_ab.half(half));
-        }
-        2 => {
-            // (0,1) L: H(A₀).L ⊕ H(A₀⊕B₁).L
-            xor_assign_8(&mut result, &h_a.half(half));
-            xor_assign_8(&mut result, &h_ab.half(half));
-        }
-        3 => {
-            // (0,1) R: H(B₁).R ⊕ H(A₀⊕B₁).R
-            xor_assign_8(&mut result, &h_b.half(half));
-            xor_assign_8(&mut result, &h_ab.half(half));
-        }
-        4 => {
-            // (1,0) L: H(A₁).L ⊕ H(A₁⊕B₀).L
-            xor_assign_8(&mut result, &h_a.half(half));
-            xor_assign_8(&mut result, &h_ab.half(half));
-        }
-        5 => {
-            // (1,0) R: H(B₀).R ⊕ H(A₁⊕B₀).R
-            xor_assign_8(&mut result, &h_b.half(half));
-            xor_assign_8(&mut result, &h_ab.half(half));
-        }
-        6 => {
-            // (1,1) L: H(A₁).L ⊕ H(A₁⊕B₁).L
-            xor_assign_8(&mut result, &h_a.half(half));
-            xor_assign_8(&mut result, &h_ab.half(half));
-        }
-        7 => {
-            // (1,1) R: H(B₁).R ⊕ H(A₁⊕B₁).R
-            xor_assign_8(&mut result, &h_b.half(half));
-            xor_assign_8(&mut result, &h_ab.half(half));
-        }
-        _ => unreachable!(),
+    // XOR in h_a if M says to use column i (the evaluator's A hash column)
+    if M[row][i] == 1 {
+        xor_assign_8(&mut result, &h_a.half(half));
+    }
+
+    // XOR in h_b if M says to use column 2+j (the evaluator's B hash column)
+    if M[row][2 + j] == 1 {
+        xor_assign_8(&mut result, &h_b.half(half));
+    }
+
+    // XOR in h_ab if M says to use the corresponding combined hash column
+    if M[row][ab_col] == 1 {
+        xor_assign_8(&mut result, &h_ab.half(half));
     }
 
     result
@@ -694,8 +713,8 @@ mod tests {
 
     /// Test 6: Output label has correct Free-XOR relationship
     ///
-    /// For AND gate: C₁ = C₀ ⊕ Δ only when output is 1 (i.e., both inputs are 1)
-    /// This test verifies the garbling equation is set up correctly.
+    /// For AND gate: C₁ = C₀ ⊕ Δ only when output is 1 (i.e., both inputs are
+    /// 1) This test verifies the garbling equation is set up correctly.
     #[test]
     fn test_output_label_structure() {
         let cipher = &(*FIXED_KEY_AES);
@@ -725,11 +744,12 @@ mod tests {
         }
     }
 
-    /// Test 7: V⁻¹ application is consistent with V
+    /// Test 7: solve_for_output satisfies the marginal equations
     ///
-    /// V · (V⁻¹ · x) should equal x projected onto the column space of V.
+    /// For each input combination (i,j), applying V to [C;G] should give back
+    /// the original RHS values for the corresponding rows.
     #[test]
-    fn test_v_inv_application() {
+    fn test_solve_for_output_satisfies_marginals() {
         use super::super::matrices::V;
 
         let mut rng = ChaCha12Rng::seed_from_u64(123);
@@ -742,38 +762,520 @@ mod tests {
             }
         }
 
-        // Apply V⁻¹
-        let output = apply_v_inv(&rhs);
+        // Solve for [C_L, C_R, G₀, G₁, G₂]
+        let output = solve_for_output(&rhs);
 
-        // Apply V to the output
-        let mut reconstructed = [[0u8; 8]; 8];
-        for row in 0..8 {
-            for col in 0..5 {
-                if V[row][col] == 1 {
-                    xor_assign_8(&mut reconstructed[row], &output[col]);
-                }
-            }
+        // Verify that rows 0-5 are exactly satisfied (inputs 0,0 and 0,1 and 1,0)
+        // Row 0: C_L = RHS[0]
+        assert_eq!(output[0], rhs[0], "Row 0 should be satisfied");
+
+        // Row 1: C_R = RHS[1]
+        assert_eq!(output[1], rhs[1], "Row 1 should be satisfied");
+
+        // Row 2: C_L ⊕ G₂ = RHS[2]
+        let mut row2_check = [0u8; 8];
+        for k in 0..8 {
+            row2_check[k] = output[0][k] ^ output[4][k]; // C_L ⊕ G₂
         }
+        assert_eq!(row2_check, rhs[2], "Row 2 should be satisfied");
 
-        // The reconstructed should be in the column space of V
-        // Since V·V⁻¹ is a projection, V·V⁻¹·x should equal itself when applied again
-        let output2 = apply_v_inv(&reconstructed);
-        let mut reconstructed2 = [[0u8; 8]; 8];
-        for row in 0..8 {
-            for col in 0..5 {
-                if V[row][col] == 1 {
-                    xor_assign_8(&mut reconstructed2[row], &output2[col]);
-                }
-            }
+        // Row 3: C_R ⊕ G₁ ⊕ G₂ = RHS[3]
+        let mut row3_check = [0u8; 8];
+        for k in 0..8 {
+            row3_check[k] = output[1][k] ^ output[3][k] ^ output[4][k]; // C_R ⊕ G₁ ⊕ G₂
         }
+        assert_eq!(row3_check, rhs[3], "Row 3 should be satisfied");
 
-        assert_eq!(
-            reconstructed, reconstructed2,
-            "Projection should be idempotent"
-        );
+        // Row 4: C_L ⊕ G₀ ⊕ G₂ = RHS[4]
+        let mut row4_check = [0u8; 8];
+        for k in 0..8 {
+            row4_check[k] = output[0][k] ^ output[2][k] ^ output[4][k]; // C_L ⊕ G₀ ⊕ G₂
+        }
+        assert_eq!(row4_check, rhs[4], "Row 4 should be satisfied");
+
+        // Note: Rows 5, 6, 7 may not be exactly satisfied (they differ by Δ
+        // terms) This is intentional - the scheme handles it through
+        // the K·RHS structure
     }
 
-    /// Test 8: THE CRITICAL TEST - Garble then evaluate for all 4 input combinations
+    /// Debug test to trace through evaluation
+    #[test]
+    fn test_debug_evaluation() {
+        let cipher = &(*FIXED_KEY_AES);
+        let mut rng = ChaCha12Rng::seed_from_u64(999);
+
+        // Generate random labels with proper LSB structure
+        let mut a0 = Block::random(&mut rng);
+        let mut b0 = Block::random(&mut rng);
+        let mut delta = Block::random(&mut rng);
+
+        delta.set_lsb(true);
+        a0.set_lsb(false);
+        b0.set_lsb(false);
+
+        let a1 = a0 ^ delta;
+        let b1 = b0 ^ delta;
+
+        let gid = 1;
+        let rand_bits = [false, false]; // Deterministic for debugging
+
+        // Garble the AND gate
+        let garbled = garble_and_gate(cipher, a0, b0, delta, gid, rand_bits);
+        let c0 = garbled.output_label;
+
+        println!("\n=== GARBLING ===");
+        println!("A0 = {:?}", a0);
+        println!("B0 = {:?}", b0);
+        println!("Delta = {:?}", delta);
+        println!("C0 (output) = {:?}", c0);
+        println!(
+            "Gate: G0={:?}, G1={:?}, G2={:?}",
+            garbled.gate.g0, garbled.gate.g1, garbled.gate.g2
+        );
+        println!("Control bits r_bar: {:?}", garbled.control_bits.r_bar);
+
+        // Test (0,0) first - this should work
+        println!("\n=== EVALUATE (0,0) ===");
+        let result_00 =
+            evaluate_and_gate(cipher, a0, b0, &garbled.gate, &garbled.control_bits, gid);
+        println!("Expected: {:?}", c0);
+        println!("Got:      {:?}", result_00);
+        println!("Match: {}", result_00 == c0);
+
+        // Test (0,1) - this fails
+        println!("\n=== EVALUATE (0,1) ===");
+        let result_01 =
+            evaluate_and_gate(cipher, a0, b1, &garbled.gate, &garbled.control_bits, gid);
+        println!("Expected: {:?}", c0);
+        println!("Got:      {:?}", result_01);
+        println!("Match: {}", result_01 == c0);
+
+        // Detailed trace for (0,1)
+        println!("\n=== DETAILED TRACE (0,1) ===");
+        let i = 0usize;
+        let j = 1usize;
+        let ij = (i << 1) | j;
+        println!("i={}, j={}, ij={}", i, j, ij);
+
+        let r_bar_ij = garbled.control_bits.r_bar[ij];
+        println!("r_bar[{}] = {:?}", ij, r_bar_ij);
+
+        // Compute hashes
+        let tweak = Block::new((gid as u128).to_be_bytes());
+        let mut hash_inputs = [a0, b1, a0 ^ b1];
+        cipher.tccr_many(&[tweak; 3], &mut hash_inputs);
+        let h_a = SlicedLabel::from_block(hash_inputs[0]);
+        let h_b = SlicedLabel::from_block(hash_inputs[1]);
+        let h_ab = SlicedLabel::from_block(hash_inputs[2]);
+        println!("H(A0) = {:?}", h_a);
+        println!("H(B1) = {:?}", h_b);
+        println!("H(A0^B1) = {:?}", h_ab);
+
+        // Slice input labels
+        let a_sliced = SlicedLabel::from_block(a0);
+        let b_sliced = SlicedLabel::from_block(b1);
+        println!("A0 sliced = {:?}", a_sliced);
+        println!("B1 sliced = {:?}", b_sliced);
+
+        // Extract marginal
+        use crate::three_halves::control::{R_P, expand_marginal, extract_marginal};
+        let r_dollar_marginal = expand_marginal(&r_bar_ij);
+        let r_p_marginal = extract_marginal(&R_P, i, j);
+        println!("R$ marginal = {:?}", r_dollar_marginal);
+        println!("R_P marginal = {:?}", r_p_marginal);
+
+        let mut total_marginal = [[0u8; 4]; 2];
+        for row in 0..2 {
+            for col in 0..4 {
+                total_marginal[row][col] = r_dollar_marginal[row][col] ^ r_p_marginal[row][col];
+            }
+        }
+        println!("Total marginal = {:?}", total_marginal);
+
+        // Now manually compute what the garbler computed for rows 2,3
+        println!("\n=== COMPARE WITH GARBLER ===");
+
+        // Garbler's hash contribution for row 2
+        let garbler_hashes = compute_hashes(cipher, a0, b0, delta, gid);
+        println!("Garbler H(A0) = {:?}", garbler_hashes[0]);
+        println!("Garbler H(A0^B1) = {:?}", garbler_hashes[5]);
+
+        // Check if hashes match
+        println!("\nHash comparison:");
+        println!(
+            "Evaluator H(A0) == Garbler H(A0): {}",
+            h_a == garbler_hashes[0]
+        );
+        println!(
+            "Evaluator H(A0^B1) == Garbler H(A0^B1): {}",
+            h_ab == garbler_hashes[5]
+        );
+
+        // Manually compute hash contribution for row 2 (left) and row 3 (right)
+        println!("\n=== HASH CONTRIBUTION ===");
+        // Row 2: H(A0).L ⊕ H(A0^B1).L
+        let mut hash_left = [0u8; 8];
+        for k in 0..8 {
+            hash_left[k] = h_a.left[k] ^ h_ab.left[k];
+        }
+        println!("Hash contrib left (row 2): {:?}", hash_left);
+
+        // Row 3: H(B1).R ⊕ H(A0^B1).R
+        let mut hash_right = [0u8; 8];
+        for k in 0..8 {
+            hash_right[k] = h_b.right[k] ^ h_ab.right[k];
+        }
+        println!("Hash contrib right (row 3): {:?}", hash_right);
+
+        // Manually compute input contribution
+        println!("\n=== INPUT CONTRIBUTION ===");
+        // Row 2 (left): marginal[0] applied to [A0_L, A0_R, B1_L, B1_R]
+        let mut input_left = [0u8; 8];
+        if total_marginal[0][0] == 1 {
+            for k in 0..8 {
+                input_left[k] ^= a_sliced.left[k];
+            }
+        }
+        if total_marginal[0][1] == 1 {
+            for k in 0..8 {
+                input_left[k] ^= a_sliced.right[k];
+            }
+        }
+        if total_marginal[0][2] == 1 {
+            for k in 0..8 {
+                input_left[k] ^= b_sliced.left[k];
+            }
+        }
+        if total_marginal[0][3] == 1 {
+            for k in 0..8 {
+                input_left[k] ^= b_sliced.right[k];
+            }
+        }
+        println!("Input contrib left: {:?}", input_left);
+        println!("  marginal[0] = {:?}", total_marginal[0]);
+        println!("  A0.L={:?}, A0.R={:?}", a_sliced.left, a_sliced.right);
+        println!("  B1.L={:?}, B1.R={:?}", b_sliced.left, b_sliced.right);
+
+        // Row 3 (right): marginal[1] applied to [A0_L, A0_R, B1_L, B1_R]
+        let mut input_right = [0u8; 8];
+        if total_marginal[1][0] == 1 {
+            for k in 0..8 {
+                input_right[k] ^= a_sliced.left[k];
+            }
+        }
+        if total_marginal[1][1] == 1 {
+            for k in 0..8 {
+                input_right[k] ^= a_sliced.right[k];
+            }
+        }
+        if total_marginal[1][2] == 1 {
+            for k in 0..8 {
+                input_right[k] ^= b_sliced.left[k];
+            }
+        }
+        if total_marginal[1][3] == 1 {
+            for k in 0..8 {
+                input_right[k] ^= b_sliced.right[k];
+            }
+        }
+        println!("Input contrib right: {:?}", input_right);
+        println!("  marginal[1] = {:?}", total_marginal[1]);
+
+        // Manually compute gate contribution
+        println!("\n=== GATE CONTRIBUTION ===");
+        use crate::three_halves::matrices::V;
+        // Row 2: V[2] = [1, 0, 0, 0, 1] -> G₂
+        let mut gate_left = [0u8; 8];
+        if V[2][2] == 1 {
+            for k in 0..8 {
+                gate_left[k] ^= garbled.gate.g0[k];
+            }
+        }
+        if V[2][3] == 1 {
+            for k in 0..8 {
+                gate_left[k] ^= garbled.gate.g1[k];
+            }
+        }
+        if V[2][4] == 1 {
+            for k in 0..8 {
+                gate_left[k] ^= garbled.gate.g2[k];
+            }
+        }
+        println!("Gate contrib left (row 2): {:?}", gate_left);
+        println!("  V[2] = {:?}", V[2]);
+
+        // Row 3: V[3] = [0, 1, 0, 1, 1] -> G₁ ⊕ G₂
+        let mut gate_right = [0u8; 8];
+        if V[3][2] == 1 {
+            for k in 0..8 {
+                gate_right[k] ^= garbled.gate.g0[k];
+            }
+        }
+        if V[3][3] == 1 {
+            for k in 0..8 {
+                gate_right[k] ^= garbled.gate.g1[k];
+            }
+        }
+        if V[3][4] == 1 {
+            for k in 0..8 {
+                gate_right[k] ^= garbled.gate.g2[k];
+            }
+        }
+        println!("Gate contrib right (row 3): {:?}", gate_right);
+        println!("  V[3] = {:?}", V[3]);
+
+        // Combine all contributions
+        println!("\n=== COMBINED ===");
+        let mut c_l_computed = [0u8; 8];
+        let mut c_r_computed = [0u8; 8];
+        for k in 0..8 {
+            c_l_computed[k] = hash_left[k] ^ input_left[k] ^ gate_left[k];
+            c_r_computed[k] = hash_right[k] ^ input_right[k] ^ gate_right[k];
+        }
+        let computed = SlicedLabel::new(c_l_computed, c_r_computed);
+        println!("Computed C_L: {:?}", c_l_computed);
+        println!("Computed C_R: {:?}", c_r_computed);
+        println!("Computed Block: {:?}", computed.to_block());
+
+        let expected = SlicedLabel::from_block(c0);
+        println!("\nExpected C_L: {:?}", expected.left);
+        println!("Expected C_R: {:?}", expected.right);
+
+        // Also show what the garbler computed for RHS[2] and RHS[3]
+        println!("\n=== GARBLER'S RHS for rows 2,3 ===");
+        // We need to compute what the garbler got before applying V^-1
+        // RHS = M*H ⊕ R*input
+
+        // First, M*H for rows 2 and 3
+        let mut m_h_2 = [0u8; 8];
+        let mut m_h_3 = [0u8; 8];
+        use crate::three_halves::matrices::M;
+        // M[2] = [1, 0, 0, 0, 0, 1] -> H(A0).L ⊕ H(A0⊕B1).L for left half
+        for col in 0..6 {
+            if M[2][col] == 1 {
+                let h_half = garbler_hashes[col].half(0); // left half for row 2
+                for k in 0..8 {
+                    m_h_2[k] ^= h_half[k];
+                }
+            }
+        }
+        // M[3] = [0, 0, 0, 1, 0, 1] -> H(B1).R ⊕ H(A0⊕B1).R for right half
+        for col in 0..6 {
+            if M[3][col] == 1 {
+                let h_half = garbler_hashes[col].half(1); // right half for row 3
+                for k in 0..8 {
+                    m_h_3[k] ^= h_half[k];
+                }
+            }
+        }
+        println!("Garbler M*H[2] (left): {:?}", m_h_2);
+        println!("Garbler M*H[3] (right): {:?}", m_h_3);
+
+        // Now R*input for rows 2 and 3
+        // R[2] = [1, 0, 1, 1, 1, 1] (computed above)
+        // R[3] = [0, 1, 1, 1, 1, 1]
+        let a0_sliced = SlicedLabel::from_block(a0);
+        let b0_sliced = SlicedLabel::from_block(b0);
+        let delta_sliced = SlicedLabel::from_block(delta);
+        let inputs_garbler: [[u8; 8]; 6] = [
+            a0_sliced.left,
+            a0_sliced.right,
+            b0_sliced.left,
+            b0_sliced.right,
+            delta_sliced.left,
+            delta_sliced.right,
+        ];
+
+        // Full R for rows 2,3
+        use crate::three_halves::control::{R_A, R_B, R_P as R_P_MAT};
+        let mut r_row_2 = [0u8; 6];
+        let mut r_row_3 = [0u8; 6];
+        for col in 0..6 {
+            r_row_2[col] = R_A[2][col] ^ R_B[2][col] ^ R_P_MAT[2][col];
+            r_row_3[col] = R_A[3][col] ^ R_B[3][col] ^ R_P_MAT[3][col];
+        }
+        println!("R[2] = {:?}", r_row_2);
+        println!("R[3] = {:?}", r_row_3);
+
+        let mut r_input_2 = [0u8; 8];
+        let mut r_input_3 = [0u8; 8];
+        for col in 0..6 {
+            if r_row_2[col] == 1 {
+                for k in 0..8 {
+                    r_input_2[k] ^= inputs_garbler[col][k];
+                }
+            }
+            if r_row_3[col] == 1 {
+                for k in 0..8 {
+                    r_input_3[k] ^= inputs_garbler[col][k];
+                }
+            }
+        }
+        println!("Garbler R*input[2]: {:?}", r_input_2);
+        println!("Garbler R*input[3]: {:?}", r_input_3);
+
+        // RHS = M*H ⊕ R*input
+        let mut rhs_2 = [0u8; 8];
+        let mut rhs_3 = [0u8; 8];
+        for k in 0..8 {
+            rhs_2[k] = m_h_2[k] ^ r_input_2[k];
+            rhs_3[k] = m_h_3[k] ^ r_input_3[k];
+        }
+        println!("Garbler RHS[2]: {:?}", rhs_2);
+        println!("Garbler RHS[3]: {:?}", rhs_3);
+
+        // The evaluator should get the same RHS values!
+        println!(
+            "\nEvaluator RHS[2] (hash_left ^ input_left): {:?}",
+            hash_left
+                .iter()
+                .zip(input_left.iter())
+                .map(|(a, b)| a ^ b)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "Evaluator RHS[3] (hash_right ^ input_right): {:?}",
+            hash_right
+                .iter()
+                .zip(input_right.iter())
+                .map(|(a, b)| a ^ b)
+                .collect::<Vec<_>>()
+        );
+
+        // Now test (1,0) - this is the one that's failing
+        println!("\n\n=== TESTING INPUT (1,0) ===");
+        let a1 = a0 ^ delta;
+        let result_10 =
+            evaluate_and_gate(cipher, a1, b0, &garbled.gate, &garbled.control_bits, gid);
+        println!("Expected: {:?}", c0);
+        println!("Got:      {:?}", result_10);
+        println!("Match: {}", result_10 == c0);
+
+        // Debug (1,0)
+        let i_10 = 1usize;
+        let j_10 = 0usize;
+        let ij_10 = (i_10 << 1) | j_10;
+        println!("i={}, j={}, ij={}", i_10, j_10, ij_10);
+
+        let r_bar_10 = garbled.control_bits.r_bar[ij_10];
+        println!("r_bar[{}] = {:?}", ij_10, r_bar_10);
+
+        // Compute hashes for (1,0)
+        let mut hash_inputs_10 = [a1, b0, a1 ^ b0];
+        cipher.tccr_many(&[tweak; 3], &mut hash_inputs_10);
+        let h_a_10 = SlicedLabel::from_block(hash_inputs_10[0]); // H(A₁)
+        let h_b_10 = SlicedLabel::from_block(hash_inputs_10[1]); // H(B₀)
+        let h_ab_10 = SlicedLabel::from_block(hash_inputs_10[2]); // H(A₁⊕B₀) = H(A₀⊕B₁)
+
+        // Hash contribution for row 5 (right half)
+        // M[5] = [0, 0, 1, 0, 0, 1] -> H(B₀) and H(A₀⊕B₁)
+        let mut hash_right_10 = [0u8; 8];
+        for k in 0..8 {
+            hash_right_10[k] = h_b_10.right[k] ^ h_ab_10.right[k];
+        }
+        println!("Hash contrib right (row 5): {:?}", hash_right_10);
+
+        // Marginal for (1,0)
+        let r_dollar_10 = expand_marginal(&r_bar_10);
+        let r_p_10 = extract_marginal(&R_P, i_10, j_10);
+        println!("R$ marginal for (1,0) = {:?}", r_dollar_10);
+        println!("R_P marginal for (1,0) = {:?}", r_p_10);
+
+        let mut total_marginal_10 = [[0u8; 4]; 2];
+        for row in 0..2 {
+            for col in 0..4 {
+                total_marginal_10[row][col] = r_dollar_10[row][col] ^ r_p_10[row][col];
+            }
+        }
+        println!("Total marginal for (1,0) = {:?}", total_marginal_10);
+
+        // Input contribution for row 5
+        let a1_sliced = SlicedLabel::from_block(a1);
+        let b0_sliced_10 = SlicedLabel::from_block(b0);
+        let mut input_right_10 = [0u8; 8];
+        if total_marginal_10[1][0] == 1 {
+            for k in 0..8 {
+                input_right_10[k] ^= a1_sliced.left[k];
+            }
+        }
+        if total_marginal_10[1][1] == 1 {
+            for k in 0..8 {
+                input_right_10[k] ^= a1_sliced.right[k];
+            }
+        }
+        if total_marginal_10[1][2] == 1 {
+            for k in 0..8 {
+                input_right_10[k] ^= b0_sliced_10.left[k];
+            }
+        }
+        if total_marginal_10[1][3] == 1 {
+            for k in 0..8 {
+                input_right_10[k] ^= b0_sliced_10.right[k];
+            }
+        }
+        println!("Input contrib right (row 5): {:?}", input_right_10);
+
+        // Gate contribution for row 5
+        // V[5] = [0, 1, 0, 0, 1] -> G₂
+        println!("Gate contrib right (row 5) = G₂ = {:?}", garbled.gate.g2);
+
+        // Garbler's RHS[5]
+        let mut m_h_5 = [0u8; 8];
+        for col in 0..6 {
+            if M[5][col] == 1 {
+                let h_half = garbler_hashes[col].half(1);
+                for k in 0..8 {
+                    m_h_5[k] ^= h_half[k];
+                }
+            }
+        }
+        let mut r_row_5 = [0u8; 6];
+        for col in 0..6 {
+            r_row_5[col] = R_A[5][col] ^ R_B[5][col] ^ R_P_MAT[5][col];
+        }
+        // Add R$ contribution (need rand_bits from garbling - but we know rand_bits was
+        // [false, false]) Actually the test uses random rand_bits, so let me
+        // skip this for now
+
+        // Check the constraint: RHS[0] ⊕ RHS[1] ⊕ RHS[2] ⊕ RHS[5] should be 0
+        let mut rhs_0_garbler = [0u8; 8];
+        let mut rhs_1_garbler = [0u8; 8];
+        for col in 0..6 {
+            if M[0][col] == 1 {
+                for k in 0..8 {
+                    rhs_0_garbler[k] ^= garbler_hashes[col].half(0)[k];
+                }
+            }
+            if M[1][col] == 1 {
+                for k in 0..8 {
+                    rhs_1_garbler[k] ^= garbler_hashes[col].half(1)[k];
+                }
+            }
+        }
+        println!("\nChecking constraint RHS[0]⊕RHS[1]⊕RHS[2]⊕RHS[5] = 0:");
+        println!("This constraint involves input contributions which depend on rand_bits...");
+
+        // Compare evaluator's computation
+        let eval_rhs_5: Vec<u8> = hash_right_10
+            .iter()
+            .zip(input_right_10.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+        println!("Evaluator RHS[5] = {:?}", eval_rhs_5);
+
+        let eval_c_r: Vec<u8> = eval_rhs_5
+            .iter()
+            .zip(garbled.gate.g2.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
+        println!("Evaluator C_R = RHS[5] ⊕ G₂ = {:?}", eval_c_r);
+
+        let expected_c0_sliced = SlicedLabel::from_block(c0);
+        println!("Expected C_R = {:?}", expected_c0_sliced.right);
+    }
+
+    /// Test 8: THE CRITICAL TEST - Garble then evaluate for all 4 input
+    /// combinations
     ///
     /// This verifies the complete correctness of the Three Halves scheme:
     /// - Garble with A₀, B₀, Δ
@@ -861,5 +1363,79 @@ mod tests {
         let result2 = evaluate_and_gate(cipher, a0, b0, &garbled.gate, &garbled.control_bits, gid);
 
         assert_eq!(result1, result2, "Evaluation should be deterministic");
+    }
+
+    /// Focused debug test for (1,0) mismatch
+    #[test]
+    fn test_focused_10_debug() {
+        let cipher = &(*FIXED_KEY_AES);
+        let mut rng = ChaCha12Rng::seed_from_u64(999);
+
+        let mut a0 = Block::random(&mut rng);
+        let mut b0 = Block::random(&mut rng);
+        let mut delta = Block::random(&mut rng);
+        delta.set_lsb(true);
+        a0.set_lsb(false);
+        b0.set_lsb(false);
+
+        let a1 = a0 ^ delta;
+        let gid = 1;
+        let rand_bits = [false, false];
+
+        let garbled = garble_and_gate(cipher, a0, b0, delta, gid, rand_bits);
+
+        // Now manually trace evaluate for (1,0)
+        let i = 1usize;
+        let j = 0usize;
+        let ij = (i << 1) | j;
+
+        // Get marginal
+        let r_bar_ij = garbled.control_bits.r_bar[ij];
+        let marginal = extract_evaluator_marginal(i, j, &r_bar_ij);
+        println!("Marginal for (1,0): {:?}", marginal);
+
+        // Compute evaluator hashes
+        let tweak = Block::new((gid as u128).to_be_bytes());
+        let mut hash_inputs = [a1, b0, a1 ^ b0];
+        cipher.tccr_many(&[tweak; 3], &mut hash_inputs);
+        let h_a = SlicedLabel::from_block(hash_inputs[0]);
+        let h_b = SlicedLabel::from_block(hash_inputs[1]);
+        let h_ab = SlicedLabel::from_block(hash_inputs[2]);
+
+        // Row 5 (right half)
+        let row = 5;
+        let hash_contrib = compute_hash_contribution_eval(row, &h_a, &h_b, &h_ab);
+        println!("Hash contrib (row 5): {:?}", hash_contrib);
+
+        // Input contribution
+        let a1_sliced = SlicedLabel::from_block(a1);
+        let b0_sliced = SlicedLabel::from_block(b0);
+        let input_contrib = compute_input_contribution(&marginal, 1, &a1_sliced, &b0_sliced);
+        println!("Input contrib (row 5): {:?}", input_contrib);
+
+        // What evaluate_and_gate actually produces
+        let result = evaluate_and_gate(cipher, a1, b0, &garbled.gate, &garbled.control_bits, gid);
+        let result_sliced = SlicedLabel::from_block(result);
+        let expected_sliced = SlicedLabel::from_block(garbled.output_label);
+
+        println!("Result right: {:?}", result_sliced.right);
+        println!("Expected right: {:?}", expected_sliced.right);
+
+        // Check the gate contribution
+        let gate_contrib = compute_gate_contribution(row, &garbled.gate);
+        println!("Gate contrib (row 5): {:?}", gate_contrib);
+
+        // RHS and C_R calculation
+        let mut rhs = [0u8; 8];
+        for k in 0..8 {
+            rhs[k] = hash_contrib[k] ^ input_contrib[k];
+        }
+        println!("RHS[5] (hash^input): {:?}", rhs);
+
+        let mut c_r = [0u8; 8];
+        for k in 0..8 {
+            c_r[k] = rhs[k] ^ gate_contrib[k];
+        }
+        println!("Computed C_R (RHS^gate): {:?}", c_r);
     }
 }

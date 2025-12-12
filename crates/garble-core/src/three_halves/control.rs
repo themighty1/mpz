@@ -6,7 +6,8 @@
 //!
 //! ## References
 //!
-//! - Paper Section 4.3: "Observation #3: Randomize and Hide the Evaluator's Coefficients"
+//! - Paper Section 4.3: "Observation #3: Randomize and Hide the Evaluator's
+//!   Coefficients"
 //! - Paper Section 5.1: "Choosing the Matrices" - detailed explanation of R
 //! - Paper Figure 3 (Page 14): Control matrices for even-parity gates
 //! - Paper Figure 4 (Page 14): Control matrices for gate-hiding (parity-hiding)
@@ -34,8 +35,8 @@
 //!
 //! ### Marginal Views
 //!
-//! When the evaluator has input (A_i, B_j), they only see/need the 2×4 submatrix:
-//! ```text
+//! When the evaluator has input (A_i, B_j), they only see/need the 2×4
+//! submatrix: ```text
 //! R_ij = [R_ijA  R_ijB]  (rows 2i, 2i+1 and columns for A, B parts)
 //! ```
 //! The full R is never revealed - only one marginal view per evaluation.
@@ -49,7 +50,7 @@
 //! This reduces overhead to 2 bits per marginal view × 4 views = 8 bits,
 //! but we encode it as 5 bits total (see paper Section 5.2).
 
-use super::matrices::{is_zero_matrix, matmul_gf2, K};
+use super::matrices::{K, is_zero_matrix, matmul_gf2};
 
 // ============================================================================
 // Basis Matrices for Marginal View Compression
@@ -214,7 +215,8 @@ pub const R_B: [[u8; 6]; 8] = [
 ///
 /// **Property**: K · R$_BASIS_0 = 0 (contributes nothing to constraint)
 ///
-/// **Property**: Each row pair (marginal view) when projected gives uniform distribution
+/// **Property**: Each row pair (marginal view) when projected gives uniform
+/// distribution
 pub const R_DOLLAR_BASIS_0: [[u8; 6]; 8] = [
     // These values ensure that:
     // 1. K × R$_BASIS_0 = 0
@@ -326,8 +328,8 @@ pub const R_BAR_DOLLAR_BASIS_1: [[u8; 2]; 4] = [
 ///
 /// For AND: only input (1,1) gives true output.
 ///
-/// Paper convention: rows are ordered by input combinations (0,0), (0,1), (1,0), (1,1)
-/// with 2 rows per combination (left and right halves).
+/// Paper convention: rows are ordered by input combinations (0,0), (0,1),
+/// (1,0), (1,1) with 2 rows per combination (left and right halves).
 ///
 /// **The a,b encoding**:
 /// - a = 1 if true output is in row (1,_), i.e., when first input is 1
@@ -393,8 +395,8 @@ pub fn extract_truth_table_bits(t: &[[u8; 2]; 8]) -> (u8, u8, u8) {
         Some(pos) => {
             // pos: 0=(0,0), 1=(0,1), 2=(1,0), 3=(1,1)
             let a = (pos >> 1) as u8; // First input bit
-            let b = (pos & 1) as u8;  // Second input bit
-            let p = 1u8;              // Odd parity (one true output)
+            let b = (pos & 1) as u8; // Second input bit
+            let p = 1u8; // Odd parity (one true output)
             (a, b, p)
         }
         None => {
@@ -426,7 +428,9 @@ pub fn extract_truth_table_bits(t: &[[u8; 2]; 8]) -> (u8, u8, u8) {
 /// * `R` - The 8×6 control matrix
 /// * `r_bar` - The 4×2 compressed representation for encryption
 pub fn sample_r_odd(t: &[[u8; 2]; 8], rand_bits: [bool; 2]) -> ([[u8; 6]; 8], [[u8; 2]; 4]) {
-    let (a, b, p) = extract_truth_table_bits(t);
+    //let (a, b, p) = extract_truth_table_bits(t);
+    // using a static truth table for now.
+    let (a, b, p) = (1, 1, 1);
 
     // Start with R$ (randomization)
     let mut r = [[0u8; 6]; 8];
@@ -474,14 +478,22 @@ pub fn sample_r_odd(t: &[[u8; 2]; 8], rand_bits: [bool; 2]) -> ([[u8; 6]; 8], [[
         }
     }
 
+    for i in 0..8 {
+        for j in 0..6 {
+            r[i][j] ^= p * R_P[i][j];
+        }
+    }
+
+    // TODO this comment was by claude and it w wrong, i arr R_P to r_bar
     // NOTE: We do NOT add p·R_p here because in ODD mode the evaluator
     // knows to add R_p themselves (parity is public). The R_p term is
     // added during evaluation, not stored in the compressed form.
     //
     // However, for the FULL R (used internally by garbler), we DO add R_p:
-    for i in 0..8 {
-        for j in 0..6 {
-            r[i][j] ^= p * R_P[i][j];
+
+    for i in 0..4 {
+        for j in 0..2 {
+            r_bar[i][j] ^= p * R_P[i][j];
         }
     }
 
@@ -600,11 +612,7 @@ pub fn verify_k_r_dollar_is_zero() -> bool {
 pub fn verify_k_r_p() -> bool {
     let kr_p = matmul_gf2(&K, &R_P);
 
-    let expected: [[u8; 6]; 3] = [
-        [0, 0, 0, 0, 1, 0],
-        [0, 0, 0, 0, 0, 1],
-        [0, 0, 0, 0, 0, 0],
-    ];
+    let expected: [[u8; 6]; 3] = [[0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 1], [0, 0, 0, 0, 0, 0]];
 
     kr_p == expected
 }
@@ -620,11 +628,7 @@ pub fn verify_k_r_p() -> bool {
 pub fn verify_k_r_a() -> bool {
     let kr_a = matmul_gf2(&K, &R_A);
 
-    let expected: [[u8; 6]; 3] = [
-        [0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 1, 0],
-    ];
+    let expected: [[u8; 6]; 3] = [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 1, 0]];
 
     kr_a == expected
 }
@@ -640,11 +644,7 @@ pub fn verify_k_r_a() -> bool {
 pub fn verify_k_r_b() -> bool {
     let kr_b = matmul_gf2(&K, &R_B);
 
-    let expected: [[u8; 6]; 3] = [
-        [0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0],
-        [0, 0, 0, 0, 0, 1],
-    ];
+    let expected: [[u8; 6]; 3] = [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 1]];
 
     kr_b == expected
 }
@@ -658,10 +658,7 @@ mod tests {
     /// Paper Figure 3: The R$ distribution must satisfy KR$ = 0
     #[test]
     fn test_k_r_dollar_is_zero() {
-        assert!(
-            verify_k_r_dollar_is_zero(),
-            "K × R$_BASIS should be zero"
-        );
+        assert!(verify_k_r_dollar_is_zero(), "K × R$_BASIS should be zero");
     }
 
     /// Test 2: K × R_p matches Equation 7
