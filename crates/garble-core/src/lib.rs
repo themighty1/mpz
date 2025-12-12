@@ -1,6 +1,10 @@
 //! Core components used to implement garbled circuit protocols
 //!
 //! This crate implements "half-gate" garbled circuits from the [Two Halves Make a Whole \[ZRE15\]](https://eprint.iacr.org/2014/756) paper.
+//!
+//! It also includes an implementation of the "Three Halves Make a Whole" scheme from
+//! [Rosulek & Roy 2021](https://eprint.iacr.org/2021/749) which reduces AND gate size
+//! from 2κ bits to 1.5κ + 5 bits.
 
 #![deny(missing_docs, unreachable_pub, unused_must_use)]
 #![deny(clippy::all)]
@@ -9,6 +13,7 @@ pub(crate) mod circuit;
 mod evaluator;
 mod garbler;
 pub mod store;
+pub mod three_halves;
 pub(crate) mod view;
 
 pub use circuit::{EncryptedGate, EncryptedGateBatch, GarbledCircuit};
