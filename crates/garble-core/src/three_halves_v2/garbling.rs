@@ -69,22 +69,33 @@ impl ThreeHalvesGate {
     pub const SIZE_BYTES: usize = 24;
 }
 
-/// Control bits for evaluator.
+/// Control bits for evaluator (compressed form).
 ///
-/// DUMMY PROTOCOL: In this experimental version, we send the full R matrix
-/// in plaintext instead of the compressed r_bar. This breaks privacy but
-/// allows us to debug the core math.
+/// The r_bar is a 4×2 matrix where each row r_bar[ij] contains the coefficients
+/// [c₁, c₂] for input position (i,j). The evaluator expands this to a 2×4
+/// marginal using: R_ij = c₁·S₁ ⊕ c₂·S₂
+///
+/// In ODD mode (AND gates), the evaluator also adds R_P's marginal since
+/// parity is public.
+///
+/// Total size: 4 × 2 = 8 bits = 1 byte (but stored as bytes for simplicity)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ControlBits {
-    /// The full 8×6 R matrix (sent in plaintext for debugging)
-    pub r: [[u8; 6]; 8],
+    /// Compressed representation r̄: 4 entries of 2 coefficients each
+    /// r_bar[0] = (0,0), r_bar[1] = (0,1), r_bar[2] = (1,0), r_bar[3] = (1,1)
+    pub r_bar: [[u8; 2]; 4],
 }
 
 impl ControlBits {
-    /// Create new control bits from the full R matrix.
-    pub fn new(r: [[u8; 6]; 8]) -> Self {
-        Self { r }
+    /// Create new control bits from the compressed r_bar representation.
+    pub fn new(r_bar: [[u8; 2]; 4]) -> Self {
+        Self { r_bar }
     }
+
+    /// Total size in bytes for transmission.
+    /// Each of the 4 entries has 2 bits, so 8 bits total = 1 byte.
+    /// In practice we use 8 bytes for alignment.
+    pub const SIZE_BYTES: usize = 8;
 }
 
 /// Output of garbling a Three Halves AND gate.
@@ -343,9 +354,9 @@ pub fn garble_and_gate(
     // 3. Sample the randomized control matrix R for AND gate (ODD mode)
     // The truth table depends on the point-and-permute bits
     let t = and_truth_table_with_permute(pi_a, pi_b);
-    let (r, _r_bar) = sample_r_odd(&t, rand_bits);
+    let (r, r_bar) = sample_r_odd(&t, rand_bits);
 
-    // DUMMY PROTOCOL: We send the full R matrix instead of r_bar
+    // The garbler uses full R internally, but sends compressed r_bar to evaluator
 
     // 4. Compute M · H⃗ (hash contribution)
     let m_times_h = apply_m_to_hashes(&hashes);
@@ -370,8 +381,8 @@ pub fn garble_and_gate(
 
     let gate = ThreeHalvesGate::new(output[2], output[3], output[4]);
 
-    // DUMMY PROTOCOL: Send full R matrix instead of compressed r_bar
-    let control_bits = ControlBits::new(r);
+    // Send compressed r_bar to evaluator (proper protocol)
+    let control_bits = ControlBits::new(r_bar);
 
     GarbledGate {
         output_label: c0,
@@ -384,29 +395,34 @@ pub fn garble_and_gate(
 // Evaluation
 // ============================================================================
 
-/// DUMMY PROTOCOL: Extract the evaluator's marginal directly from R matrix.
-///
-/// The evaluator has access to the full R matrix. For input (i,j), they need
-/// rows 2*ij and 2*ij+1, columns 0-3 (the A and B coefficients).
-///
-/// # Key Insight from Paper (Equation 6, Page 12)
-///
-/// The R matrix is designed such that the Δ columns (4-5) satisfy:
-/// R[row][4] = R[row][0]*i + R[row][2]*j
-/// R[row][5] = R[row][1]*i + R[row][3]*j
-///
-/// This means the Δ contribution is implicitly handled when the evaluator
-/// uses their labels A_i = A₀ ⊕ i·Δ and B_j = B₀ ⊕ j·Δ.
-fn extract_evaluator_marginal_from_r(r: &[[u8; 6]; 8], i: usize, j: usize) -> [[u8; 4]; 2] {
-    let ij = (i << 1) | j;
-    let row_l = 2 * ij;
-    let row_r = 2 * ij + 1;
+use super::control::{expand_marginal, extract_r_p_marginal};
 
-    // Extract columns 0-3 (A_L, A_R, B_L, B_R coefficients)
-    let mut marginal = [[0u8; 4]; 2];
-    for col in 0..4 {
-        marginal[0][col] = r[row_l][col];
-        marginal[1][col] = r[row_r][col];
+/// Extract and expand the evaluator's marginal from compressed r_bar.
+///
+/// For ODD mode (AND gates), this:
+/// 1. Gets r_bar_ij coefficients for input position (i,j)
+/// 2. Expands using basis {S₁, S₂}: R_ij = c₁·S₁ ⊕ c₂·S₂
+/// 3. Adds R_P's marginal (since parity is public in ODD mode)
+///
+/// # Key Insight from Paper (Section 5.1, Figure 4)
+///
+/// In ODD mode, the evaluator knows parity is odd and adds R_P themselves.
+/// The compressed r_bar only contains R$ ⊕ a·R_a ⊕ b·R_b (without R_P).
+fn expand_evaluator_marginal(r_bar: &[[u8; 2]; 4], i: usize, j: usize) -> [[u8; 4]; 2] {
+    let ij = (i << 1) | j;
+
+    // 1. Get compressed coefficients for this input position
+    let r_bar_ij = r_bar[ij];
+
+    // 2. Expand using basis: R_ij = c₁·S₁ ⊕ c₂·S₂
+    let mut marginal = expand_marginal(&r_bar_ij);
+
+    // 3. Add R_P's marginal (ODD mode: evaluator knows parity is odd)
+    let r_p_marginal = extract_r_p_marginal(i, j);
+    for row in 0..2 {
+        for col in 0..4 {
+            marginal[row][col] ^= r_p_marginal[row][col];
+        }
     }
 
     marginal
@@ -414,14 +430,16 @@ fn extract_evaluator_marginal_from_r(r: &[[u8; 6]; 8], i: usize, j: usize) -> [[
 
 /// Evaluate a Three Halves AND gate.
 ///
-/// DUMMY PROTOCOL: Uses the full R matrix sent in plaintext.
+/// Uses the compressed r_bar protocol where the evaluator:
+/// 1. Expands r_bar_ij to full marginal using basis {S₁, S₂}
+/// 2. Adds R_P's marginal (ODD mode: parity is public)
 ///
 /// # Arguments
 /// * `cipher` - Fixed-key AES cipher for TCCR hash
 /// * `a` - Input wire A label (for bit i)
 /// * `b` - Input wire B label (for bit j)
 /// * `gate` - Gate ciphertexts from garbling
-/// * `control_bits` - Control bits (contains full R matrix)
+/// * `control_bits` - Control bits (contains compressed r_bar)
 /// * `gid` - Gate ID
 ///
 /// # Returns
@@ -452,8 +470,8 @@ pub fn evaluate_and_gate(
     let a_sliced = SlicedLabel::from_block(a);
     let b_sliced = SlicedLabel::from_block(b);
 
-    // 4. DUMMY PROTOCOL: Extract marginal directly from the full R matrix
-    let marginal = extract_evaluator_marginal_from_r(&control_bits.r, i, j);
+    // 4. Expand compressed r_bar to full marginal (includes R_P for ODD mode)
+    let marginal = expand_evaluator_marginal(&control_bits.r_bar, i, j);
 
     // 5. Get the two rows for this input combination
     let row_l = 2 * ij; // Left half row
@@ -644,10 +662,10 @@ mod tests {
         let result3 = garble_and_gate(cipher, a0, b0, delta, gid, false, false, [false, true]);
         let result4 = garble_and_gate(cipher, a0, b0, delta, gid, false, false, [true, true]);
 
-        // R matrices should differ based on random bits
-        assert_ne!(result1.control_bits.r, result2.control_bits.r);
-        assert_ne!(result1.control_bits.r, result3.control_bits.r);
-        assert_ne!(result1.control_bits.r, result4.control_bits.r);
+        // r_bar matrices should differ based on random bits
+        assert_ne!(result1.control_bits.r_bar, result2.control_bits.r_bar);
+        assert_ne!(result1.control_bits.r_bar, result3.control_bits.r_bar);
+        assert_ne!(result1.control_bits.r_bar, result4.control_bits.r_bar);
     }
 
     /// Test 3: Different gate IDs produce different hashes
@@ -1371,11 +1389,16 @@ mod tests {
     /// Evaluator computes: marginal · [A_i_L, A_i_R, B_j_L, B_j_R]ᵀ → 2 values
     ///
     /// For input (i,j), the evaluator's 2 values should match garbler's rows 2*ij and 2*ij+1.
+    ///
+    /// This tests the compressed r_bar protocol:
+    /// 1. Garbler samples (R, r_bar) and computes full R·[A₀;B₀;Δ]
+    /// 2. Evaluator expands r_bar to marginal and adds R_P (ODD mode)
+    /// 3. Evaluator's marginal·[A_i;B_j] should match garbler's rows
     #[test]
     fn test_evaluator_input_contribution() {
         use super::super::control::{and_truth_table, sample_r_odd};
         use super::super::slicing::SlicedLabel;
-        use super::{apply_r_to_inputs, compute_input_contribution, extract_evaluator_marginal_from_r};
+        use super::{apply_r_to_inputs, compute_input_contribution, expand_evaluator_marginal};
 
         let mut rng = ChaCha12Rng::seed_from_u64(77777);
         let mut failures: Vec<(usize, [bool; 2], usize, usize, &str)> = Vec::new();
@@ -1403,7 +1426,7 @@ mod tests {
             // Test all R matrix variations
             for rand_bits in [[false, false], [false, true], [true, false], [true, true]] {
                 let t = and_truth_table();
-                let (r, _) = sample_r_odd(&t, rand_bits);
+                let (r, r_bar) = sample_r_odd(&t, rand_bits);
 
                 // Garbler's full input contribution
                 let garbler_result = apply_r_to_inputs(&r, &a0_sliced, &b0_sliced, &delta_sliced);
@@ -1421,8 +1444,8 @@ mod tests {
                     let row_l = 2 * ij;
                     let row_r = 2 * ij + 1;
 
-                    // Evaluator extracts marginal and computes input contribution
-                    let marginal = extract_evaluator_marginal_from_r(&r, i, j);
+                    // Evaluator expands r_bar to marginal (includes R_P for ODD mode)
+                    let marginal = expand_evaluator_marginal(&r_bar, i, j);
                     let eval_l = compute_input_contribution(&marginal, 0, a_sliced, b_sliced);
                     let eval_r = compute_input_contribution(&marginal, 1, a_sliced, b_sliced);
 

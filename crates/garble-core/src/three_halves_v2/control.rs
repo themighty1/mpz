@@ -604,6 +604,33 @@ pub fn expand_marginal(r_bar_ij: &[u8; 2]) -> [[u8; 4]; 2] {
     result
 }
 
+/// Extract R_P's marginal view for input position (i,j)
+///
+/// In ODD mode, the evaluator knows parity is odd and must add R_P's
+/// contribution to their marginal view. This function extracts the
+/// 2×4 marginal from the constant R_P matrix.
+///
+/// # Arguments
+/// * `i` - First input's color bit (0 or 1)
+/// * `j` - Second input's color bit (0 or 1)
+///
+/// # Returns
+/// The 2×4 marginal view from R_P for position (i,j)
+pub fn extract_r_p_marginal(i: usize, j: usize) -> [[u8; 4]; 2] {
+    let ij = (i << 1) | j;
+    let row_l = 2 * ij;
+    let row_r = 2 * ij + 1;
+
+    // Extract columns 0-3 (A₀_L, A₀_R, B₀_L, B₀_R)
+    let mut marginal = [[0u8; 4]; 2];
+    for col in 0..4 {
+        marginal[0][col] = R_P[row_l][col];
+        marginal[1][col] = R_P[row_r][col];
+    }
+
+    marginal
+}
+
 /// Compress a marginal view to its [c₁, c₂] representation
 ///
 /// Given R_ij, find c₁, c₂ such that R_ij = c₁·S₁ ⊕ c₂·S₂
