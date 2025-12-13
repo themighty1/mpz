@@ -137,8 +137,13 @@ fn compute_hashes(
 
 /// Apply matrix M to hash vector H⃗, producing 8 half-results.
 ///
-/// For row i (computing half h = i%2):
-///   result[i] = XOR of H[j].half(h) for all j where M[i][j] = 1
+/// **IMPORTANT**: The paper's K·M = 0 property requires computing M·H with FULL
+/// hashes first, then extracting the appropriate half for each row. If we extract
+/// halves during the matrix multiply, K[2] (which mixes L and R rows) won't give 0.
+///
+/// Correct approach:
+/// 1. Compute (M·H)[row] as XOR of FULL hashes H[j] where M[row][j] = 1
+/// 2. Extract left half for even rows, right half for odd rows
 ///
 /// # Paper Reference
 /// M is defined on Page 10, mapping hash outputs to evaluation equations.
@@ -146,14 +151,20 @@ fn apply_m_to_hashes(hashes: &[SlicedLabel; 6]) -> [[u8; 8]; 8] {
     let mut result = [[0u8; 8]; 8];
 
     for row in 0..8 {
-        let half = row % 2; // 0 = left, 1 = right
+        // Step 1: Compute FULL M·H for this row (XOR both halves)
+        let mut full_left = [0u8; 8];
+        let mut full_right = [0u8; 8];
 
         for col in 0..6 {
             if M[row][col] == 1 {
-                let h_half = hashes[col].half(half);
-                xor_assign_8(&mut result[row], &h_half);
+                xor_assign_8(&mut full_left, &hashes[col].left);
+                xor_assign_8(&mut full_right, &hashes[col].right);
             }
         }
+
+        // Step 2: Extract the appropriate half based on row parity
+        let half = row % 2; // 0 = left, 1 = right
+        result[row] = if half == 0 { full_left } else { full_right };
     }
 
     result
@@ -200,6 +211,15 @@ fn apply_r_to_inputs(
 
 /// Solve for [C_L, C_R, G₀, G₁, G₂] from RHS using V⁻¹ matrix.
 ///
+/// # Key Insight
+///
+/// The RHS = M·H ⊕ R·input is NOT directly in col(V) because R includes
+/// the truth table contribution. For rows where the truth table says TRUE
+/// (rows 6,7 for AND gate), we need to adjust RHS by XORing Δ before solving.
+///
+/// This adjustment makes RHS_adjusted ∈ col(V) = ker(K), allowing V_INV
+/// to find a valid solution.
+///
 /// From Paper Page 18, Equation 10, V⁻¹ is:
 /// ```text
 /// V⁻¹ = [ 1 0 | 0 0 | 0 0 | 0 0 ]  -> C_L = RHS[0]
@@ -208,28 +228,35 @@ fn apply_r_to_inputs(
 ///       [ 1 1 | 1 1 | 0 0 | 0 0 ]  -> G₁ = RHS[0] ⊕ RHS[1] ⊕ RHS[2] ⊕ RHS[3]
 ///       [ 0 0 | 0 0 | 1 0 | 1 0 ]  -> G₂ = RHS[4] ⊕ RHS[6]
 /// ```
-fn solve_for_output(rhs: &[[u8; 8]; 8]) -> [[u8; 8]; 5] {
+fn solve_for_output(rhs: &[[u8; 8]; 8], delta: &SlicedLabel) -> [[u8; 8]; 5] {
+    // Adjust RHS for truth table: rows 6,7 are TRUE for AND gate
+    // V[6] = [1,0,1,0,0] -> C_L position, so XOR Δ_L
+    // V[7] = [0,1,1,1,0] -> C_R position, so XOR Δ_R
+    let mut rhs_adjusted = *rhs;
+    xor_assign_8(&mut rhs_adjusted[6], &delta.left);
+    xor_assign_8(&mut rhs_adjusted[7], &delta.right);
+
     let mut result = [[0u8; 8]; 5];
 
     // C_L = RHS[0]
-    result[0] = rhs[0];
+    result[0] = rhs_adjusted[0];
 
     // C_R = RHS[1]
-    result[1] = rhs[1];
+    result[1] = rhs_adjusted[1];
 
     // G₀ = RHS[0] ⊕ RHS[1] ⊕ RHS[4] ⊕ RHS[5]
     for k in 0..8 {
-        result[2][k] = rhs[0][k] ^ rhs[1][k] ^ rhs[4][k] ^ rhs[5][k];
+        result[2][k] = rhs_adjusted[0][k] ^ rhs_adjusted[1][k] ^ rhs_adjusted[4][k] ^ rhs_adjusted[5][k];
     }
 
     // G₁ = RHS[0] ⊕ RHS[1] ⊕ RHS[2] ⊕ RHS[3]
     for k in 0..8 {
-        result[3][k] = rhs[0][k] ^ rhs[1][k] ^ rhs[2][k] ^ rhs[3][k];
+        result[3][k] = rhs_adjusted[0][k] ^ rhs_adjusted[1][k] ^ rhs_adjusted[2][k] ^ rhs_adjusted[3][k];
     }
 
     // G₂ = RHS[4] ⊕ RHS[6]
     for k in 0..8 {
-        result[4][k] = rhs[4][k] ^ rhs[6][k];
+        result[4][k] = rhs_adjusted[4][k] ^ rhs_adjusted[6][k];
     }
 
     result
@@ -295,7 +322,7 @@ pub fn garble_and_gate(
 
     // 7. Solve for [C; G⃗] using correct formulas that ensure all marginal equations
     //    hold
-    let output = solve_for_output(&rhs);
+    let output = solve_for_output(&rhs, &delta_sliced);
 
     // 8. Extract output label and gate ciphertexts
     // output = [C_L, C_R, G₀, G₁, G₂]
@@ -682,6 +709,7 @@ mod tests {
     #[test]
     fn test_solve_for_output_satisfies_marginals() {
         use super::super::matrices::V;
+        use super::super::slicing::SlicedLabel;
 
         let mut rng = ChaCha12Rng::seed_from_u64(123);
 
@@ -693,8 +721,11 @@ mod tests {
             }
         }
 
+        // Use zero delta to test pure algebraic properties (no truth table adjustment)
+        let zero_delta = SlicedLabel::ZERO;
+
         // Solve for [C_L, C_R, G₀, G₁, G₂]
-        let output = solve_for_output(&rhs);
+        let output = solve_for_output(&rhs, &zero_delta);
 
         // Verify that rows 0-5 are exactly satisfied (inputs 0,0 and 0,1 and 1,0)
         // Row 0: C_L = RHS[0]
@@ -1167,7 +1198,7 @@ mod tests {
                 }
 
                 // Solve for [C_L, C_R, G₀, G₁, G₂]
-                let output = solve_for_output(&rhs);
+                let output = solve_for_output(&rhs, &delta_sliced);
                 let c_l = output[0];
                 let c_r = output[1];
                 let g0 = output[2];
@@ -1284,5 +1315,982 @@ mod tests {
         }
 
         println!("✓ solve_for_output + V matrix test passed for all trials!");
+    }
+
+    /// Test evaluator's input contribution matches garbler's.
+    ///
+    /// Garbler computes: R · [A₀_L, A₀_R, B₀_L, B₀_R, Δ_L, Δ_R]ᵀ → 8 values
+    /// Evaluator computes: marginal · [A_i_L, A_i_R, B_j_L, B_j_R]ᵀ → 2 values
+    ///
+    /// For input (i,j), the evaluator's 2 values should match garbler's rows 2*ij and 2*ij+1.
+    #[test]
+    fn test_evaluator_input_contribution() {
+        use super::super::control::{and_truth_table, sample_r_odd};
+        use super::super::slicing::SlicedLabel;
+        use super::{apply_r_to_inputs, compute_input_contribution, extract_evaluator_marginal_from_r};
+
+        let mut rng = ChaCha12Rng::seed_from_u64(77777);
+        let mut failures: Vec<(usize, [bool; 2], usize, usize, &str)> = Vec::new();
+
+        for trial in 0..10 {
+            // Generate random labels
+            let mut a0 = Block::random(&mut rng);
+            let mut b0 = Block::random(&mut rng);
+            let mut delta = Block::random(&mut rng);
+
+            delta.set_lsb(true);
+            a0.set_lsb(false);
+            b0.set_lsb(false);
+
+            let a1 = a0 ^ delta;
+            let b1 = b0 ^ delta;
+
+            // Slice labels
+            let a0_sliced = SlicedLabel::from_block(a0);
+            let b0_sliced = SlicedLabel::from_block(b0);
+            let a1_sliced = SlicedLabel::from_block(a1);
+            let b1_sliced = SlicedLabel::from_block(b1);
+            let delta_sliced = SlicedLabel::from_block(delta);
+
+            // Test all R matrix variations
+            for rand_bits in [[false, false], [false, true], [true, false], [true, true]] {
+                let t = and_truth_table();
+                let (r, _) = sample_r_odd(&t, rand_bits);
+
+                // Garbler's full input contribution
+                let garbler_result = apply_r_to_inputs(&r, &a0_sliced, &b0_sliced, &delta_sliced);
+
+                // Test all 4 input combinations
+                let inputs = [
+                    (0, 0, &a0_sliced, &b0_sliced),
+                    (0, 1, &a0_sliced, &b1_sliced),
+                    (1, 0, &a1_sliced, &b0_sliced),
+                    (1, 1, &a1_sliced, &b1_sliced),
+                ];
+
+                for (i, j, a_sliced, b_sliced) in inputs {
+                    let ij = (i << 1) | j;
+                    let row_l = 2 * ij;
+                    let row_r = 2 * ij + 1;
+
+                    // Evaluator extracts marginal and computes input contribution
+                    let marginal = extract_evaluator_marginal_from_r(&r, i, j);
+                    let eval_l = compute_input_contribution(&marginal, 0, a_sliced, b_sliced);
+                    let eval_r = compute_input_contribution(&marginal, 1, a_sliced, b_sliced);
+
+                    // Compare with garbler's result for these rows
+                    if eval_l != garbler_result[row_l] {
+                        println!(
+                            "FAIL Trial {}, rand_bits={:?}, input ({},{}), LEFT half:\n\
+                             Evaluator: {:?}\n\
+                             Garbler[{}]: {:?}\n\
+                             Marginal[0]: {:?}\n\
+                             R[{}]: {:?}",
+                            trial, rand_bits, i, j,
+                            eval_l, row_l, garbler_result[row_l],
+                            marginal[0], row_l, r[row_l]
+                        );
+                        failures.push((trial, rand_bits, i, j, "left"));
+                    } else {
+                        println!("PASS Trial {}, rand_bits={:?}, input ({},{}), LEFT", trial, rand_bits, i, j);
+                    }
+
+                    if eval_r != garbler_result[row_r] {
+                        println!(
+                            "FAIL Trial {}, rand_bits={:?}, input ({},{}), RIGHT half:\n\
+                             Evaluator: {:?}\n\
+                             Garbler[{}]: {:?}\n\
+                             Marginal[1]: {:?}\n\
+                             R[{}]: {:?}",
+                            trial, rand_bits, i, j,
+                            eval_r, row_r, garbler_result[row_r],
+                            marginal[1], row_r, r[row_r]
+                        );
+                        failures.push((trial, rand_bits, i, j, "right"));
+                    } else {
+                        println!("PASS Trial {}, rand_bits={:?}, input ({},{}), RIGHT", trial, rand_bits, i, j);
+                    }
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            println!("\n=== SUMMARY ===");
+            println!("Total failures: {}", failures.len());
+            panic!("{} input contribution tests failed", failures.len());
+        }
+
+        println!("✓ Evaluator input contribution test passed!");
+    }
+
+    /// Test that solve_for_output produces valid output.
+    ///
+    /// After adjusting rows 6,7 with Δ:
+    /// 1. K·RHS_adjusted should = 0 (RHS_adjusted in ker(K))
+    /// 2. V·output should = RHS_adjusted for ALL 8 rows
+    #[test]
+    fn test_solve_for_output_produces_valid_output() {
+        use super::super::control::{and_truth_table, sample_r_odd};
+        use super::super::matrices::{K, V};
+        use super::super::slicing::SlicedLabel;
+        use super::{apply_m_to_hashes, apply_r_to_inputs, compute_hashes, solve_for_output, xor_assign_8};
+
+        let cipher = &(*FIXED_KEY_AES);
+        let mut rng = ChaCha12Rng::seed_from_u64(22222);
+
+        for trial in 0..10 {
+            let mut a0 = Block::random(&mut rng);
+            let mut b0 = Block::random(&mut rng);
+            let mut delta = Block::random(&mut rng);
+
+            delta.set_lsb(true);
+            a0.set_lsb(false);
+            b0.set_lsb(false);
+
+            let gid = trial + 1;
+            let rand_bits: [bool; 2] = [rng.random(), rng.random()];
+
+            let a0_sliced = SlicedLabel::from_block(a0);
+            let b0_sliced = SlicedLabel::from_block(b0);
+            let delta_sliced = SlicedLabel::from_block(delta);
+
+            // Compute garbler's RHS
+            let hashes = compute_hashes(cipher, a0, b0, delta, gid);
+            let m_times_h = apply_m_to_hashes(&hashes);
+
+            let t = and_truth_table();
+            let (r, _) = sample_r_odd(&t, rand_bits);
+            let r_times_input = apply_r_to_inputs(&r, &a0_sliced, &b0_sliced, &delta_sliced);
+
+            let mut rhs = [[0u8; 8]; 8];
+            for row in 0..8 {
+                rhs[row] = m_times_h[row];
+                xor_assign_8(&mut rhs[row], &r_times_input[row]);
+            }
+
+            // Compute RHS_adjusted (what solve_for_output uses internally)
+            let mut rhs_adjusted = rhs;
+            xor_assign_8(&mut rhs_adjusted[6], &delta_sliced.left);
+            xor_assign_8(&mut rhs_adjusted[7], &delta_sliced.right);
+
+            // Check 1: K·RHS_adjusted should = 0
+            for k_row in 0..3 {
+                let mut k_times_rhs_adj = [0u8; 8];
+                for col in 0..8 {
+                    if K[k_row][col] == 1 {
+                        xor_assign_8(&mut k_times_rhs_adj, &rhs_adjusted[col]);
+                    }
+                }
+                if k_times_rhs_adj != [0u8; 8] {
+                    panic!(
+                        "Trial {}: K[{}]·RHS_adjusted ≠ 0\n\
+                         K[{}] = {:?}\n\
+                         Result = {:?}",
+                        trial, k_row, k_row, K[k_row], k_times_rhs_adj
+                    );
+                }
+            }
+
+            // Get output from solve_for_output
+            let output = solve_for_output(&rhs, &delta_sliced);
+
+            // Check 2: V·output should = RHS_adjusted for ALL 8 rows
+            for row in 0..8 {
+                let mut v_times_output = [0u8; 8];
+                if V[row][0] == 1 { xor_assign_8(&mut v_times_output, &output[0]); }
+                if V[row][1] == 1 { xor_assign_8(&mut v_times_output, &output[1]); }
+                if V[row][2] == 1 { xor_assign_8(&mut v_times_output, &output[2]); }
+                if V[row][3] == 1 { xor_assign_8(&mut v_times_output, &output[3]); }
+                if V[row][4] == 1 { xor_assign_8(&mut v_times_output, &output[4]); }
+
+                if v_times_output != rhs_adjusted[row] {
+                    panic!(
+                        "Trial {}: V[{}]·output ≠ RHS_adjusted[{}]\n\
+                         V[{}] = {:?}\n\
+                         V·output = {:?}\n\
+                         RHS_adjusted[{}] = {:?}\n\
+                         output = C_L={:?}, C_R={:?}, G₀={:?}, G₁={:?}, G₂={:?}",
+                        trial, row, row, row, V[row], v_times_output, row, rhs_adjusted[row],
+                        output[0], output[1], output[2], output[3], output[4]
+                    );
+                }
+            }
+        }
+
+        println!("✓ solve_for_output produces valid output test passed!");
+    }
+
+    /// Test gate contribution in isolation.
+    ///
+    /// Verify that compute_gate_contribution correctly applies V[row][2:4] to [G₀, G₁, G₂].
+    ///
+    /// For each row, gate_contrib should equal:
+    ///   V[row][2]·G₀ ⊕ V[row][3]·G₁ ⊕ V[row][4]·G₂
+    #[test]
+    fn test_gate_contribution_isolated() {
+        use super::super::matrices::V;
+        use super::{compute_gate_contribution, ThreeHalvesGate};
+
+        let mut rng = ChaCha12Rng::seed_from_u64(11111);
+
+        // Test with random G values
+        for trial in 0..10 {
+            let mut g0 = [0u8; 8];
+            let mut g1 = [0u8; 8];
+            let mut g2 = [0u8; 8];
+            for i in 0..8 {
+                g0[i] = rng.random();
+                g1[i] = rng.random();
+                g2[i] = rng.random();
+            }
+
+            let gate = ThreeHalvesGate::new(g0, g1, g2);
+
+            // Test each row
+            for row in 0..8 {
+                let result = compute_gate_contribution(row, &gate);
+
+                // Compute expected: V[row][2]·G₀ ⊕ V[row][3]·G₁ ⊕ V[row][4]·G₂
+                let mut expected = [0u8; 8];
+                if V[row][2] == 1 {
+                    for k in 0..8 { expected[k] ^= g0[k]; }
+                }
+                if V[row][3] == 1 {
+                    for k in 0..8 { expected[k] ^= g1[k]; }
+                }
+                if V[row][4] == 1 {
+                    for k in 0..8 { expected[k] ^= g2[k]; }
+                }
+
+                assert_eq!(
+                    result, expected,
+                    "Trial {}, row {}: gate_contrib mismatch\n\
+                     V[{}] = {:?}\n\
+                     G₀={:?}, G₁={:?}, G₂={:?}\n\
+                     Got: {:?}\n\
+                     Expected: {:?}",
+                    trial, row, row, V[row], g0, g1, g2, result, expected
+                );
+            }
+        }
+
+        println!("✓ Gate contribution isolated test passed!");
+    }
+
+    /// Test R matrix Δ column constraint.
+    ///
+    /// For evaluator with A_i = A₀ ⊕ i·Δ and B_j = B₀ ⊕ j·Δ to get the same
+    /// result as garbler, the R matrix must satisfy:
+    ///
+    /// For row r corresponding to input (i,j):
+    ///   R[r][4] = i·R[r][0] ⊕ j·R[r][2]  (Δ_L column)
+    ///   R[r][5] = i·R[r][1] ⊕ j·R[r][3]  (Δ_R column)
+    ///
+    /// Row mapping:
+    ///   Rows 0,1: (0,0) → R[r][4]=0, R[r][5]=0
+    ///   Rows 2,3: (0,1) → R[r][4]=R[r][2], R[r][5]=R[r][3]
+    ///   Rows 4,5: (1,0) → R[r][4]=R[r][0], R[r][5]=R[r][1]
+    ///   Rows 6,7: (1,1) → R[r][4]=R[r][0]⊕R[r][2], R[r][5]=R[r][1]⊕R[r][3]
+    #[test]
+    fn test_r_matrix_delta_column_constraint() {
+        use super::super::control::{and_truth_table, sample_r_odd};
+
+        let mut failures: Vec<(usize, [bool; 2], usize, &str)> = Vec::new();
+
+        // Test all R matrix variations
+        for (idx, rand_bits) in [[false, false], [false, true], [true, false], [true, true]].iter().enumerate() {
+            let t = and_truth_table();
+            let (r, _) = sample_r_odd(&t, *rand_bits);
+
+            // Check each row
+            for row in 0..8 {
+                let ij = row / 2;
+                let i = ij >> 1;
+                let j = ij & 1;
+
+                // Expected Δ_L column: i·R[r][0] ⊕ j·R[r][2]
+                let expected_delta_l = (i as u8 * r[row][0]) ^ (j as u8 * r[row][2]);
+                // Expected Δ_R column: i·R[r][1] ⊕ j·R[r][3]
+                let expected_delta_r = (i as u8 * r[row][1]) ^ (j as u8 * r[row][3]);
+
+                if r[row][4] != expected_delta_l {
+                    println!(
+                        "FAIL rand_bits={:?}, row {} (i={},j={}), Δ_L:\n\
+                         R[{}][4] = {}, expected {} (= {}*R[{}][0] ⊕ {}*R[{}][2] = {}*{} ⊕ {}*{})\n\
+                         Full row: {:?}",
+                        rand_bits, row, i, j,
+                        row, r[row][4], expected_delta_l,
+                        i, row, j, row, i, r[row][0], j, r[row][2],
+                        r[row]
+                    );
+                    failures.push((idx, *rand_bits, row, "Δ_L"));
+                }
+
+                if r[row][5] != expected_delta_r {
+                    println!(
+                        "FAIL rand_bits={:?}, row {} (i={},j={}), Δ_R:\n\
+                         R[{}][5] = {}, expected {} (= {}*R[{}][1] ⊕ {}*R[{}][3] = {}*{} ⊕ {}*{})\n\
+                         Full row: {:?}",
+                        rand_bits, row, i, j,
+                        row, r[row][5], expected_delta_r,
+                        i, row, j, row, i, r[row][1], j, r[row][3],
+                        r[row]
+                    );
+                    failures.push((idx, *rand_bits, row, "Δ_R"));
+                }
+            }
+        }
+
+        if failures.is_empty() {
+            println!("✓ R matrix Δ column constraint test passed!");
+        } else {
+            println!("\n=== SUMMARY ===");
+            println!("Total failures: {}", failures.len());
+            panic!("{} Δ column constraint tests failed", failures.len());
+        }
+    }
+
+    /// Test evaluator's hash contribution matches garbler's.
+    ///
+    /// Garbler computes M · [H(A₀), H(A₁), H(B₀), H(B₁), H(A₀⊕B₀), H(A₀⊕B₁)]ᵀ → 8 values
+    /// Evaluator computes hash contribution using only 3 hashes: H(A_i), H(B_j), H(A_i⊕B_j)
+    ///
+    /// For input (i,j), evaluator's hash contribution for rows 2*ij and 2*ij+1
+    /// should match garbler's M·H⃗ for those rows.
+    #[test]
+    fn test_evaluator_hash_contribution() {
+        use super::super::slicing::SlicedLabel;
+        use super::{apply_m_to_hashes, compute_hash_contribution_eval, compute_hashes};
+
+        let cipher = &(*FIXED_KEY_AES);
+        let mut rng = ChaCha12Rng::seed_from_u64(88888);
+        let mut failures: Vec<(usize, usize, usize, &str)> = Vec::new();
+
+        for trial in 0..10 {
+            // Generate random labels
+            let mut a0 = Block::random(&mut rng);
+            let mut b0 = Block::random(&mut rng);
+            let mut delta = Block::random(&mut rng);
+
+            delta.set_lsb(true);
+            a0.set_lsb(false);
+            b0.set_lsb(false);
+
+            let a1 = a0 ^ delta;
+            let b1 = b0 ^ delta;
+
+            let gid = trial + 1;
+            let tweak = Block::new((gid as u128).to_be_bytes());
+
+            // Garbler computes all 6 hashes
+            let garbler_hashes = compute_hashes(cipher, a0, b0, delta, gid);
+            let garbler_m_h = apply_m_to_hashes(&garbler_hashes);
+
+            // Test all 4 input combinations
+            let inputs = [
+                (0, 0, a0, b0),
+                (0, 1, a0, b1),
+                (1, 0, a1, b0),
+                (1, 1, a1, b1),
+            ];
+
+            for (i, j, a, b) in inputs {
+                let ij = (i << 1) | j;
+                let row_l = 2 * ij;
+                let row_r = 2 * ij + 1;
+
+                // Evaluator computes their 3 hashes
+                let mut eval_hash_inputs = [a, b, a ^ b];
+                cipher.tccr_many(&[tweak; 3], &mut eval_hash_inputs);
+
+                let h_a = SlicedLabel::from_block(eval_hash_inputs[0]);
+                let h_b = SlicedLabel::from_block(eval_hash_inputs[1]);
+                let h_ab = SlicedLabel::from_block(eval_hash_inputs[2]);
+
+                // Evaluator's hash contribution
+                let eval_l = compute_hash_contribution_eval(row_l, &h_a, &h_b, &h_ab);
+                let eval_r = compute_hash_contribution_eval(row_r, &h_a, &h_b, &h_ab);
+
+                // Compare with garbler's M·H⃗
+                if eval_l != garbler_m_h[row_l] {
+                    println!(
+                        "FAIL Trial {}, input ({},{}), LEFT half:\n\
+                         Evaluator: {:?}\n\
+                         Garbler M·H[{}]: {:?}",
+                        trial, i, j, eval_l, row_l, garbler_m_h[row_l]
+                    );
+                    failures.push((trial, i, j, "left"));
+                } else {
+                    println!("PASS Trial {}, input ({},{}), LEFT", trial, i, j);
+                }
+
+                if eval_r != garbler_m_h[row_r] {
+                    println!(
+                        "FAIL Trial {}, input ({},{}), RIGHT half:\n\
+                         Evaluator: {:?}\n\
+                         Garbler M·H[{}]: {:?}",
+                        trial, i, j, eval_r, row_r, garbler_m_h[row_r]
+                    );
+                    failures.push((trial, i, j, "right"));
+                } else {
+                    println!("PASS Trial {}, input ({},{}), RIGHT", trial, i, j);
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            println!("\n=== SUMMARY ===");
+            println!("Total failures: {}", failures.len());
+            panic!("{} hash contribution tests failed", failures.len());
+        }
+
+        println!("✓ Evaluator hash contribution test passed!");
+    }
+
+    /// Test evaluator's gate contribution + final combination.
+    ///
+    /// Given correct hash_contrib and input_contrib (verified above),
+    /// verify that adding gate_contrib produces the correct output C.
+    #[test]
+    fn test_evaluator_gate_and_final_combination() {
+        use super::super::control::{and_truth_table, sample_r_odd};
+        use super::super::slicing::SlicedLabel;
+        use super::{
+            apply_m_to_hashes, apply_r_to_inputs, compute_gate_contribution,
+            compute_hashes, solve_for_output, ThreeHalvesGate, xor_assign_8,
+        };
+
+        let cipher = &(*FIXED_KEY_AES);
+        let mut rng = ChaCha12Rng::seed_from_u64(99999);
+        let mut failures: Vec<(usize, usize, usize, &str)> = Vec::new();
+
+        for trial in 0..10 {
+            let mut a0 = Block::random(&mut rng);
+            let mut b0 = Block::random(&mut rng);
+            let mut delta = Block::random(&mut rng);
+
+            delta.set_lsb(true);
+            a0.set_lsb(false);
+            b0.set_lsb(false);
+
+            let gid = trial + 1;
+
+            // Slice labels
+            let a0_sliced = SlicedLabel::from_block(a0);
+            let b0_sliced = SlicedLabel::from_block(b0);
+            let delta_sliced = SlicedLabel::from_block(delta);
+
+            // Garbler computes everything
+            let hashes = compute_hashes(cipher, a0, b0, delta, gid);
+            let m_times_h = apply_m_to_hashes(&hashes);
+
+            let rand_bits = [rng.random(), rng.random()];
+            let t = and_truth_table();
+            let (r, _) = sample_r_odd(&t, rand_bits);
+
+            let r_times_input = apply_r_to_inputs(&r, &a0_sliced, &b0_sliced, &delta_sliced);
+
+            // Compute RHS = M·H ⊕ R·input
+            let mut rhs = [[0u8; 8]; 8];
+            for row in 0..8 {
+                rhs[row] = m_times_h[row];
+                xor_assign_8(&mut rhs[row], &r_times_input[row]);
+            }
+
+            // Solve for output
+            let output = solve_for_output(&rhs, &delta_sliced);
+            let c0 = SlicedLabel::new(output[0], output[1]);
+            let c1 = c0 ^ delta_sliced;
+            let gate = ThreeHalvesGate::new(output[2], output[3], output[4]);
+
+            // VERIFY: K · RHS should equal 0 (RHS must be in kernel of K)
+            use super::super::matrices::{K, V};
+            for row in 0..3 {
+                let mut k_times_rhs = [0u8; 8];
+                for col in 0..8 {
+                    if K[row][col] == 1 {
+                        xor_assign_8(&mut k_times_rhs, &rhs[col]);
+                    }
+                }
+                if k_times_rhs != [0u8; 8] {
+                    println!(
+                        "KERNEL FAIL Trial {}, K row {}:\n\
+                         K[{}]·RHS = {:?} (should be 0)\n\
+                         K[{}] = {:?}",
+                        trial, row, row, k_times_rhs, row, K[row]
+                    );
+                }
+            }
+
+            // VERIFY: V · output should equal RHS
+            for row in 0..8 {
+                let mut v_times_output = [0u8; 8];
+                if V[row][0] == 1 { xor_assign_8(&mut v_times_output, &output[0]); }
+                if V[row][1] == 1 { xor_assign_8(&mut v_times_output, &output[1]); }
+                if V[row][2] == 1 { xor_assign_8(&mut v_times_output, &output[2]); }
+                if V[row][3] == 1 { xor_assign_8(&mut v_times_output, &output[3]); }
+                if V[row][4] == 1 { xor_assign_8(&mut v_times_output, &output[4]); }
+
+                if v_times_output != rhs[row] {
+                    println!(
+                        "EQUATION FAIL Trial {}, row {}:\n\
+                         V[{}]·output = {:?}\n\
+                         RHS[{}] = {:?}\n\
+                         V[{}] = {:?}",
+                        trial, row, row, v_times_output, row, rhs[row], row, V[row]
+                    );
+                }
+            }
+
+            // Test all 4 input combinations
+            for (i, j) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                let ij = (i << 1) | j;
+                let row_l = 2 * ij;
+                let row_r = 2 * ij + 1;
+
+                // Expected output: C₀ for (0,0),(0,1),(1,0), C₁ for (1,1)
+                let expected = if i == 1 && j == 1 { c1 } else { c0 };
+
+                // Evaluator's computation:
+                // eval = RHS[row] ⊕ gate_contrib
+                // (RHS here is what evaluator computes, which we verified matches garbler's)
+                let gate_contrib_l = compute_gate_contribution(row_l, &gate);
+                let gate_contrib_r = compute_gate_contribution(row_r, &gate);
+
+                let mut eval_l = rhs[row_l];
+                xor_assign_8(&mut eval_l, &gate_contrib_l);
+
+                let mut eval_r = rhs[row_r];
+                xor_assign_8(&mut eval_r, &gate_contrib_r);
+
+                if eval_l != expected.left {
+                    println!(
+                        "FAIL Trial {}, input ({},{}), LEFT:\n\
+                         Evaluator: {:?}\n\
+                         Expected C{}: {:?}\n\
+                         RHS[{}]: {:?}\n\
+                         gate_contrib: {:?}",
+                        trial, i, j, eval_l,
+                        if i == 1 && j == 1 { 1 } else { 0 }, expected.left,
+                        row_l, rhs[row_l], gate_contrib_l
+                    );
+                    failures.push((trial, i, j, "left"));
+                } else {
+                    println!("PASS Trial {}, input ({},{}), LEFT", trial, i, j);
+                }
+
+                if eval_r != expected.right {
+                    println!(
+                        "FAIL Trial {}, input ({},{}), RIGHT:\n\
+                         Evaluator: {:?}\n\
+                         Expected C{}: {:?}\n\
+                         RHS[{}]: {:?}\n\
+                         gate_contrib: {:?}",
+                        trial, i, j, eval_r,
+                        if i == 1 && j == 1 { 1 } else { 0 }, expected.right,
+                        row_r, rhs[row_r], gate_contrib_r
+                    );
+                    failures.push((trial, i, j, "right"));
+                } else {
+                    println!("PASS Trial {}, input ({},{}), RIGHT", trial, i, j);
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            println!("\n=== SUMMARY ===");
+            println!("Total failures: {}", failures.len());
+            panic!("{} gate/combination tests failed", failures.len());
+        }
+
+        println!("✓ Gate contribution + final combination test passed!");
+    }
+
+    /// Minimal diagnostic test: verify K·RHS = 0 step by step.
+    ///
+    /// We know:
+    /// - K·M = 0 (tested)
+    /// - K·R = K·[0 0 t] (tested)
+    ///
+    /// So K·(M·H ⊕ R·input ⊕ t·Δ) should = K·M·H ⊕ K·R·input ⊕ K·(t·Δ)
+    ///                                    = 0 ⊕ K·[0 0 t]·input ⊕ K·(t·Δ)
+    ///                                    = K·(t·Δ) ⊕ K·(t·Δ) = 0
+    #[test]
+    fn test_k_rhs_diagnostic() {
+        use super::super::control::{and_truth_table, sample_r_odd};
+        use super::super::matrices::{K, M};
+        use super::super::slicing::SlicedLabel;
+        use super::xor_assign_8;
+
+        let mut rng = ChaCha12Rng::seed_from_u64(12345);
+
+        // Generate random labels
+        let mut a0 = Block::random(&mut rng);
+        let mut b0 = Block::random(&mut rng);
+        let mut delta = Block::random(&mut rng);
+        delta.set_lsb(true);
+        a0.set_lsb(false);
+        b0.set_lsb(false);
+
+        let a0_sliced = SlicedLabel::from_block(a0);
+        let b0_sliced = SlicedLabel::from_block(b0);
+        let delta_sliced = SlicedLabel::from_block(delta);
+
+        // Sample R
+        let t = and_truth_table();
+        let (r, _) = sample_r_odd(&t, [true, false]);
+
+        // Build input vector: [A₀_L, A₀_R, B₀_L, B₀_R, Δ_L, Δ_R]
+        let inputs: [[u8; 8]; 6] = [
+            a0_sliced.left, a0_sliced.right,
+            b0_sliced.left, b0_sliced.right,
+            delta_sliced.left, delta_sliced.right,
+        ];
+
+        // Step 1: Compute R·input
+        let mut r_times_input = [[0u8; 8]; 8];
+        for row in 0..8 {
+            for col in 0..6 {
+                if r[row][col] == 1 {
+                    xor_assign_8(&mut r_times_input[row], &inputs[col]);
+                }
+            }
+        }
+
+        // Step 2: Compute K·(R·input)
+        println!("\n=== K·(R·input) ===");
+        for k_row in 0..3 {
+            let mut k_times_r_input = [0u8; 8];
+            for col in 0..8 {
+                if K[k_row][col] == 1 {
+                    xor_assign_8(&mut k_times_r_input, &r_times_input[col]);
+                }
+            }
+            let is_zero = k_times_r_input == [0u8; 8];
+            println!("K[{}]·(R·input) = {:?} (zero: {})", k_row, k_times_r_input, is_zero);
+        }
+
+        // Step 3: Compute [0 0 t]·input = t·Δ
+        // For AND gate: t[6]=[1,0], t[7]=[0,1], rest are [0,0]
+        let mut t_times_delta = [[0u8; 8]; 8];
+        // Row 6: 1·Δ_L + 0·Δ_R = Δ_L
+        t_times_delta[6] = delta_sliced.left;
+        // Row 7: 0·Δ_L + 1·Δ_R = Δ_R
+        t_times_delta[7] = delta_sliced.right;
+
+        // Step 4: Compute K·(t·Δ)
+        println!("\n=== K·(t·Δ) ===");
+        for k_row in 0..3 {
+            let mut k_times_t_delta = [0u8; 8];
+            for col in 0..8 {
+                if K[k_row][col] == 1 {
+                    xor_assign_8(&mut k_times_t_delta, &t_times_delta[col]);
+                }
+            }
+            let is_zero = k_times_t_delta == [0u8; 8];
+            println!("K[{}]·(t·Δ) = {:?} (zero: {})", k_row, k_times_t_delta, is_zero);
+        }
+
+        // Step 5: They should be equal (both = K·[0 0 t]·input)
+        println!("\n=== Comparing K·(R·input) vs K·(t·Δ) ===");
+        for k_row in 0..3 {
+            let mut k_times_r_input = [0u8; 8];
+            let mut k_times_t_delta = [0u8; 8];
+            for col in 0..8 {
+                if K[k_row][col] == 1 {
+                    xor_assign_8(&mut k_times_r_input, &r_times_input[col]);
+                    xor_assign_8(&mut k_times_t_delta, &t_times_delta[col]);
+                }
+            }
+            let equal = k_times_r_input == k_times_t_delta;
+            println!("K[{}]: R·input={:?}, t·Δ={:?}, equal: {}",
+                k_row, k_times_r_input, k_times_t_delta, equal);
+            if !equal {
+                // Print XOR to see the difference
+                let mut diff = [0u8; 8];
+                for i in 0..8 { diff[i] = k_times_r_input[i] ^ k_times_t_delta[i]; }
+                println!("       Difference (XOR): {:?}", diff);
+            }
+        }
+
+        // Step 6: Verify K·R = K·[0 0 t] by computing K·R directly
+        println!("\n=== Verifying K·R = K·[0 0 t] ===");
+        // K is 3×8, R is 8×6, so K·R is 3×6
+        let mut k_times_r = [[0u8; 6]; 3];
+        for i in 0..3 {
+            for j in 0..6 {
+                for k in 0..8 {
+                    k_times_r[i][j] ^= K[i][k] * r[k][j];
+                }
+            }
+        }
+        // [0 0 t] is 8×6 with t in columns 4,5
+        let mut zero_zero_t = [[0u8; 6]; 8];
+        for i in 0..8 {
+            zero_zero_t[i][4] = t[i][0];
+            zero_zero_t[i][5] = t[i][1];
+        }
+        let mut k_times_zero_zero_t = [[0u8; 6]; 3];
+        for i in 0..3 {
+            for j in 0..6 {
+                for k in 0..8 {
+                    k_times_zero_zero_t[i][j] ^= K[i][k] * zero_zero_t[k][j];
+                }
+            }
+        }
+        for i in 0..3 {
+            let equal = k_times_r[i] == k_times_zero_zero_t[i];
+            println!("K·R[{}] = {:?}, K·[0 0 t][{}] = {:?}, equal: {}",
+                i, k_times_r[i], i, k_times_zero_zero_t[i], equal);
+        }
+
+        // The XOR of K·(R·input) and K·(t·Δ) should be zero
+        // since K·R·input = K·[0 0 t]·input and [0 0 t]·input = t·Δ
+        println!("\n=== Final check: K·(R·input) ⊕ K·(t·Δ) ===");
+        let mut all_zero = true;
+        for k_row in 0..3 {
+            let mut xor_result = [0u8; 8];
+            for col in 0..8 {
+                if K[k_row][col] == 1 {
+                    xor_assign_8(&mut xor_result, &r_times_input[col]);
+                    xor_assign_8(&mut xor_result, &t_times_delta[col]);
+                }
+            }
+            let is_zero = xor_result == [0u8; 8];
+            if !is_zero { all_zero = false; }
+            println!("K[{}]·(R·input) ⊕ K[{}]·(t·Δ) = {:?} (zero: {})",
+                k_row, k_row, xor_result, is_zero);
+        }
+
+        assert!(all_zero, "K·(R·input) should equal K·(t·Δ)");
+    }
+
+    /// Verify K·V = 0 in the sliced case.
+    ///
+    /// K[0] and K[1] only involve same-parity rows, so they work.
+    /// K[2] mixes parities, so it may fail.
+    #[test]
+    fn test_k_v_sliced_case() {
+        use super::super::matrices::{K, V};
+        use super::super::slicing::SlicedLabel;
+        use super::xor_assign_8;
+
+        let mut rng = ChaCha12Rng::seed_from_u64(55555);
+
+        // Random C and G values
+        let c_l: [u8; 8] = rng.random();
+        let c_r: [u8; 8] = rng.random();
+        let g0: [u8; 8] = rng.random();
+        let g1: [u8; 8] = rng.random();
+        let g2: [u8; 8] = rng.random();
+
+        // Compute V·[C_L, C_R, G₀, G₁, G₂]
+        let x = [c_l, c_r, g0, g1, g2];
+        let mut v_times_x = [[0u8; 8]; 8];
+        for row in 0..8 {
+            for col in 0..5 {
+                if V[row][col] == 1 {
+                    xor_assign_8(&mut v_times_x[row], &x[col]);
+                }
+            }
+        }
+
+        println!("\n=== V·x for each row ===");
+        for row in 0..8 {
+            println!("(V·x)[{}] = {:?}", row, v_times_x[row]);
+        }
+
+        println!("\n=== K·(V·x) for each K row ===");
+        for k_row in 0..3 {
+            let mut result = [0u8; 8];
+            for col in 0..8 {
+                if K[k_row][col] == 1 {
+                    xor_assign_8(&mut result, &v_times_x[col]);
+                }
+            }
+            let is_zero = result == [0u8; 8];
+            println!("K[{}]·(V·x) = {:?} (zero: {})", k_row, result, is_zero);
+            if !is_zero {
+                println!("  K[{}] involves rows: {:?}", k_row,
+                    (0..8).filter(|&c| K[k_row][c] == 1).collect::<Vec<_>>());
+                // Show what each involved row contributes
+                for col in 0..8 {
+                    if K[k_row][col] == 1 {
+                        println!("    Row {} ({}): V[{}] = {:?}, (V·x)[{}] = {:?}",
+                            col, if col % 2 == 0 { "left" } else { "right" },
+                            col, V[col], col, v_times_x[col]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extended diagnostic: include M·H term and verify full K·RHS_adjusted = 0.
+    #[test]
+    fn test_k_rhs_with_hashes_diagnostic() {
+        use super::super::control::{and_truth_table, sample_r_odd};
+        use super::super::matrices::K;
+        use super::super::slicing::SlicedLabel;
+        use super::{apply_m_to_hashes, apply_r_to_inputs, compute_hashes, xor_assign_8};
+
+        let cipher = &(*FIXED_KEY_AES);
+        let mut rng = ChaCha12Rng::seed_from_u64(22222); // Same seed as failing test
+
+        for trial in 0..3 {
+            let mut a0 = Block::random(&mut rng);
+            let mut b0 = Block::random(&mut rng);
+            let mut delta = Block::random(&mut rng);
+            delta.set_lsb(true);
+            a0.set_lsb(false);
+            b0.set_lsb(false);
+
+            let gid = trial + 1;
+            let rand_bits: [bool; 2] = [rng.random(), rng.random()];
+
+            let a0_sliced = SlicedLabel::from_block(a0);
+            let b0_sliced = SlicedLabel::from_block(b0);
+            let delta_sliced = SlicedLabel::from_block(delta);
+
+            println!("\n========== Trial {} ==========", trial);
+
+            // Compute M·H
+            let hashes = compute_hashes(cipher, a0, b0, delta, gid);
+            let m_times_h = apply_m_to_hashes(&hashes);
+
+            // Compute R·input
+            let t = and_truth_table();
+            let (r, _) = sample_r_odd(&t, rand_bits);
+            let r_times_input = apply_r_to_inputs(&r, &a0_sliced, &b0_sliced, &delta_sliced);
+
+            // Compute RHS = M·H ⊕ R·input
+            let mut rhs = [[0u8; 8]; 8];
+            for row in 0..8 {
+                rhs[row] = m_times_h[row];
+                xor_assign_8(&mut rhs[row], &r_times_input[row]);
+            }
+
+            // Compute RHS_adjusted = RHS ⊕ t·Δ
+            let mut rhs_adjusted = rhs;
+            xor_assign_8(&mut rhs_adjusted[6], &delta_sliced.left);
+            xor_assign_8(&mut rhs_adjusted[7], &delta_sliced.right);
+
+            // Check K·(M·H)
+            println!("\n--- K·(M·H) ---");
+            for k_row in 0..3 {
+                let mut result = [0u8; 8];
+                for col in 0..8 {
+                    if K[k_row][col] == 1 {
+                        xor_assign_8(&mut result, &m_times_h[col]);
+                    }
+                }
+                let is_zero = result == [0u8; 8];
+                println!("K[{}]·(M·H) = {:?} (zero: {})", k_row, result, is_zero);
+            }
+
+            // Check K·(R·input)
+            println!("\n--- K·(R·input) ---");
+            for k_row in 0..3 {
+                let mut result = [0u8; 8];
+                for col in 0..8 {
+                    if K[k_row][col] == 1 {
+                        xor_assign_8(&mut result, &r_times_input[col]);
+                    }
+                }
+                let is_zero = result == [0u8; 8];
+                println!("K[{}]·(R·input) = {:?} (zero: {})", k_row, result, is_zero);
+            }
+
+            // Check K·RHS
+            println!("\n--- K·RHS (before adjustment) ---");
+            for k_row in 0..3 {
+                let mut result = [0u8; 8];
+                for col in 0..8 {
+                    if K[k_row][col] == 1 {
+                        xor_assign_8(&mut result, &rhs[col]);
+                    }
+                }
+                let is_zero = result == [0u8; 8];
+                println!("K[{}]·RHS = {:?} (zero: {})", k_row, result, is_zero);
+            }
+
+            // Check K·RHS_adjusted
+            println!("\n--- K·RHS_adjusted (after t·Δ adjustment) ---");
+            for k_row in 0..3 {
+                let mut result = [0u8; 8];
+                for col in 0..8 {
+                    if K[k_row][col] == 1 {
+                        xor_assign_8(&mut result, &rhs_adjusted[col]);
+                    }
+                }
+                let is_zero = result == [0u8; 8];
+                println!("K[{}]·RHS_adjusted = {:?} (zero: {})", k_row, result, is_zero);
+                if !is_zero {
+                    println!("  PROBLEM: K[{}] involves rows {:?}", k_row,
+                        (0..8).filter(|&c| K[k_row][c] == 1).collect::<Vec<_>>());
+                }
+            }
+        }
+    }
+
+    /// Test the evaluator's gate contribution function in isolation.
+    ///
+    /// This verifies that compute_gate_contribution correctly applies
+    /// V[row][2:4] · [G₀, G₁, G₂] for all 8 rows.
+    #[test]
+    fn test_evaluator_gate_contribution() {
+        use super::super::matrices::V;
+        use super::compute_gate_contribution;
+
+        let mut rng = ChaCha12Rng::seed_from_u64(77777);
+
+        for trial in 0..10 {
+            // Generate random gate ciphertexts
+            let g0: [u8; 8] = rng.random();
+            let g1: [u8; 8] = rng.random();
+            let g2: [u8; 8] = rng.random();
+
+            let gate = ThreeHalvesGate::new(g0, g1, g2);
+
+            // Test all 8 rows
+            for row in 0..8 {
+                // Compute using the function under test
+                let result = compute_gate_contribution(row, &gate);
+
+                // Compute expected result manually: V[row][2:4] · [G₀, G₁, G₂]
+                let mut expected = [0u8; 8];
+                if V[row][2] == 1 {
+                    for k in 0..8 {
+                        expected[k] ^= g0[k];
+                    }
+                }
+                if V[row][3] == 1 {
+                    for k in 0..8 {
+                        expected[k] ^= g1[k];
+                    }
+                }
+                if V[row][4] == 1 {
+                    for k in 0..8 {
+                        expected[k] ^= g2[k];
+                    }
+                }
+
+                assert_eq!(
+                    result, expected,
+                    "Trial {}, row {}: gate contribution mismatch.\n\
+                     V[{}][2:5] = [{}, {}, {}]\n\
+                     Got:      {:?}\n\
+                     Expected: {:?}",
+                    trial, row, row, V[row][2], V[row][3], V[row][4],
+                    result, expected
+                );
+
+                println!(
+                    "PASS Trial {}, row {}: V[{}][2:5]=[{},{},{}]",
+                    trial, row, row, V[row][2], V[row][3], V[row][4]
+                );
+            }
+        }
+
+        println!("✓ Evaluator gate contribution test passed!");
     }
 }
