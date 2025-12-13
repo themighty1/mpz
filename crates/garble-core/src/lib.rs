@@ -1,32 +1,39 @@
 //! Core components used to implement garbled circuit protocols
 //!
-//! This crate implements "half-gate" garbled circuits from the [Two Halves Make a Whole \[ZRE15\]](https://eprint.iacr.org/2014/756) paper.
+//! This crate provides two garbling schemes:
 //!
-//! It also includes an implementation of the "Three Halves Make a Whole" scheme from
+//! ## Half-Gates (default)
+//!
+//! The [`half_gates`] module implements "half-gate" garbled circuits from the
+//! [Two Halves Make a Whole \[ZRE15\]](https://eprint.iacr.org/2014/756) paper.
+//! AND gates require **2κ bits** (two ciphertexts).
+//!
+//! ## Three-Halves
+//!
+//! The [`three_halves`] module implements the "Three Halves Make a Whole" scheme from
 //! [Rosulek & Roy 2021](https://eprint.iacr.org/2021/749) which reduces AND gate size
-//! from 2κ bits to 1.5κ + 5 bits.
+//! from 2κ bits to **1.5κ + 5 bits**.
 
 #![deny(missing_docs, unreachable_pub, unused_must_use)]
 #![deny(clippy::all)]
 
 pub(crate) mod circuit;
-mod evaluator;
-mod garbler;
+pub mod half_gates;
 pub mod store;
 pub mod three_halves;
-pub mod three_halves_v2;
 pub(crate) mod view;
 
+// Re-export shared types
 pub use circuit::{EncryptedGate, EncryptedGateBatch, GarbledCircuit};
-pub use evaluator::{
-    EncryptedGateBatchConsumer, EncryptedGateConsumer, Evaluator, EvaluatorError, EvaluatorOutput,
-    evaluate_garbled_circuits,
-};
-pub use garbler::{
-    EncryptedGateBatchIter, EncryptedGateIter, Garbler, GarblerError, GarblerOutput,
-};
 pub use mpz_memory_core::correlated::{Delta, Key, Mac};
 pub use view::FlushView;
+
+// Re-export half_gates as the default scheme for backwards compatibility
+pub use half_gates::{
+    EncryptedGateBatchConsumer, EncryptedGateConsumer, Evaluator, EvaluatorError, EvaluatorOutput,
+    EncryptedGateBatchIter, EncryptedGateIter, Garbler, GarblerError, GarblerOutput,
+    evaluate_garbled_circuits,
+};
 
 const KB: usize = 1024;
 const BYTES_PER_GATE: usize = 32;
@@ -55,13 +62,13 @@ mod tests {
     use rand::{Rng, SeedableRng, rngs::StdRng};
     use rand_chacha::ChaCha12Rng;
 
-    use crate::evaluator::evaluate_garbled_circuits;
+    use crate::half_gates::evaluate_garbled_circuits;
 
     use super::*;
 
     #[test]
     fn test_and_gate() {
-        use crate::{evaluator as ev, garbler as gb};
+        use crate::half_gates::{evaluator as ev, garbler as gb};
 
         let mut rng = ChaCha12Rng::seed_from_u64(0);
         let cipher = &(*FIXED_KEY_AES);

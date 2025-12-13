@@ -23,26 +23,58 @@
 //!
 //! - [`matrices`]: Core matrices (K, V, M) that define the linear algebraic structure
 //! - [`control`]: Control matrix system (R, S₁, S₂) for the "dicing" technique
+//! - [`slicing`]: Wire label slicing utilities
+//! - [`garbler`]: Garbling functions
+//! - [`evaluator`]: Evaluation functions
 //!
-//! ## Key Equations (Paper Section 5)
+//! ## Usage
 //!
-//! The main garbling equation (Equation 4) is:
+//! ```ignore
+//! use mpz_garble_core::three_halves::{Garbler, Evaluator, GarblerOutput, EvaluatorOutput};
 //!
-//! ```text
-//! V · [C; G⃗] = M · H⃗ ⊕ (R ⊕ [0 0 t]) · [A₀; B₀; Δ]
+//! let mut gb = Garbler::default();
+//! let mut ev = Evaluator::default();
+//!
+//! let mut gb_iter = gb.generate(&circuit, delta, &input_keys, &mut rng)?;
+//! let mut ev_consumer = ev.evaluate(&circuit, &input_macs)?;
+//!
+//! while let Some(gate) = gb_iter.next() {
+//!     ev_consumer.next(gate);
+//! }
+//!
+//! let gb_output = gb_iter.finish()?;
+//! let ev_output = ev_consumer.finish()?;
 //! ```
-//!
-//! Where:
-//! - `C` = output wire label (2 halves: C_L, C_R)
-//! - `G⃗` = gate ciphertexts (3 values, each κ/2 bits)
-//! - `H⃗` = hash outputs [H(A₀), H(A₁), H(B₀), H(B₁), H(A₀⊕B₀), H(A₀⊕B₁)]ᵀ
-//! - `t` = truth table (8×2 matrix encoding which input gives true output)
-//! - `R` = control matrix (randomized, determines linear combinations)
 
-pub mod matrices;
 pub mod control;
+/// Evaluator for three-halves garbled circuits.
+pub mod evaluator;
+/// Garbler for three-halves garbled circuits.
+pub mod garbler;
+pub mod matrices;
 pub mod slicing;
-pub mod garbling;
+
+// Re-export main types from garbler
+pub use garbler::{
+    ControlBits,
+    EncryptedGate,
+    EncryptedGateBatch,
+    EncryptedGateBatchIter,
+    EncryptedGateIter,
+    Garbler,
+    GarblerError,
+    GarblerOutput,
+    ThreeHalvesGate,
+};
+
+// Re-export main types from evaluator
+pub use evaluator::{
+    EncryptedGateBatchConsumer,
+    EncryptedGateConsumer,
+    Evaluator,
+    EvaluatorError,
+    EvaluatorOutput,
+};
 
 #[cfg(test)]
 mod tests;
