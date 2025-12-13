@@ -14,6 +14,7 @@ mod evaluator;
 mod garbler;
 pub mod store;
 pub mod three_halves;
+pub mod three_halves_v2;
 pub(crate) mod view;
 
 pub use circuit::{EncryptedGate, EncryptedGateBatch, GarbledCircuit};
