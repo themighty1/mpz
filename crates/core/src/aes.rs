@@ -6,6 +6,51 @@ use once_cell::sync::Lazy;
 
 use crate::Block;
 
+/// Constant α for RTCCR sigma function.
+/// Must be in GF(2^64) \ GF(2^2). We use 0x87 which is commonly used in crypto.
+const RTCCR_ALPHA: u64 = 0x87;
+
+/// Reduction polynomial for GF(2^64): x^64 + x^4 + x^3 + x + 1
+/// The constant represents the low-order bits (without the x^64 term).
+const GF64_REDUCTION: u64 = 0x1B; // bits 0,1,3,4 = 1+2+8+16 = 0x1B
+
+/// Multiply two elements in GF(2^64) with reduction.
+///
+/// Uses the irreducible polynomial x^64 + x^4 + x^3 + x + 1.
+#[inline]
+fn gf64_mul(mut a: u64, mut b: u64) -> u64 {
+    let mut result: u64 = 0;
+
+    while b != 0 {
+        if b & 1 != 0 {
+            result ^= a;
+        }
+        let high_bit = a >> 63;
+        a <<= 1;
+        if high_bit != 0 {
+            a ^= GF64_REDUCTION;
+        }
+        b >>= 1;
+    }
+
+    result
+}
+
+/// RTCCR sigma function: σ(X_L || X_R) = (α·X_L) || (α·X_R)
+///
+/// Multiplies both 64-bit halves of the block by the constant α in GF(2^64).
+/// This is used in the RTCCR (Randomized Tweakable CCR) hash function from
+/// "Three Halves Make a Whole" (Rosulek & Roy, 2021).
+#[inline]
+pub fn rtccr_sigma(block: Block) -> Block {
+    let halves: [u64; 2] = bytemuck::cast(block);
+    let result: [u64; 2] = [
+        gf64_mul(RTCCR_ALPHA, halves[0]),
+        gf64_mul(RTCCR_ALPHA, halves[1]),
+    ];
+    bytemuck::cast(result)
+}
+
 /// A fixed AES key (arbitrarily chosen).
 pub const FIXED_KEY: [u8; 16] = [
     69, 42, 69, 42, 69, 42, 69, 42, 69, 42, 69, 42, 69, 42, 69, 42,
@@ -26,6 +71,52 @@ impl FixedKeyAes {
     pub fn new(key: [u8; 16]) -> Self {
         Self {
             aes: Aes128Enc::new(&key.into()),
+        }
+    }
+
+    /// Randomized tweakable circular correlation-robust hash function (RTCCR).
+    ///
+    /// From "Three Halves Make a Whole" (Rosulek & Roy, 2021):
+    /// <https://eprint.iacr.org/2021/749>
+    ///
+    /// `H(X, τ) = AES_k(X ⊕ τ) ⊕ σ(X ⊕ τ)`
+    ///
+    /// Uses only 1 AES call (vs 2 for TCCR), with GF(2^64) sigma function.
+    #[inline]
+    pub fn rtccr(&self, tweak: Block, block: Block) -> Block {
+        let tweaked = block ^ tweak;
+        let mut encrypted = tweaked;
+        self.aes.encrypt_block(encrypted.as_array_mut());
+        encrypted ^ rtccr_sigma(tweaked)
+    }
+
+    /// Randomized tweakable circular correlation-robust hash function (RTCCR) - batch version.
+    ///
+    /// From "Three Halves Make a Whole" (Rosulek & Roy, 2021):
+    /// <https://eprint.iacr.org/2021/749>
+    ///
+    /// `H(X, τ) = AES_k(X ⊕ τ) ⊕ σ(X ⊕ τ)`
+    ///
+    /// # Arguments
+    ///
+    /// * `tweaks` - The tweaks to use for each block.
+    /// * `blocks` - The blocks to hash in-place.
+    #[inline]
+    pub fn rtccr_many<const N: usize>(&self, tweaks: &[Block; N], blocks: &mut [Block; N]) {
+        // Compute X ⊕ τ for all blocks
+        for (block, tweak) in blocks.iter_mut().zip(tweaks.iter()) {
+            *block ^= *tweak;
+        }
+
+        // Store σ(X ⊕ τ) in buf before encryption overwrites blocks
+        let sigma_buf: [Block; N] = std::array::from_fn(|i| rtccr_sigma(blocks[i]));
+
+        // Encrypt all tweaked blocks: AES_k(X ⊕ τ)
+        self.aes.encrypt_blocks(Block::as_array_mut_slice(blocks));
+
+        // XOR with sigma: AES_k(X ⊕ τ) ⊕ σ(X ⊕ τ)
+        for (block, sigma) in blocks.iter_mut().zip(sigma_buf.iter()) {
+            *block ^= *sigma;
         }
     }
 

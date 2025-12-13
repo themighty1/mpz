@@ -36,17 +36,17 @@
 //! ### Marginal Views
 //!
 //! When the evaluator has input (A_i, B_j), they only see/need the 2×4
-//! submatrix: ```text
+//! submatrix:
 //! R_ij = [R_ijA  R_ijB]  (rows 2i, 2i+1 and columns for A, B parts)
-//! ```
+
 //! The full R is never revealed - only one marginal view per evaluation.
 //!
 //! ## Compression with Basis {S₁, S₂}
 //!
 //! Instead of encrypting 8-bit marginal views, we express them in a 2D basis:
-//! ```text
+//!
 //! R_ij = c₁·S₁ ⊕ c₂·S₂
-//! ```
+//!
 //! This reduces overhead to 2 bits per marginal view × 4 views = 8 bits,
 //! but we encode it as 5 bits total (see paper Section 5.2).
 
@@ -333,7 +333,8 @@ pub const R_BAR_DOLLAR_BASIS_1: [[u8; 2]; 4] = [
 /// - πA: if 0, then A₀=FALSE, A₁=TRUE; if 1, then A₀=TRUE, A₁=FALSE
 /// - πB: similarly for B wire
 ///
-/// When evaluator has labels with color bits (i, j), the actual logical values are:
+/// When evaluator has labels with color bits (i, j), the actual logical values
+/// are:
 /// - xA = πA ⊕ i
 /// - xB = πB ⊕ j
 ///
