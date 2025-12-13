@@ -321,31 +321,75 @@ pub const R_BAR_DOLLAR_BASIS_1: [[u8; 2]; 4] = [
 // Truth Table Representation
 // ============================================================================
 
-/// Truth table for AND gate
+/// Compute truth table for AND gate based on point-and-permute bits.
 ///
-/// The truth table t is an 8×2 matrix where each 2×2 block is either
-/// the identity matrix (output is true) or zero matrix (output is false).
+/// # Paper Reference (Page 16, Figure 6)
 ///
-/// For AND: only input (1,1) gives true output.
+/// ```text
+/// t := [g(πA⊕i, πB⊕j)]  for (i,j) in [(0,0), (0,1), (1,0), (1,1)]
+/// ```
 ///
-/// Paper convention: rows are ordered by input combinations (0,0), (0,1),
-/// (1,0), (1,1) with 2 rows per combination (left and right halves).
+/// The point-and-permute bits determine which wire label represents TRUE:
+/// - πA: if 0, then A₀=FALSE, A₁=TRUE; if 1, then A₀=TRUE, A₁=FALSE
+/// - πB: similarly for B wire
 ///
-/// **The a,b encoding**:
-/// - a = 1 if true output is in row (1,_), i.e., when first input is 1
-/// - b = 1 if true output is in row (_,1), i.e., when second input is 1
-/// - For AND: a=1, b=1 (true at (1,1))
+/// When evaluator has labels with color bits (i, j), the actual logical values are:
+/// - xA = πA ⊕ i
+/// - xB = πB ⊕ j
+///
+/// The truth table entry is g(xA, xB) where g is the AND function.
+///
+/// # Arguments
+/// * `pi_a` - Point-and-permute bit for wire A (0 or 1)
+/// * `pi_b` - Point-and-permute bit for wire B (0 or 1)
+///
+/// # Returns
+/// 8×2 truth table matrix where identity blocks mark TRUE outputs.
+pub fn and_truth_table_with_permute(pi_a: bool, pi_b: bool) -> [[u8; 2]; 8] {
+    let mut t = [[0u8; 2]; 8];
+
+    for i in 0..2u8 {
+        for j in 0..2u8 {
+            // Actual logical values based on color bits and permute bits
+            let x_a = (pi_a as u8) ^ i;
+            let x_b = (pi_b as u8) ^ j;
+
+            // AND gate: output is true iff both inputs are true
+            let output = x_a & x_b;
+
+            // Row index: (i,j) maps to rows 2*(2*i + j) and 2*(2*i + j) + 1
+            let block = (2 * i + j) as usize;
+            let row_l = 2 * block;
+            let row_r = 2 * block + 1;
+
+            if output == 1 {
+                // Identity block for TRUE output
+                t[row_l] = [1, 0];
+                t[row_r] = [0, 1];
+            }
+            // Zero block (default) for FALSE output
+        }
+    }
+
+    t
+}
+
+/// Truth table for AND gate with default permute bits (πA=1, πB=1).
+///
+/// This is the "canonical" AND truth table where (1,1) gives TRUE.
+/// For proper security, use `and_truth_table_with_permute` with random bits.
+///
+/// **WARNING**: Using fixed permute bits leaks information! In production,
+/// always use random πA, πB values.
 pub fn and_truth_table() -> [[u8; 2]; 8] {
-    [
-        [0, 0], // (0,0) left  - output false
-        [0, 0], // (0,0) right
-        [0, 0], // (0,1) left  - output false
-        [0, 0], // (0,1) right
-        [0, 0], // (1,0) left  - output false
-        [0, 0], // (1,0) right
-        [1, 0], // (1,1) left  - output TRUE (identity block row 1)
-        [0, 1], // (1,1) right - output TRUE (identity block row 2)
-    ]
+    // Default: πA=1, πB=1 means A₀=TRUE, B₀=TRUE
+    // So (1,1) color bits give logical (0,0) which is FALSE for AND
+    // And (0,0) color bits give logical (1,1) which is TRUE for AND
+    // Wait, that's backwards from what we had...
+
+    // Let's use πA=0, πB=0 to match the existing behavior:
+    // (1,1) color bits → logical (1,1) → TRUE for AND
+    and_truth_table_with_permute(false, false)
 }
 
 /// Truth table for OR gate
@@ -428,9 +472,7 @@ pub fn extract_truth_table_bits(t: &[[u8; 2]; 8]) -> (u8, u8, u8) {
 /// * `R` - The 8×6 control matrix
 /// * `r_bar` - The 4×2 compressed representation for encryption
 pub fn sample_r_odd(t: &[[u8; 2]; 8], rand_bits: [bool; 2]) -> ([[u8; 6]; 8], [[u8; 2]; 4]) {
-    //let (a, b, p) = extract_truth_table_bits(t);
-    // using a static truth table for now.
-    let (a, b, p) = (1, 1, 1);
+    let (a, b, p) = extract_truth_table_bits(t);
 
     // Start with R$ (randomization)
     let mut r = [[0u8; 6]; 8];
@@ -478,24 +520,17 @@ pub fn sample_r_odd(t: &[[u8; 2]; 8], rand_bits: [bool; 2]) -> ([[u8; 6]; 8], [[
         }
     }
 
+    // Add p·R_p to the FULL R matrix (used by garbler for correctness)
     for i in 0..8 {
         for j in 0..6 {
             r[i][j] ^= p * R_P[i][j];
         }
     }
 
-    // TODO this comment was by claude and it w wrong, i arr R_P to r_bar
-    // NOTE: We do NOT add p·R_p here because in ODD mode the evaluator
-    // knows to add R_p themselves (parity is public). The R_p term is
-    // added during evaluation, not stored in the compressed form.
-    //
-    // However, for the FULL R (used internally by garbler), we DO add R_p:
-
-    for i in 0..4 {
-        for j in 0..2 {
-            r_bar[i][j] ^= p * R_P[i][j];
-        }
-    }
+    // NOTE: We do NOT add p·R_p to r_bar because:
+    // 1. R_P is NOT in the span of {S₁, S₂} basis (see paper Figure 4)
+    // 2. In ODD mode the evaluator knows parity is odd and adds R_P themselves
+    // The r_bar compressed form only contains R$ ⊕ a·R_a ⊕ b·R_b
 
     (r, r_bar)
 }

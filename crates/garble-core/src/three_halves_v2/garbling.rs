@@ -37,7 +37,7 @@
 use mpz_core::{Block, aes::FixedKeyAes};
 
 use super::{
-    control::{and_truth_table, sample_r_odd},
+    control::{and_truth_table_with_permute, sample_r_odd},
     matrices::M,
     slicing::SlicedLabel,
 };
@@ -135,36 +135,40 @@ fn compute_hashes(
     ]
 }
 
-/// Apply matrix M to hash vector H⃗, producing 8 half-results.
+/// Apply matrix M to hash vector H, producing 8 κ/2-bit outputs.
 ///
-/// **IMPORTANT**: The paper's K·M = 0 property requires computing M·H with FULL
-/// hashes first, then extracting the appropriate half for each row. If we extract
-/// halves during the matrix multiply, K[2] (which mixes L and R rows) won't give 0.
+/// # Paper Reference (Section 4.2, Page 10)
 ///
-/// Correct approach:
-/// 1. Compute (M·H)[row] as XOR of FULL hashes H[j] where M[row][j] = 1
-/// 2. Extract left half for even rows, right half for odd rows
+/// > "H(·) is a function with κ/2 bits of output"
 ///
-/// # Paper Reference
-/// M is defined on Page 10, mapping hash outputs to evaluation equations.
+/// **CRITICAL**: ALL 8 rows use the SAME κ/2-bit hash values. The "left/right"
+/// distinction in the scheme refers to which half of the OUTPUT label (C_L vs C_R)
+/// is being computed, NOT which half of the hash to use.
+///
+/// The M matrix specifies which of the 6 hash outputs to XOR for each row.
+/// K×M = 0 holds because the coefficients cancel when all rows use the same values.
+///
+/// M is defined on Page 12:
+/// ```text
+/// M = [1 0 0 0 1 0]  row 0: H(A₀) ⊕ H(A₀⊕B₀)
+///     [0 0 1 0 1 0]  row 1: H(B₀) ⊕ H(A₀⊕B₀)
+///     [1 0 0 0 0 1]  row 2: H(A₀) ⊕ H(A₀⊕B₁)
+///     [0 0 0 1 0 1]  row 3: H(B₁) ⊕ H(A₀⊕B₁)
+///     [0 1 0 0 0 1]  row 4: H(A₁) ⊕ H(A₀⊕B₁)
+///     [0 0 1 0 0 1]  row 5: H(B₀) ⊕ H(A₀⊕B₁)
+///     [0 1 0 0 1 0]  row 6: H(A₁) ⊕ H(A₀⊕B₀)
+///     [0 0 0 1 1 0]  row 7: H(B₁) ⊕ H(A₀⊕B₀)
+/// ```
 fn apply_m_to_hashes(hashes: &[SlicedLabel; 6]) -> [[u8; 8]; 8] {
     let mut result = [[0u8; 8]; 8];
 
     for row in 0..8 {
-        // Step 1: Compute FULL M·H for this row (XOR both halves)
-        let mut full_left = [0u8; 8];
-        let mut full_right = [0u8; 8];
-
         for col in 0..6 {
             if M[row][col] == 1 {
-                xor_assign_8(&mut full_left, &hashes[col].left);
-                xor_assign_8(&mut full_right, &hashes[col].right);
+                // Use .left consistently for all rows (the κ/2-bit hash output)
+                xor_assign_8(&mut result[row], &hashes[col].left);
             }
         }
-
-        // Step 2: Extract the appropriate half based on row parity
-        let half = row % 2; // 0 = left, 1 = right
-        result[row] = if half == 0 { full_left } else { full_right };
     }
 
     result
@@ -214,11 +218,16 @@ fn apply_r_to_inputs(
 /// # Key Insight
 ///
 /// The RHS = M·H ⊕ R·input is NOT directly in col(V) because R includes
-/// the truth table contribution. For rows where the truth table says TRUE
-/// (rows 6,7 for AND gate), we need to adjust RHS by XORing Δ before solving.
+/// the truth table contribution. For rows where the truth table says TRUE,
+/// we need to adjust RHS by XORing Δ before solving.
 ///
 /// This adjustment makes RHS_adjusted ∈ col(V) = ker(K), allowing V_INV
 /// to find a valid solution.
+///
+/// # Arguments
+/// * `rhs` - The right-hand side matrix M·H ⊕ R·input
+/// * `delta` - The global correlation Δ (sliced)
+/// * `t` - The 8×2 truth table matrix (identity blocks mark TRUE outputs)
 ///
 /// From Paper Page 18, Equation 10, V⁻¹ is:
 /// ```text
@@ -228,13 +237,22 @@ fn apply_r_to_inputs(
 ///       [ 1 1 | 1 1 | 0 0 | 0 0 ]  -> G₁ = RHS[0] ⊕ RHS[1] ⊕ RHS[2] ⊕ RHS[3]
 ///       [ 0 0 | 0 0 | 1 0 | 1 0 ]  -> G₂ = RHS[4] ⊕ RHS[6]
 /// ```
-fn solve_for_output(rhs: &[[u8; 8]; 8], delta: &SlicedLabel) -> [[u8; 8]; 5] {
-    // Adjust RHS for truth table: rows 6,7 are TRUE for AND gate
-    // V[6] = [1,0,1,0,0] -> C_L position, so XOR Δ_L
-    // V[7] = [0,1,1,1,0] -> C_R position, so XOR Δ_R
+fn solve_for_output(rhs: &[[u8; 8]; 8], delta: &SlicedLabel, t: &[[u8; 2]; 8]) -> [[u8; 8]; 5] {
+    // Adjust RHS for truth table: find which rows have TRUE output
+    // Identity block [1,0; 0,1] marks TRUE output at rows (2*ij, 2*ij+1)
     let mut rhs_adjusted = *rhs;
-    xor_assign_8(&mut rhs_adjusted[6], &delta.left);
-    xor_assign_8(&mut rhs_adjusted[7], &delta.right);
+
+    // Find the TRUE position by looking for identity block in truth table
+    for ij in 0..4 {
+        let row_l = 2 * ij;
+        let row_r = 2 * ij + 1;
+        // Check if this is an identity block (TRUE output)
+        if t[row_l] == [1, 0] && t[row_r] == [0, 1] {
+            // XOR Δ into the rows where truth table says TRUE
+            xor_assign_8(&mut rhs_adjusted[row_l], &delta.left);
+            xor_assign_8(&mut rhs_adjusted[row_r], &delta.right);
+        }
+    }
 
     let mut result = [[0u8; 8]; 5];
 
@@ -285,12 +303,33 @@ fn xor_assign_8(a: &mut [u8; 8], b: &[u8; 8]) {
 ///
 /// # Paper Reference
 /// This implements the garbling algorithm from Section 5 (Page 11-15).
+/// Garble an AND gate.
+///
+/// # Arguments
+/// * `cipher` - The fixed-key AES cipher for hashing
+/// * `a0` - Wire A label with color bit 0
+/// * `b0` - Wire B label with color bit 0
+/// * `delta` - Global correlation Δ
+/// * `gid` - Gate ID (for domain separation)
+/// * `pi_a` - Point-and-permute bit for wire A (determines which label is TRUE)
+/// * `pi_b` - Point-and-permute bit for wire B (determines which label is TRUE)
+/// * `rand_bits` - Random bits for control matrix sampling
+///
+/// # Paper Reference (Page 16-17, Figure 6)
+///
+/// The truth table is computed as:
+/// ```text
+/// t := [g(πA⊕i, πB⊕j)]  for (i,j) in [(0,0), (0,1), (1,0), (1,1)]
+/// ```
+/// where g is the AND function.
 pub fn garble_and_gate(
     cipher: &FixedKeyAes,
     a0: Block,
     b0: Block,
     delta: Block,
     gid: usize,
+    pi_a: bool,
+    pi_b: bool,
     rand_bits: [bool; 2],
 ) -> GarbledGate {
     // 1. Compute the 6 hash values
@@ -302,7 +341,8 @@ pub fn garble_and_gate(
     let delta_sliced = SlicedLabel::from_block(delta);
 
     // 3. Sample the randomized control matrix R for AND gate (ODD mode)
-    let t = and_truth_table();
+    // The truth table depends on the point-and-permute bits
+    let t = and_truth_table_with_permute(pi_a, pi_b);
     let (r, _r_bar) = sample_r_odd(&t, rand_bits);
 
     // DUMMY PROTOCOL: We send the full R matrix instead of r_bar
@@ -321,8 +361,8 @@ pub fn garble_and_gate(
     }
 
     // 7. Solve for [C; G⃗] using correct formulas that ensure all marginal equations
-    //    hold
-    let output = solve_for_output(&rhs, &delta_sliced);
+    //    hold. Pass truth table so delta is XORed into the correct rows.
+    let output = solve_for_output(&rhs, &delta_sliced, &t);
 
     // 8. Extract output label and gate ciphertexts
     // output = [C_L, C_R, G₀, G₁, G₂]
@@ -446,12 +486,19 @@ pub fn evaluate_and_gate(
     SlicedLabel::new(c_l, c_r).to_block()
 }
 
-/// Compute hash contribution for evaluation (left or right half).
+/// Compute hash contribution for evaluation.
 ///
 /// The evaluator has H(A_i), H(B_j), H(A_i⊕B_j) and needs to compute
 /// the hash contribution matching what the garbler computed via M·H.
 ///
-/// # Key Insight: Hash Column Mapping
+/// # Paper Reference (Section 4.2, Page 10)
+///
+/// > "H(·) is a function with κ/2 bits of output"
+///
+/// **CRITICAL**: ALL rows use the SAME κ/2-bit hash values (using `.left`).
+/// This must match the garbler's `apply_m_to_hashes` function.
+///
+/// # Hash Column Mapping
 ///
 /// The evaluator's three hashes map to the garbler's 6 columns as follows:
 /// - `h_a = H(A_i)` → column `i` (0 for i=0, 1 for i=1)
@@ -461,8 +508,6 @@ pub fn evaluate_and_gate(
 ///   - (0,1): H(A₀⊕B₁) → col 5
 ///   - (1,0): H(A₁⊕B₀) = H(A₀⊕B₁) → col 5
 ///   - (1,1): H(A₁⊕B₁) = H(A₀⊕B₀) → col 4
-///
-/// This uses M matrix values to determine which hashes to XOR.
 fn compute_hash_contribution_eval(
     row: usize,
     h_a: &SlicedLabel,
@@ -471,7 +516,6 @@ fn compute_hash_contribution_eval(
 ) -> [u8; 8] {
     use super::matrices::M;
 
-    let half = row % 2;
     let ij = row / 2;
     let i = ij >> 1;
     let j = ij & 1;
@@ -484,18 +528,19 @@ fn compute_hash_contribution_eval(
     let mut result = [0u8; 8];
 
     // XOR in h_a if M says to use column i (the evaluator's A hash column)
+    // Use .left consistently (κ/2-bit hash output) - must match garbler
     if M[row][i] == 1 {
-        xor_assign_8(&mut result, &h_a.half(half));
+        xor_assign_8(&mut result, &h_a.left);
     }
 
     // XOR in h_b if M says to use column 2+j (the evaluator's B hash column)
     if M[row][2 + j] == 1 {
-        xor_assign_8(&mut result, &h_b.half(half));
+        xor_assign_8(&mut result, &h_b.left);
     }
 
     // XOR in h_ab if M says to use the corresponding combined hash column
     if M[row][ab_col] == 1 {
-        xor_assign_8(&mut result, &h_ab.half(half));
+        xor_assign_8(&mut result, &h_ab.left);
     }
 
     result
@@ -575,8 +620,8 @@ mod tests {
         let gid = 1;
         let rand_bits = [true, false];
 
-        let result1 = garble_and_gate(cipher, a0, b0, delta, gid, rand_bits);
-        let result2 = garble_and_gate(cipher, a0, b0, delta, gid, rand_bits);
+        let result1 = garble_and_gate(cipher, a0, b0, delta, gid, false, false, rand_bits);
+        let result2 = garble_and_gate(cipher, a0, b0, delta, gid, false, false, rand_bits);
 
         assert_eq!(result1.output_label, result2.output_label);
         assert_eq!(result1.gate, result2.gate);
@@ -594,10 +639,10 @@ mod tests {
         let delta = Block::random(&mut rng);
         let gid = 1;
 
-        let result1 = garble_and_gate(cipher, a0, b0, delta, gid, [false, false]);
-        let result2 = garble_and_gate(cipher, a0, b0, delta, gid, [true, false]);
-        let result3 = garble_and_gate(cipher, a0, b0, delta, gid, [false, true]);
-        let result4 = garble_and_gate(cipher, a0, b0, delta, gid, [true, true]);
+        let result1 = garble_and_gate(cipher, a0, b0, delta, gid, false, false, [false, false]);
+        let result2 = garble_and_gate(cipher, a0, b0, delta, gid, false, false, [true, false]);
+        let result3 = garble_and_gate(cipher, a0, b0, delta, gid, false, false, [false, true]);
+        let result4 = garble_and_gate(cipher, a0, b0, delta, gid, false, false, [true, true]);
 
         // R matrices should differ based on random bits
         assert_ne!(result1.control_bits.r, result2.control_bits.r);
@@ -616,8 +661,8 @@ mod tests {
         let delta = Block::random(&mut rng);
         let rand_bits = [false, false];
 
-        let result1 = garble_and_gate(cipher, a0, b0, delta, 1, rand_bits);
-        let result2 = garble_and_gate(cipher, a0, b0, delta, 2, rand_bits);
+        let result1 = garble_and_gate(cipher, a0, b0, delta, 1, false, false, rand_bits);
+        let result2 = garble_and_gate(cipher, a0, b0, delta, 2, false, false, rand_bits);
 
         // Output labels should differ due to different gate IDs
         assert_ne!(result1.output_label, result2.output_label);
@@ -685,7 +730,7 @@ mod tests {
         // Garble multiple gates to check consistency
         for gid in 1..10 {
             let rand_bits: [bool; 2] = [rng.random(), rng.random()];
-            let result = garble_and_gate(cipher, a0, b0, delta, gid, rand_bits);
+            let result = garble_and_gate(cipher, a0, b0, delta, gid, false, false, rand_bits);
 
             // The output label C₀ should be a valid block
             assert_ne!(result.output_label, Block::ZERO);
@@ -706,6 +751,9 @@ mod tests {
     ///
     /// For each input combination (i,j), applying V to [C;G] should give back
     /// the original RHS values for the corresponding rows.
+    ///
+    /// IMPORTANT: solve_for_output only works correctly when RHS is in col(V) = ker(K).
+    /// We generate valid RHS by computing RHS = V · x for random x.
     #[test]
     fn test_solve_for_output_satisfies_marginals() {
         use super::super::matrices::V;
@@ -713,51 +761,51 @@ mod tests {
 
         let mut rng = ChaCha12Rng::seed_from_u64(123);
 
-        // Create a random 8-element RHS
-        let mut rhs = [[0u8; 8]; 8];
-        for i in 0..8 {
+        // Generate random "output" values [C_L, C_R, G₀, G₁, G₂]
+        let mut x = [[0u8; 8]; 5];
+        for i in 0..5 {
             for j in 0..8 {
-                rhs[i][j] = rng.random();
+                x[i][j] = rng.random();
             }
         }
 
-        // Use zero delta to test pure algebraic properties (no truth table adjustment)
+        // Compute RHS = V · x (this ensures RHS is in col(V) = ker(K))
+        let mut rhs = [[0u8; 8]; 8];
+        for row in 0..8 {
+            for k in 0..8 {
+                let mut val = 0u8;
+                for col in 0..5 {
+                    if V[row][col] == 1 {
+                        val ^= x[col][k];
+                    }
+                }
+                rhs[row][k] = val;
+            }
+        }
+
+        // Use zero delta and zero truth table (no adjustment needed)
         let zero_delta = SlicedLabel::ZERO;
+        let zero_t = [[0u8; 2]; 8];
 
         // Solve for [C_L, C_R, G₀, G₁, G₂]
-        let output = solve_for_output(&rhs, &zero_delta);
+        let output = solve_for_output(&rhs, &zero_delta, &zero_t);
 
-        // Verify that rows 0-5 are exactly satisfied (inputs 0,0 and 0,1 and 1,0)
-        // Row 0: C_L = RHS[0]
-        assert_eq!(output[0], rhs[0], "Row 0 should be satisfied");
-
-        // Row 1: C_R = RHS[1]
-        assert_eq!(output[1], rhs[1], "Row 1 should be satisfied");
-
-        // Row 2: C_L ⊕ G₂ = RHS[2]
-        let mut row2_check = [0u8; 8];
-        for k in 0..8 {
-            row2_check[k] = output[0][k] ^ output[4][k]; // C_L ⊕ G₂
+        // With valid RHS in col(V), solve_for_output should recover the original x
+        // Verify V · output = RHS for all 8 rows
+        for row in 0..8 {
+            let mut v_times_output = [0u8; 8];
+            for k in 0..8 {
+                for col in 0..5 {
+                    if V[row][col] == 1 {
+                        v_times_output[k] ^= output[col][k];
+                    }
+                }
+            }
+            assert_eq!(
+                v_times_output, rhs[row],
+                "Row {} should be satisfied: V·output should equal RHS", row
+            );
         }
-        assert_eq!(row2_check, rhs[2], "Row 2 should be satisfied");
-
-        // Row 3: C_R ⊕ G₁ ⊕ G₂ = RHS[3]
-        let mut row3_check = [0u8; 8];
-        for k in 0..8 {
-            row3_check[k] = output[1][k] ^ output[3][k] ^ output[4][k]; // C_R ⊕ G₁ ⊕ G₂
-        }
-        assert_eq!(row3_check, rhs[3], "Row 3 should be satisfied");
-
-        // Row 4: C_L ⊕ G₀ ⊕ G₂ = RHS[4]
-        let mut row4_check = [0u8; 8];
-        for k in 0..8 {
-            row4_check[k] = output[0][k] ^ output[2][k] ^ output[4][k]; // C_L ⊕ G₀ ⊕ G₂
-        }
-        assert_eq!(row4_check, rhs[4], "Row 4 should be satisfied");
-
-        // Note: Rows 5, 6, 7 may not be exactly satisfied (they differ by Δ
-        // terms) This is intentional - the scheme handles it through
-        // the K·RHS structure
     }
 
     /// Test 8: THE CRITICAL TEST - Garble then evaluate for all 4 input
@@ -793,8 +841,8 @@ mod tests {
             let gid = trial + 1;
             let rand_bits: [bool; 2] = [rng.random(), rng.random()];
 
-            // Garble the AND gate
-            let garbled = garble_and_gate(cipher, a0, b0, delta, gid, rand_bits);
+            // Garble the AND gate (pi_a=false, pi_b=false means A₀ and B₀ represent 0)
+            let garbled = garble_and_gate(cipher, a0, b0, delta, gid, false, false, rand_bits);
             let c0 = garbled.output_label;
             let c1 = c0 ^ delta; // Expected output for 1∧1
 
@@ -853,7 +901,7 @@ mod tests {
         let gid = 1;
         let rand_bits = [true, false];
 
-        let garbled = garble_and_gate(cipher, a0, b0, delta, gid, rand_bits);
+        let garbled = garble_and_gate(cipher, a0, b0, delta, gid, false, false, rand_bits);
 
         // Evaluate twice with same inputs
         let result1 = evaluate_and_gate(cipher, a0, b0, &garbled.gate, &garbled.control_bits, gid);
@@ -1198,7 +1246,7 @@ mod tests {
                 }
 
                 // Solve for [C_L, C_R, G₀, G₁, G₂]
-                let output = solve_for_output(&rhs, &delta_sliced);
+                let output = solve_for_output(&rhs, &delta_sliced, &t);
                 let c_l = output[0];
                 let c_r = output[1];
                 let g0 = output[2];
@@ -1425,7 +1473,7 @@ mod tests {
 
     /// Test that solve_for_output produces valid output.
     ///
-    /// After adjusting rows 6,7 with Δ:
+    /// After adjusting TRUE rows with Δ (based on truth table):
     /// 1. K·RHS_adjusted should = 0 (RHS_adjusted in ker(K))
     /// 2. V·output should = RHS_adjusted for ALL 8 rows
     #[test]
@@ -1469,9 +1517,16 @@ mod tests {
             }
 
             // Compute RHS_adjusted (what solve_for_output uses internally)
+            // Find TRUE rows from truth table and XOR delta into them
             let mut rhs_adjusted = rhs;
-            xor_assign_8(&mut rhs_adjusted[6], &delta_sliced.left);
-            xor_assign_8(&mut rhs_adjusted[7], &delta_sliced.right);
+            for ij in 0..4 {
+                let row_l = 2 * ij;
+                let row_r = 2 * ij + 1;
+                if t[row_l] == [1, 0] && t[row_r] == [0, 1] {
+                    xor_assign_8(&mut rhs_adjusted[row_l], &delta_sliced.left);
+                    xor_assign_8(&mut rhs_adjusted[row_r], &delta_sliced.right);
+                }
+            }
 
             // Check 1: K·RHS_adjusted should = 0
             for k_row in 0..3 {
@@ -1492,7 +1547,7 @@ mod tests {
             }
 
             // Get output from solve_for_output
-            let output = solve_for_output(&rhs, &delta_sliced);
+            let output = solve_for_output(&rhs, &delta_sliced, &t);
 
             // Check 2: V·output should = RHS_adjusted for ALL 8 rows
             for row in 0..8 {
@@ -1798,31 +1853,42 @@ mod tests {
             }
 
             // Solve for output
-            let output = solve_for_output(&rhs, &delta_sliced);
+            let output = solve_for_output(&rhs, &delta_sliced, &t);
             let c0 = SlicedLabel::new(output[0], output[1]);
             let c1 = c0 ^ delta_sliced;
             let gate = ThreeHalvesGate::new(output[2], output[3], output[4]);
 
-            // VERIFY: K · RHS should equal 0 (RHS must be in kernel of K)
+            // Compute RHS_adjusted (for verification)
+            let mut rhs_adjusted = rhs;
+            for ij in 0..4 {
+                let row_l = 2 * ij;
+                let row_r = 2 * ij + 1;
+                if t[row_l] == [1, 0] && t[row_r] == [0, 1] {
+                    xor_assign_8(&mut rhs_adjusted[row_l], &delta_sliced.left);
+                    xor_assign_8(&mut rhs_adjusted[row_r], &delta_sliced.right);
+                }
+            }
+
+            // VERIFY: K · RHS_adjusted should equal 0 (RHS_adjusted must be in kernel of K)
             use super::super::matrices::{K, V};
             for row in 0..3 {
                 let mut k_times_rhs = [0u8; 8];
                 for col in 0..8 {
                     if K[row][col] == 1 {
-                        xor_assign_8(&mut k_times_rhs, &rhs[col]);
+                        xor_assign_8(&mut k_times_rhs, &rhs_adjusted[col]);
                     }
                 }
                 if k_times_rhs != [0u8; 8] {
                     println!(
                         "KERNEL FAIL Trial {}, K row {}:\n\
-                         K[{}]·RHS = {:?} (should be 0)\n\
+                         K[{}]·RHS_adjusted = {:?} (should be 0)\n\
                          K[{}] = {:?}",
                         trial, row, row, k_times_rhs, row, K[row]
                     );
                 }
             }
 
-            // VERIFY: V · output should equal RHS
+            // VERIFY: V · output should equal RHS_adjusted
             for row in 0..8 {
                 let mut v_times_output = [0u8; 8];
                 if V[row][0] == 1 { xor_assign_8(&mut v_times_output, &output[0]); }
@@ -1831,13 +1897,13 @@ mod tests {
                 if V[row][3] == 1 { xor_assign_8(&mut v_times_output, &output[3]); }
                 if V[row][4] == 1 { xor_assign_8(&mut v_times_output, &output[4]); }
 
-                if v_times_output != rhs[row] {
+                if v_times_output != rhs_adjusted[row] {
                     println!(
                         "EQUATION FAIL Trial {}, row {}:\n\
                          V[{}]·output = {:?}\n\
-                         RHS[{}] = {:?}\n\
+                         RHS_adjusted[{}] = {:?}\n\
                          V[{}] = {:?}",
-                        trial, row, row, v_times_output, row, rhs[row], row, V[row]
+                        trial, row, row, v_times_output, row, rhs_adjusted[row], row, V[row]
                     );
                 }
             }
@@ -2292,5 +2358,93 @@ mod tests {
         }
 
         println!("✓ Evaluator gate contribution test passed!");
+    }
+
+    /// Test 18: Garbling and evaluation with different point-and-permute bits
+    ///
+    /// This test verifies that the truth table is correctly computed when
+    /// the point-and-permute bits (pi_a, pi_b) are varied. With permute bits:
+    /// - When pi_a=false: A₀ represents semantic value 0, A₁ represents 1
+    /// - When pi_a=true: A₀ represents semantic value 1, A₁ represents 0
+    /// - Similarly for pi_b
+    #[test]
+    fn test_garble_evaluate_with_permute_bits() {
+        let cipher = &(*FIXED_KEY_AES);
+        let mut rng = ChaCha12Rng::seed_from_u64(0xDEADBEEF);
+        let mut failures = Vec::new();
+
+        // Test all 4 combinations of permute bits
+        for pi_a in [false, true] {
+            for pi_b in [false, true] {
+                for trial in 0..5 {
+                    let mut a0 = Block::random(&mut rng);
+                    let mut b0 = Block::random(&mut rng);
+                    let mut delta = Block::random(&mut rng);
+                    delta.set_lsb(true);
+                    a0.set_lsb(false);
+                    b0.set_lsb(false);
+
+                    let a1 = a0 ^ delta;
+                    let b1 = b0 ^ delta;
+
+                    let gid = trial + 1;
+                    let rand_bits: [bool; 2] = [rng.random(), rng.random()];
+
+                    // Garble with specific permute bits
+                    let garbled =
+                        garble_and_gate(cipher, a0, b0, delta, gid, pi_a, pi_b, rand_bits);
+                    let c0 = garbled.output_label;
+                    let c1 = c0 ^ delta;
+
+                    // Determine which label represents which semantic value
+                    // When pi_a=false: A₀ = semantic 0, A₁ = semantic 1
+                    // When pi_a=true: A₀ = semantic 1, A₁ = semantic 0
+                    let (a_false, a_true) = if pi_a { (a1, a0) } else { (a0, a1) };
+                    let (b_false, b_true) = if pi_b { (b1, b0) } else { (b0, b1) };
+
+                    // Test all 4 input combinations (using semantic values)
+                    // AND gate: output = semantic_a AND semantic_b
+                    let test_cases = [
+                        (a_false, b_false, 0, 0, c0), // 0 ∧ 0 = 0
+                        (a_false, b_true, 0, 1, c0),  // 0 ∧ 1 = 0
+                        (a_true, b_false, 1, 0, c0),  // 1 ∧ 0 = 0
+                        (a_true, b_true, 1, 1, c1),   // 1 ∧ 1 = 1
+                    ];
+
+                    for (a_label, b_label, sem_a, sem_b, expected) in test_cases {
+                        let result = evaluate_and_gate(
+                            cipher,
+                            a_label,
+                            b_label,
+                            &garbled.gate,
+                            &garbled.control_bits,
+                            gid,
+                        );
+
+                        if result != expected {
+                            failures.push((pi_a, pi_b, trial, sem_a, sem_b));
+                            println!(
+                                "FAIL pi_a={}, pi_b={}, trial {}: evaluate({},{}) got wrong result",
+                                pi_a, pi_b, trial, sem_a, sem_b
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        if !failures.is_empty() {
+            println!("\n=== SUMMARY ===");
+            println!("Total failures: {}", failures.len());
+            for (pi_a, pi_b, trial, sem_a, sem_b) in &failures {
+                println!(
+                    "  pi_a={}, pi_b={}, trial {}: ({},{})",
+                    pi_a, pi_b, trial, sem_a, sem_b
+                );
+            }
+            panic!("{} test cases failed", failures.len());
+        }
+
+        println!("✓ All permute bit combinations pass!");
     }
 }
