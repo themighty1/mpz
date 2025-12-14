@@ -3,13 +3,26 @@
 //! These tests verify the complete system works together correctly.
 
 use super::control::{
-    and_truth_table, expand_marginal, extract_marginal, extract_truth_table_bits, sample_r_odd,
-    verify_k_r_a, verify_k_r_b, verify_k_r_dollar_is_zero, verify_k_r_p, R_P,
+    and_truth_table_with_permute, expand_marginal, extract_marginal, extract_truth_table_bits,
+    sample_r_odd, verify_k_r_a, verify_k_r_b, verify_k_r_dollar_is_zero, verify_k_r_p, R_P,
 };
 use super::matrices::{
     compute_v_inv_m, matmul_gf2, verify_km_is_zero, verify_kv_is_zero,
     verify_ranks, verify_v_inv_is_left_inverse, K, M, V,
 };
+
+/// Helper: convert bool matrix to u8 for GF(2) matrix operations
+fn bool_to_u8_matrix<const ROWS: usize, const COLS: usize>(
+    m: &[[bool; COLS]; ROWS],
+) -> [[u8; COLS]; ROWS] {
+    let mut result = [[0u8; COLS]; ROWS];
+    for i in 0..ROWS {
+        for j in 0..COLS {
+            result[i][j] = m[i][j] as u8;
+        }
+    }
+    result
+}
 
 /// Master test: Run all matrix verification checks
 #[test]
@@ -38,16 +51,19 @@ fn test_all_matrix_properties() {
 /// Paper Equation 5 and surrounding discussion.
 #[test]
 fn test_complete_constraint_and_gate() {
-    let t = and_truth_table();
-    let (a, b, p) = extract_truth_table_bits(&t);
+    // Test with default permute bits (false, false)
+    let (pi_a, pi_b) = (false, false);
+    let t = and_truth_table_with_permute(pi_a, pi_b);
+    let (a, b, p) = extract_truth_table_bits(pi_a, pi_b);
 
     println!("AND gate: a={}, b={}, p={}", a, b, p);
-    assert_eq!((a, b, p), (1, 1, 1), "AND gate should be at (1,1) with odd parity");
+    assert_eq!((a, b, p), (true, true, true), "AND gate with pi_a=false, pi_b=false should have a=true, b=true");
 
     // Test all random combinations
     for r0 in [false, true] {
         for r1 in [false, true] {
-            let (r, r_bar) = sample_r_odd(&t, [r0, r1]);
+            let (r_bool, r_bar) = sample_r_odd(pi_a, pi_b, [r0, r1]);
+            let r = bool_to_u8_matrix(&r_bool);
 
             // Verify K × R = K × [0 0 t]
             let kr = matmul_gf2(&K, &r);

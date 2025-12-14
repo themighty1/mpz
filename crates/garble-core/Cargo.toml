@@ -29,6 +29,7 @@ mpz-vm-core = { workspace = true }
 
 aes = { workspace = true, features = [] }
 bitvec = { workspace = true, features = ["serde"] }
+bytemuck = { workspace = true }
 blake3 = { workspace = true, features = ["serde"] }
 cfg-if = { workspace = true }
 cipher = { workspace = true }

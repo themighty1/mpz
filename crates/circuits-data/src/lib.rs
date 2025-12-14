@@ -174,6 +174,92 @@ mod tests {
         assert_eq!(output, init_state);
     }
 
+    /// Analyze wire liveness to determine potential for buffer size optimization.
+    ///
+    /// This test computes:
+    /// - feed_count: total wires in circuit (current buffer size)
+    /// - max_live: maximum simultaneously live wires (optimal buffer size)
+    /// - Potential memory reduction ratio
+    #[test]
+    #[cfg(feature = "aes")]
+    fn analyze_aes128_wire_liveness() {
+        use mpz_circuits_core::Gate;
+        use std::collections::HashSet;
+
+        let circ = &*AES128;
+
+        let feed_count = circ.feed_count();
+        let gates = circ.gates();
+        let outputs = circ.outputs();
+
+        // Step 1: For each wire, find the last gate index that reads it
+        // (or mark it as output if it's in the output range)
+        let mut last_use: Vec<Option<usize>> = vec![None; feed_count];
+
+        // Outputs are "used" at the very end
+        for wire_id in outputs.clone() {
+            last_use[wire_id] = Some(gates.len());
+        }
+
+        // Scan gates to find last use of each wire
+        for (gate_idx, gate) in gates.iter().enumerate() {
+            match gate {
+                Gate::Xor { x, y, .. } | Gate::And { x, y, .. } => {
+                    last_use[x.id()] = Some(gate_idx);
+                    last_use[y.id()] = Some(gate_idx);
+                }
+                Gate::Inv { x, .. } | Gate::Id { x, .. } => {
+                    last_use[x.id()] = Some(gate_idx);
+                }
+            }
+        }
+
+        // Step 2: Simulate execution, tracking live set at each gate
+        let mut live_wires: HashSet<usize> = HashSet::new();
+        let mut max_live: usize = 0;
+        let mut total_live: usize = 0;
+
+        // Initially, all input wires are live
+        for wire_id in circ.inputs() {
+            live_wires.insert(wire_id);
+        }
+        max_live = max_live.max(live_wires.len());
+
+        for (gate_idx, gate) in gates.iter().enumerate() {
+            // Add output wire to live set
+            let z_id = gate.z().id();
+            live_wires.insert(z_id);
+
+            // Remove wires whose last use was this gate
+            let inputs: Vec<usize> = match gate {
+                Gate::Xor { x, y, .. } | Gate::And { x, y, .. } => vec![x.id(), y.id()],
+                Gate::Inv { x, .. } | Gate::Id { x, .. } => vec![x.id()],
+            };
+
+            for wire_id in inputs {
+                if last_use[wire_id] == Some(gate_idx) {
+                    live_wires.remove(&wire_id);
+                }
+            }
+
+            max_live = max_live.max(live_wires.len());
+            total_live += live_wires.len();
+        }
+
+        let avg_live = total_live / gates.len().max(1);
+        let reduction = feed_count as f64 / max_live as f64;
+
+        println!("\n=== AES-128 Wire Liveness Analysis ===");
+        println!("Total wires (feed_count):    {}", feed_count);
+        println!("Max simultaneously live:     {}", max_live);
+        println!("Average live wires:          {}", avg_live);
+        println!("Potential reduction:         {:.1}x", reduction);
+        println!("Current buffer size:         {} KB", feed_count * 16 / 1024);
+        println!("Optimal buffer size:         {} KB", max_live * 16 / 1024);
+        println!("AND gates: {}, XOR gates: {}", circ.and_count(), circ.xor_count());
+        println!("Total gates: {}", gates.len());
+    }
+
     // Test vectors from https://csrc.nist.gov/files/pubs/fips/197/final/docs/fips-197.pdf
     // Returns a tuple (key, key schedule, input, output).
     #[allow(dead_code)]

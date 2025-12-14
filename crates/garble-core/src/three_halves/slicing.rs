@@ -2,7 +2,8 @@
 //!
 //! This module implements the "slicing" technique from the Three Halves paper.
 //! Wire labels are split into left and right halves (κ/2 bits each), allowing
-//! the evaluator to compute each half using potentially different linear combinations.
+//! the evaluator to compute each half using potentially different linear
+//! combinations.
 //!
 //! # Paper Reference
 //!
@@ -10,7 +11,8 @@
 //! > "We slice a wire label W into two halves W_L and W_R, each of length κ/2."
 //!
 //! Section 5 (Page 11):
-//! > "The slicing technique means that 'half' of each wire label (i.e., κ/2 bits)
+//! > "The slicing technique means that 'half' of each wire label (i.e., κ/2
+//! > bits)
 //! > can be computed from a different linear combination."
 //!
 //! # Layout
@@ -72,23 +74,14 @@ impl SlicedLabel {
     /// ```
     #[inline]
     pub fn from_block(block: Block) -> Self {
-        let bytes: [u8; 16] = block.into();
-        let mut left = [0u8; 8];
-        let mut right = [0u8; 8];
-
-        left.copy_from_slice(&bytes[0..8]);
-        right.copy_from_slice(&bytes[8..16]);
-
+        let [left, right]: [[u8; 8]; 2] = bytemuck::cast(block);
         Self { left, right }
     }
 
     /// Recombine left and right halves into a 128-bit Block.
     #[inline]
     pub fn to_block(&self) -> Block {
-        let mut bytes = [0u8; 16];
-        bytes[0..8].copy_from_slice(&self.left);
-        bytes[8..16].copy_from_slice(&self.right);
-        Block::new(bytes)
+        bytemuck::cast([self.left, self.right])
     }
 
     /// Get the left half as a u64 (little-endian).
@@ -304,7 +297,8 @@ mod tests {
         }
     }
 
-    /// Test 3: XOR properties (associativity, commutativity, identity, self-inverse)
+    /// Test 3: XOR properties (associativity, commutativity, identity,
+    /// self-inverse)
     #[test]
     fn test_xor_properties() {
         let mut rng = ChaCha12Rng::seed_from_u64(456);
@@ -352,8 +346,8 @@ mod tests {
 
     /// Test 6: Verify layout matches Block's sigma function
     ///
-    /// Block::sigma treats the first 8 bytes as x0 (left) and last 8 as x1 (right).
-    /// Our slicing should match this convention.
+    /// Block::sigma treats the first 8 bytes as x0 (left) and last 8 as x1
+    /// (right). Our slicing should match this convention.
     #[test]
     fn test_layout_matches_sigma() {
         // Create a block where left and right halves are different

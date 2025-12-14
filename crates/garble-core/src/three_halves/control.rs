@@ -347,6 +347,8 @@ pub const R_BAR_DOLLAR_BASIS_1: [[u8; 2]; 4] = [
 /// # Returns
 /// 8×2 truth table matrix where identity blocks mark TRUE outputs.
 pub fn and_truth_table_with_permute(pi_a: bool, pi_b: bool) -> [[u8; 2]; 8] {
+    // TODO hard-code truth tables based on 4 combinations of input bits
+
     let mut t = [[0u8; 2]; 8];
 
     for i in 0..2u8 {
@@ -412,128 +414,168 @@ pub fn or_truth_table() -> [[u8; 2]; 8] {
     todo!("OR gate encoding - see paper Section 5 for details")
 }
 
-/// Extract (a, b, p) bits from a truth table
+/// Extract (a, b, p) bits for an AND gate from permute bits.
 ///
-/// Paper Section 5.1: The constraint KR = K[0 0 t] reduces to
-/// matching p, a, b where:
-/// - p = parity of truth table (1 for AND/OR, 0 for XOR)
-/// - a, b = position bits encoding where the true output is
+/// For AND gates, the output is true when both logical inputs are true.
+/// Given permute bits (π_a, π_b), the color bit position (i, j) where
+/// the true output occurs satisfies:
+///   - logical_a = π_a ⊕ i = 1  →  i = !π_a
+///   - logical_b = π_b ⊕ j = 1  →  j = !π_b
 ///
-/// For AND gate at position (1,1): a=1, b=1, p=1
-pub fn extract_truth_table_bits(t: &[[u8; 2]; 8]) -> (u8, u8, u8) {
-    // Count number of identity blocks (positions where output is true)
-    // For odd-parity gates, exactly one position is true
-
-    // Check each 2×2 block to see if it's an identity
-    let mut true_position = None;
-    for i in 0..4 {
-        let row1 = t[2 * i];
-        let row2 = t[2 * i + 1];
-        // Identity block check: [[1,0], [0,1]]
-        if row1 == [1, 0] && row2 == [0, 1] {
-            true_position = Some(i);
-            break;
-        }
-    }
-
-    match true_position {
-        Some(pos) => {
-            // pos: 0=(0,0), 1=(0,1), 2=(1,0), 3=(1,1)
-            let a = (pos >> 1) as u8; // First input bit
-            let b = (pos & 1) as u8; // Second input bit
-            let p = 1u8; // Odd parity (one true output)
-            (a, b, p)
-        }
-        None => {
-            // No true position found - could be even parity or invalid
-            // For even parity gates, p=0
-            (0, 0, 0)
-        }
-    }
+/// Therefore:
+///   - a = !π_a (position bit for input A)
+///   - b = !π_b (position bit for input B)
+///   - p = true (AND is an odd-parity gate with exactly one true output)
+pub fn extract_truth_table_bits(pi_a: bool, pi_b: bool) -> (bool, bool, bool) {
+    (!pi_a, !pi_b, true)
 }
 
 // ============================================================================
 // Control Matrix Operations
 // ============================================================================
 
-/// Sample a control matrix R for a given truth table (ODD mode)
+/// Precomputed lookup table for control matrices R and R_bar.
+///
+/// Indexed by: `(pi_a as usize) << 3 | (pi_b as usize) << 2 | (r0 as usize) << 1 | r1 as usize`
+///
+/// Each entry is `(R, R_bar)` where:
+/// - `a = !pi_a` (true position bit for input A in AND gate)
+/// - `b = !pi_b` (true position bit for input B in AND gate)
+/// - `p = true` (AND gate has odd parity, exactly one true output)
+/// - `R = r0·R$_BASIS_0 ⊕ r1·R$_BASIS_1 ⊕ a·R_A ⊕ b·R_B ⊕ R_P`
+/// - `R_bar = r0·R̄$_BASIS_0 ⊕ r1·R̄$_BASIS_1 ⊕ a·R̄_A ⊕ b·R̄_B`
+///
+/// Note: R_P is added to R but NOT to R_bar because R_P is not in the span
+/// of {S₁, S₂}. The evaluator adds R_P themselves since parity is public.
+const SAMPLE_R_ODD_TABLE: [([[bool; 6]; 8], [[bool; 2]; 4]); 16] = {
+    const F: bool = false;
+    const T: bool = true;
+    [
+    // Index 0: pi_a=false, pi_b=false, r0=false, r1=false => a=true, b=true
+    (
+        [[F, F, T, F, F, F], [F, T, F, F, F, F], [T, F, T, T, T, T], [F, T, T, T, T, T],
+         [T, T, T, F, T, T], [T, T, F, T, T, T], [F, T, T, T, T, F], [T, T, T, F, F, T]],
+        [[F, F], [F, T], [T, F], [T, T]],
+    ),
+    // Index 1: pi_a=false, pi_b=false, r0=false, r1=true => a=true, b=true
+    (
+        [[T, F, T, T, F, F], [F, F, T, T, F, F], [F, F, T, F, T, F], [F, F, F, F, F, F],
+         [F, T, T, T, F, T], [T, F, T, F, T, F], [T, T, T, F, F, T], [T, F, F, T, T, T]],
+        [[F, T], [F, F], [T, T], [T, F]],
+    ),
+    // Index 2: pi_a=false, pi_b=false, r0=true, r1=false => a=true, b=true
+    (
+        [[T, T, F, F, F, F], [T, T, F, T, F, F], [F, T, F, T, F, T], [T, T, T, F, T, F],
+         [F, F, F, F, F, F], [F, T, F, F, F, T], [T, F, F, T, T, T], [F, T, T, T, T, F]],
+        [[T, F], [T, T], [F, F], [F, T]],
+    ),
+    // Index 3: pi_a=false, pi_b=false, r0=true, r1=true => a=true, b=true
+    (
+        [[F, T, F, T, F, F], [T, F, T, F, F, F], [T, T, F, F, F, F], [T, F, F, T, F, T],
+         [T, F, F, T, T, F], [F, F, T, T, F, F], [F, F, F, F, F, F], [F, F, F, F, F, F]],
+        [[T, T], [T, F], [F, T], [F, F]],
+    ),
+    // Index 4: pi_a=false, pi_b=true, r0=false, r1=false => a=true, b=false
+    (
+        [[F, F, T, F, F, F], [F, T, F, F, F, F], [F, T, F, T, F, T], [T, T, T, F, T, F],
+         [T, F, F, T, T, F], [F, F, T, T, F, F], [T, T, T, F, F, T], [T, F, F, T, T, T]],
+        [[F, F], [T, T], [F, T], [T, F]],
+    ),
+    // Index 5: pi_a=false, pi_b=true, r0=false, r1=true => a=true, b=false
+    (
+        [[T, F, T, T, F, F], [F, F, T, T, F, F], [T, T, F, F, F, F], [T, F, F, T, F, T],
+         [F, F, F, F, F, F], [F, T, F, F, F, T], [F, T, T, T, T, F], [T, T, T, F, F, T]],
+        [[F, T], [T, F], [F, F], [T, T]],
+    ),
+    // Index 6: pi_a=false, pi_b=true, r0=true, r1=false => a=true, b=false
+    (
+        [[T, T, F, F, F, F], [T, T, F, T, F, F], [T, F, T, T, T, T], [F, T, T, T, T, T],
+         [F, T, T, T, F, T], [T, F, T, F, T, F], [F, F, F, F, F, F], [F, F, F, F, F, F]],
+        [[T, F], [F, T], [T, T], [F, F]],
+    ),
+    // Index 7: pi_a=false, pi_b=true, r0=true, r1=true => a=true, b=false
+    (
+        [[F, T, F, T, F, F], [T, F, T, F, F, F], [F, F, T, F, T, F], [F, F, F, F, F, F],
+         [T, T, T, F, T, T], [T, T, F, T, T, T], [T, F, F, T, T, T], [F, T, T, T, T, F]],
+        [[T, T], [F, F], [T, F], [F, T]],
+    ),
+    // Index 8: pi_a=true, pi_b=false, r0=false, r1=false => a=false, b=true
+    (
+        [[F, F, T, F, F, F], [F, T, F, F, F, F], [T, T, F, F, F, F], [T, F, F, T, F, T],
+         [F, T, T, T, F, T], [T, F, T, F, T, F], [T, F, F, T, T, T], [F, T, T, T, T, F]],
+        [[F, F], [T, F], [T, T], [F, T]],
+    ),
+    // Index 9: pi_a=true, pi_b=false, r0=false, r1=true => a=false, b=true
+    (
+        [[T, F, T, T, F, F], [F, F, T, T, F, F], [F, T, F, T, F, T], [T, T, T, F, T, F],
+         [T, T, T, F, T, T], [T, T, F, T, T, T], [F, F, F, F, F, F], [F, F, F, F, F, F]],
+        [[F, T], [T, T], [T, F], [F, F]],
+    ),
+    // Index 10: pi_a=true, pi_b=false, r0=true, r1=false => a=false, b=true
+    (
+        [[T, T, F, F, F, F], [T, T, F, T, F, F], [F, F, T, F, T, F], [F, F, F, F, F, F],
+         [T, F, F, T, T, F], [F, F, T, T, F, F], [F, T, T, T, T, F], [T, T, T, F, F, T]],
+        [[T, F], [F, F], [F, T], [T, T]],
+    ),
+    // Index 11: pi_a=true, pi_b=false, r0=true, r1=true => a=false, b=true
+    (
+        [[F, T, F, T, F, F], [T, F, T, F, F, F], [T, F, T, T, T, T], [F, T, T, T, T, T],
+         [F, F, F, F, F, F], [F, T, F, F, F, T], [T, T, T, F, F, T], [T, F, F, T, T, T]],
+        [[T, T], [F, T], [F, F], [T, F]],
+    ),
+    // Index 12: pi_a=true, pi_b=true, r0=false, r1=false => a=false, b=false
+    (
+        [[F, F, T, F, F, F], [F, T, F, F, F, F], [F, F, T, F, T, F], [F, F, F, F, F, F],
+         [F, F, F, F, F, F], [F, T, F, F, F, T], [F, F, F, F, F, F], [F, F, F, F, F, F]],
+        [[F, F], [F, F], [F, F], [F, F]],
+    ),
+    // Index 13: pi_a=true, pi_b=true, r0=false, r1=true => a=false, b=false
+    (
+        [[T, F, T, T, F, F], [F, F, T, T, F, F], [T, F, T, T, T, T], [F, T, T, T, T, T],
+         [T, F, F, T, T, F], [F, F, T, T, F, F], [T, F, F, T, T, T], [F, T, T, T, T, F]],
+        [[F, T], [F, T], [F, T], [F, T]],
+    ),
+    // Index 14: pi_a=true, pi_b=true, r0=true, r1=false => a=false, b=false
+    (
+        [[T, T, F, F, F, F], [T, T, F, T, F, F], [T, T, F, F, F, F], [T, F, F, T, F, T],
+         [T, T, T, F, T, T], [T, T, F, T, T, T], [T, T, T, F, F, T], [T, F, F, T, T, T]],
+        [[T, F], [T, F], [T, F], [T, F]],
+    ),
+    // Index 15: pi_a=true, pi_b=true, r0=true, r1=true => a=false, b=false
+    (
+        [[F, T, F, T, F, F], [T, F, T, F, F, F], [F, T, F, T, F, T], [T, T, T, F, T, F],
+         [F, T, T, T, F, T], [T, F, T, F, T, F], [F, T, T, T, T, F], [T, T, T, F, F, T]],
+        [[T, T], [T, T], [T, T], [T, T]],
+    ),
+]};
+
+/// Sample a control matrix R for an AND gate (ODD mode)
+///
+/// Uses precomputed lookup table for all 16 combinations of inputs.
 ///
 /// Paper Section 5.1, Algorithm:
 /// ```text
 /// R = p·R_p ⊕ a·R_a ⊕ b·R_b ⊕ R$
 /// ```
 ///
-/// where R$ is sampled uniformly from span{R$_BASIS_0, R$_BASIS_1}
+/// where:
+/// - `a = !pi_a` (position bit derived from permute bit)
+/// - `b = !pi_b` (position bit derived from permute bit)
+/// - `p = true` (AND gates have odd parity)
+/// - `R$` is sampled uniformly from span{R$_BASIS_0, R$_BASIS_1}
 ///
 /// # Arguments
-/// * `t` - The 8×2 truth table matrix
+/// * `pi_a` - Permute bit for input A
+/// * `pi_b` - Permute bit for input B
 /// * `rand_bits` - Two random bits [r₀, r₁] for sampling R$
 ///
 /// # Returns
-/// * `R` - The 8×6 control matrix
-/// * `r_bar` - The 4×2 compressed representation for encryption
-pub fn sample_r_odd(t: &[[u8; 2]; 8], rand_bits: [bool; 2]) -> ([[u8; 6]; 8], [[u8; 2]; 4]) {
-    let (a, b, p) = extract_truth_table_bits(t);
-
-    // Start with R$ (randomization)
-    let mut r = [[0u8; 6]; 8];
-    let mut r_bar = [[0u8; 2]; 4];
-
-    // Add random contribution: r₀·R$_BASIS_0 ⊕ r₁·R$_BASIS_1
-    let r0 = rand_bits[0] as u8;
-    let r1 = rand_bits[1] as u8;
-
-    for i in 0..8 {
-        for j in 0..6 {
-            r[i][j] ^= r0 * R_DOLLAR_BASIS_0[i][j];
-            r[i][j] ^= r1 * R_DOLLAR_BASIS_1[i][j];
-        }
-    }
-
-    for i in 0..4 {
-        for j in 0..2 {
-            r_bar[i][j] ^= r0 * R_BAR_DOLLAR_BASIS_0[i][j];
-            r_bar[i][j] ^= r1 * R_BAR_DOLLAR_BASIS_1[i][j];
-        }
-    }
-
-    // Add a·R_a
-    for i in 0..8 {
-        for j in 0..6 {
-            r[i][j] ^= a * R_A[i][j];
-        }
-    }
-    for i in 0..4 {
-        for j in 0..2 {
-            r_bar[i][j] ^= a * R_BAR_A[i][j];
-        }
-    }
-
-    // Add b·R_b
-    for i in 0..8 {
-        for j in 0..6 {
-            r[i][j] ^= b * R_B[i][j];
-        }
-    }
-    for i in 0..4 {
-        for j in 0..2 {
-            r_bar[i][j] ^= b * R_BAR_B[i][j];
-        }
-    }
-
-    // Add p·R_p to the FULL R matrix (used by garbler for correctness)
-    for i in 0..8 {
-        for j in 0..6 {
-            r[i][j] ^= p * R_P[i][j];
-        }
-    }
-
-    // NOTE: We do NOT add p·R_p to r_bar because:
-    // 1. R_P is NOT in the span of {S₁, S₂} basis (see paper Figure 4)
-    // 2. In ODD mode the evaluator knows parity is odd and adds R_P themselves
-    // The r_bar compressed form only contains R$ ⊕ a·R_a ⊕ b·R_b
-
-    (r, r_bar)
+/// * `R` - The 8×6 control matrix (bool values)
+/// * `r_bar` - The 4×2 compressed representation for encryption (bool values)
+#[inline]
+pub fn sample_r_odd(pi_a: bool, pi_b: bool, rand_bits: [bool; 2]) -> ([[bool; 6]; 8], [[bool; 2]; 4]) {
+    let index = (pi_a as usize) << 3 | (pi_b as usize) << 2 | (rand_bits[0] as usize) << 1 | rand_bits[1] as usize;
+    SAMPLE_R_ODD_TABLE[index]
 }
 
 /// Extract marginal view R_ij from full control matrix R
@@ -591,9 +633,9 @@ pub fn extract_marginal(r: &[[u8; 6]; 8], i: usize, j: usize) -> [[u8; 4]; 2] {
 ///
 /// # Returns
 /// The 2×4 marginal view matrix
-pub fn expand_marginal(r_bar_ij: &[u8; 2]) -> [[u8; 4]; 2] {
-    let c1 = r_bar_ij[0];
-    let c2 = r_bar_ij[1];
+pub fn expand_marginal(r_bar_ij: &[bool; 2]) -> [[u8; 4]; 2] {
+    let c1 = r_bar_ij[0] as u8;
+    let c2 = r_bar_ij[1] as u8;
 
     let mut result = [[0u8; 4]; 2];
     for row in 0..2 {
@@ -637,10 +679,10 @@ pub fn extract_r_p_marginal(i: usize, j: usize) -> [[u8; 4]; 2] {
 /// Given R_ij, find c₁, c₂ such that R_ij = c₁·S₁ ⊕ c₂·S₂
 ///
 /// This is used for testing to verify that sampled R has valid structure.
-pub fn compress_marginal(r_ij: &[[u8; 4]; 2]) -> Option<[u8; 2]> {
+pub fn compress_marginal(r_ij: &[[u8; 4]; 2]) -> Option<[bool; 2]> {
     // Try all 4 combinations of (c₁, c₂)
-    for c1 in 0..2 {
-        for c2 in 0..2 {
+    for c1 in [false, true] {
+        for c2 in [false, true] {
             let expanded = expand_marginal(&[c1, c2]);
             if expanded == *r_ij {
                 return Some([c1, c2]);
@@ -716,6 +758,19 @@ pub fn verify_k_r_b() -> bool {
 mod tests {
     use super::*;
 
+    /// Helper: convert bool matrix to u8 for GF(2) matrix operations in tests
+    fn bool_to_u8_matrix<const ROWS: usize, const COLS: usize>(
+        m: &[[bool; COLS]; ROWS],
+    ) -> [[u8; COLS]; ROWS] {
+        let mut result = [[0u8; COLS]; ROWS];
+        for i in 0..ROWS {
+            for j in 0..COLS {
+                result[i][j] = m[i][j] as u8;
+            }
+        }
+        result
+    }
+
     /// Test 1: K × R$_BASIS vectors = 0
     ///
     /// Paper Figure 3: The R$ distribution must satisfy KR$ = 0
@@ -745,8 +800,8 @@ mod tests {
     /// Test 5: Expanding and compressing marginal views are inverse operations
     #[test]
     fn test_marginal_roundtrip() {
-        for c1 in 0..2 {
-            for c2 in 0..2 {
+        for c1 in [false, true] {
+            for c2 in [false, true] {
                 let original = [c1, c2];
                 let expanded = expand_marginal(&original);
                 let compressed = compress_marginal(&expanded);
@@ -762,16 +817,31 @@ mod tests {
         }
     }
 
-    /// Test 6: AND gate truth table extraction
+    /// Test 6: AND gate truth table extraction from permute bits
     #[test]
     fn test_and_truth_table_bits() {
-        let t = and_truth_table();
-        let (a, b, p) = extract_truth_table_bits(&t);
+        // With pi_a=false, pi_b=false: a=!false=true, b=!false=true
+        let (a, b, p) = extract_truth_table_bits(false, false);
+        assert!(a, "AND gate with pi_a=false should have a=true");
+        assert!(b, "AND gate with pi_b=false should have b=true");
+        assert!(p, "AND gate should have p=true (odd parity)");
 
-        // AND gate: true at (1,1) means a=1, b=1
-        assert_eq!(a, 1, "AND gate should have a=1");
-        assert_eq!(b, 1, "AND gate should have b=1");
-        assert_eq!(p, 1, "AND gate should have p=1 (odd parity)");
+        // With pi_a=true, pi_b=true: a=!true=false, b=!true=false
+        let (a, b, p) = extract_truth_table_bits(true, true);
+        assert!(!a, "AND gate with pi_a=true should have a=false");
+        assert!(!b, "AND gate with pi_b=true should have b=false");
+        assert!(p, "AND gate should have p=true (odd parity)");
+
+        // Mixed cases
+        let (a, b, p) = extract_truth_table_bits(false, true);
+        assert!(a, "a = !pi_a = !false = true");
+        assert!(!b, "b = !pi_b = !true = false");
+        assert!(p, "p always true for AND");
+
+        let (a, b, p) = extract_truth_table_bits(true, false);
+        assert!(!a, "a = !pi_a = !true = false");
+        assert!(b, "b = !pi_b = !false = true");
+        assert!(p, "p always true for AND");
     }
 
     /// Test 7: Sampled R satisfies K × R = K × [0 0 t]
@@ -779,30 +849,36 @@ mod tests {
     /// This is the fundamental correctness property from Paper Equation 5.
     #[test]
     fn test_sampled_r_constraint() {
-        let t = and_truth_table();
+        // Test all combinations of permute bits
+        for pi_a in [false, true] {
+            for pi_b in [false, true] {
+                let t = and_truth_table_with_permute(pi_a, pi_b);
 
-        // Test with all 4 random bit combinations
-        for r0 in [false, true] {
-            for r1 in [false, true] {
-                let (r, _r_bar) = sample_r_odd(&t, [r0, r1]);
+                // Test with all 4 random bit combinations
+                for r0 in [false, true] {
+                    for r1 in [false, true] {
+                        let (r_bool, _r_bar) = sample_r_odd(pi_a, pi_b, [r0, r1]);
+                        let r = bool_to_u8_matrix(&r_bool);
 
-                // Compute K × R
-                let kr = matmul_gf2(&K, &r);
+                        // Compute K × R
+                        let kr = matmul_gf2(&K, &r);
 
-                // Compute K × [0 0 t]
-                // The matrix [0 0 t] is 8×6 with t in the last 2 columns
-                let mut zero_zero_t = [[0u8; 6]; 8];
-                for i in 0..8 {
-                    zero_zero_t[i][4] = t[i][0]; // Δ_L column gets t's first column
-                    zero_zero_t[i][5] = t[i][1]; // Δ_R column gets t's second column
+                        // Compute K × [0 0 t]
+                        // The matrix [0 0 t] is 8×6 with t in the last 2 columns
+                        let mut zero_zero_t = [[0u8; 6]; 8];
+                        for i in 0..8 {
+                            zero_zero_t[i][4] = t[i][0]; // Δ_L column gets t's first column
+                            zero_zero_t[i][5] = t[i][1]; // Δ_R column gets t's second column
+                        }
+                        let k_zero_zero_t = matmul_gf2(&K, &zero_zero_t);
+
+                        assert_eq!(
+                            kr, k_zero_zero_t,
+                            "K×R should equal K×[0 0 t] for pi_a={}, pi_b={}, rand_bits=[{}, {}]",
+                            pi_a, pi_b, r0, r1
+                        );
+                    }
                 }
-                let k_zero_zero_t = matmul_gf2(&K, &zero_zero_t);
-
-                assert_eq!(
-                    kr, k_zero_zero_t,
-                    "K×R should equal K×[0 0 t] for rand_bits=[{}, {}]",
-                    r0, r1
-                );
             }
         }
     }
@@ -810,11 +886,13 @@ mod tests {
     /// Test 8: Each marginal view is expressible in the basis {S₁, S₂}
     #[test]
     fn test_marginals_in_basis() {
-        let t = and_truth_table();
+        // Test with default permute bits (false, false)
+        let (pi_a, pi_b) = (false, false);
 
         for r0 in [false, true] {
             for r1 in [false, true] {
-                let (r, r_bar) = sample_r_odd(&t, [r0, r1]);
+                let (r_bool, r_bar) = sample_r_odd(pi_a, pi_b, [r0, r1]);
+                let r = bool_to_u8_matrix(&r_bool);
 
                 // For ODD mode, we need to add R_p to the marginal before checking
                 // because sample_r_odd adds R_p to r but not to r_bar
@@ -849,24 +927,30 @@ mod tests {
     /// Test 9: Distribution test - each marginal view should be uniform
     ///
     /// Over all 4 choices of rand_bits, each marginal should take each
-    /// of the 4 possible values {[0,0], [0,1], [1,0], [1,1]} exactly once.
+    /// of the 4 possible values {[F,F], [F,T], [T,F], [T,T]} exactly once.
     #[test]
     fn test_marginal_uniformity() {
-        let t = and_truth_table();
+        // Test with default permute bits (false, false)
+        let (pi_a, pi_b) = (false, false);
 
         // Collect all marginal views for input (0,0)
         let mut marginals_00 = Vec::new();
 
         for r0 in [false, true] {
             for r1 in [false, true] {
-                let (_r, r_bar) = sample_r_odd(&t, [r0, r1]);
+                let (_r, r_bar) = sample_r_odd(pi_a, pi_b, [r0, r1]);
                 marginals_00.push(r_bar[0]); // (0,0) marginal
             }
         }
 
         // Check that we got all 4 possible values
         marginals_00.sort();
-        let expected = vec![[0, 0], [0, 1], [1, 0], [1, 1]];
+        let expected = vec![
+            [false, false],
+            [false, true],
+            [true, false],
+            [true, true],
+        ];
         assert_eq!(
             marginals_00, expected,
             "Marginal (0,0) should cover all 4 basis coefficient pairs"
