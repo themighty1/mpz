@@ -12,7 +12,7 @@ use rand::{rngs::StdRng, Rng, SeedableRng};
 /// Benchmark single AES circuit garbling
 fn bench_garble_aes(c: &mut Criterion) {
     let mut group = c.benchmark_group("garble_aes128");
-    group.throughput(Throughput::Elements(1));
+    group.throughput(Throughput::Elements(AES128.and_count() as u64));
 
     let mut rng = StdRng::seed_from_u64(0);
     let delta = Delta::random(&mut rng);
@@ -56,7 +56,7 @@ fn bench_garble_aes(c: &mut Criterion) {
 /// Benchmark single AES circuit evaluation
 fn bench_evaluate_aes(c: &mut Criterion) {
     let mut group = c.benchmark_group("evaluate_aes128");
-    group.throughput(Throughput::Elements(1));
+    group.throughput(Throughput::Elements(AES128.and_count() as u64));
 
     let mut rng = StdRng::seed_from_u64(0);
     let delta = Delta::random(&mut rng);
@@ -196,7 +196,7 @@ fn bench_100_aes(c: &mut Criterion) {
     // === Garble 100x ===
     {
         let mut group = c.benchmark_group("garble_100x_aes128");
-        group.throughput(Throughput::Elements(N as u64));
+        group.throughput(Throughput::Elements((N * AES128.and_count()) as u64));
 
         group.bench_function("half_gates", |b| {
             let mut gb = half_gates::Garbler::default();
@@ -229,7 +229,7 @@ fn bench_100_aes(c: &mut Criterion) {
     // === Evaluate 100x ===
     {
         let mut group = c.benchmark_group("evaluate_100x_aes128");
-        group.throughput(Throughput::Elements(N as u64));
+        group.throughput(Throughput::Elements((N * AES128.and_count()) as u64));
 
         group.bench_function("half_gates", |b| {
             let mut ev = half_gates::Evaluator::default();
@@ -263,7 +263,7 @@ fn bench_100_aes(c: &mut Criterion) {
     // === Garble+Evaluate 100x ===
     {
         let mut group = c.benchmark_group("garble_and_evaluate_100x_aes128");
-        group.throughput(Throughput::Elements(N as u64));
+        group.throughput(Throughput::Elements((N * AES128.and_count()) as u64));
 
         group.bench_function("half_gates", |b| {
             let mut gb = half_gates::Garbler::default();

@@ -90,6 +90,12 @@ thread_local! {
     static STATE: BenchState = BenchState::new();
 }
 
+/// Returns the number of AND gates in the AES-128 circuit.
+#[wasm_bindgen]
+pub fn aes128_and_count() -> u32 {
+    AES128.and_count() as u32
+}
+
 /// Benchmark half-gates garbling: garble AES circuit n times.
 /// Returns a checksum to prevent optimization.
 #[wasm_bindgen]

@@ -30,6 +30,14 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
+/// All available benchmarks
+const ALL_BENCHMARKS: &[&str] = &[
+    "half_gates_garble",
+    "three_halves_garble",
+    "half_gates_evaluate",
+    "three_halves_evaluate",
+];
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct BenchResult {
@@ -67,14 +75,14 @@ fn print_results(results: &BenchResults) {
     fn print_section(name: &str, benchmarks: &[BenchResult]) {
         println!("\n=== {} ===", name);
         println!(
-            "{:<30} {:>12} {:>14} {:>18}",
-            "Name", "Median (ms)", "Per-iter (us)", "Throughput (ops/s)"
+            "{:<30} {:>12} {:>14} {:>12}",
+            "Name", "Median (ms)", "Per-iter (us)", "AND gates/s"
         );
-        println!("{}", "-".repeat(78));
+        println!("{}", "-".repeat(72));
         for b in benchmarks {
             println!(
-                "{:<30} {:>12.2} {:>14.2} {:>18.1}",
-                b.name, b.median_ms, b.per_iter_us, b.throughput
+                "{:<30} {:>12.2} {:>14.2} {:>10.2}M",
+                b.name, b.median_ms, b.per_iter_us, b.throughput / 1_000_000.0
             );
         }
     }
@@ -165,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut iterations = 100u32;
     let mut samples = 10u32;
     let mut headless = true;
+    let mut selected_benchmarks: Vec<String> = Vec::new();
 
     // Parse arguments
     let mut i = 1;
@@ -181,6 +190,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--headed" => {
                 headless = false;
             }
+            "--list" | "-l" => {
+                println!("Available benchmarks:");
+                for name in ALL_BENCHMARKS {
+                    println!("  {}", name);
+                }
+                return Ok(());
+            }
+            "--bench" | "-b" => {
+                i += 1;
+                if let Some(name) = args.get(i) {
+                    if ALL_BENCHMARKS.contains(&name.as_str()) {
+                        selected_benchmarks.push(name.clone());
+                    } else {
+                        eprintln!("Unknown benchmark: {}", name);
+                        eprintln!("Use --list to see available benchmarks.");
+                        return Ok(());
+                    }
+                }
+            }
             "--help" | "-h" => {
                 println!("WASM Benchmark Runner");
                 println!();
@@ -189,8 +217,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Options:");
                 println!("  --iterations <N>   Number of iterations per benchmark (default: 100)");
                 println!("  --samples <N>      Number of samples per benchmark (default: 10)");
+                println!("  --bench, -b <NAME> Run specific benchmark (can be repeated)");
+                println!("  --list, -l         List available benchmarks");
                 println!("  --headed           Run with visible browser window");
                 println!("  --help, -h         Show this help");
+                println!();
+                println!("Examples:");
+                println!("  wasm-bench-runner                          # Run all benchmarks");
+                println!("  wasm-bench-runner -b half_gates_garble     # Run one benchmark");
+                println!("  wasm-bench-runner -b half_gates_garble -b half_gates_evaluate");
                 println!();
                 println!("Note: Run ./build-wasm.sh first to build the WASM module.");
                 return Ok(());
@@ -199,6 +234,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         i += 1;
     }
+
+    // If no benchmarks specified, run all
+    let benchmarks: Vec<String> = if selected_benchmarks.is_empty() {
+        ALL_BENCHMARKS.iter().map(|s| s.to_string()).collect()
+    } else {
+        selected_benchmarks
+    };
 
     let crate_dir = get_crate_dir();
     let index_path = crate_dir.join("index.html");
@@ -252,9 +294,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let page = browser.new_page("about:blank").await?;
 
     // Navigate to the benchmark page with autorun
+    let benchmarks_param = benchmarks.join(",");
     let url = format!(
-        "http://{}/?autorun=true&iterations={}&samples={}",
-        server_addr, iterations, samples
+        "http://{}/?autorun=true&iterations={}&samples={}&benchmarks={}",
+        server_addr, iterations, samples, benchmarks_param
     );
 
     println!("Loading {}...", url);

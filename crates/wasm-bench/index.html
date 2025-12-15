@@ -107,10 +107,11 @@
             runEvaluateBtn.disabled = disabled;
         }
 
-        async function runBenchmarks(type) {
+        async function runBenchmarks(type, filter = null) {
             const config = getConfig();
             disableButtons(true);
-            setStatus(`Running ${type} benchmarks (${config.iterations} iterations, ${config.samples} samples)...`);
+            const filterInfo = filter ? ` [${filter.length} selected]` : '';
+            setStatus(`Running ${type} benchmarks${filterInfo} (${config.iterations} iterations, ${config.samples} samples)...`);
             outputEl.textContent = '';
 
             // Use setTimeout to allow UI update before blocking
@@ -119,7 +120,7 @@
             try {
                 let results;
                 if (type === 'all') {
-                    results = bench.runAllBenchmarks(config.iterations, config.samples);
+                    results = bench.runAllBenchmarks(config.iterations, config.samples, filter);
                 } else if (type === 'garble') {
                     results = { garble: bench.runGarbleBenchmarks(config.iterations, config.samples) };
                 } else if (type === 'evaluate') {
@@ -154,9 +155,12 @@
                 if (params.get('autorun') === 'true') {
                     const iterations = parseInt(params.get('iterations')) || 100;
                     const samples = parseInt(params.get('samples')) || 10;
+                    const benchmarksParam = params.get('benchmarks');
+                    const filter = benchmarksParam ? benchmarksParam.split(',').filter(s => s) : null;
+
                     iterationsInput.value = iterations;
                     samplesInput.value = samples;
-                    await runBenchmarks('all');
+                    await runBenchmarks('all', filter);
                 }
             } catch (e) {
                 setStatus(`Failed to load WASM: ${e.message}`, true);
