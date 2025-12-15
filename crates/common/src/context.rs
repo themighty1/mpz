@@ -11,7 +11,9 @@ pub use mt::{
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub use test::{
-    test_mt_context, test_mt_context_with_concurrency, test_mt_context_with_spawn, test_st_context,
+    recording_st_context, recording_st_context_with_limit, replay_st_context, test_mt_context,
+    test_mt_context_with_concurrency, test_mt_context_with_spawn, test_st_context, RecordingDuplex,
+    ReplayDuplex,
 };
 
 use core::fmt;
@@ -46,6 +48,23 @@ impl Context {
         Self {
             id: ThreadId::default(),
             io: crate::io::Io::from_io(io),
+            mode: Mode::St,
+        }
+    }
+
+    /// Creates a new single-threaded context with a custom frame limit.
+    ///
+    /// # Arguments
+    ///
+    /// * `io` - The I/O channel used by the context.
+    /// * `max_frame_length` - Maximum frame size in bytes.
+    pub fn new_single_threaded_with_limit<Io>(io: Io, max_frame_length: usize) -> Self
+    where
+        Io: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        Self {
+            id: ThreadId::default(),
+            io: crate::io::Io::from_io_with_limit(io, max_frame_length),
             mode: Mode::St,
         }
     }

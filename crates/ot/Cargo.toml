@@ -12,7 +12,7 @@ name = "mpz_ot"
 [features]
 default = []
 rayon = ["mpz-ot-core/rayon"]
-ideal = ["mpz-common/ideal"]
+ideal = ["mpz-common/ideal", "serde"]
 test-utils = ["mpz-ot-core/test-utils"]
 
 [dependencies]
@@ -56,3 +56,8 @@ tokio = { workspace = true, features = [
 [[bench]]
 name = "shared"
 harness = false
+
+[[bench]]
+name = "ideal_cmp"
+harness = false
+required-features = ["ideal"]
