@@ -1,14 +1,15 @@
-//! Isolated benchmarks for prover and verifier.
+//! Isolated verifier benchmarks.
 //!
-//! Records protocol messages for replay-based isolated benchmarking.
+//! Records protocol messages for replay-based isolated benchmarking of verifier.
 //!
-//! Run with: cargo bench -p mpz-zk --bench isolated
+//! Run with: cargo bench -p mpz-zk --bench isolated_verifier
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::executor::block_on;
 use mpz_circuits::AES128;
 use mpz_common::context::{recording_st_context_with_limit, replay_st_context};
-use mpz_ot::ideal::msg_rcot::{MsgIdealRCOTReceiver, msg_ideal_rcot};
+use mpz_core::Block;
+use mpz_ot::ideal::msg_rcot::{MsgIdealRCOTSender, msg_ideal_rcot};
 use mpz_vm_core::{
     Call,
     memory::{Array, binary::U8, correlated::Delta},
@@ -34,7 +35,8 @@ fn max_frame_length(circuit: &mpz_circuits::Circuit, circuit_count: usize) -> us
 }
 
 /// Runs the full ZK protocol with prover and verifier.
-async fn run_protocol(
+/// Records prover->verifier messages (ctx_p is the recording context).
+async fn run_protocol_record_prover(
     ctx_p: &mut mpz_common::Context,
     ctx_v: &mut mpz_common::Context,
     seed: u64,
@@ -122,40 +124,49 @@ async fn run_protocol(
     );
 }
 
-/// Records the protocol and returns the recorded bytes (verifier -> prover).
-fn record_protocol(seed: u64, batch_size: usize) -> Vec<u8> {
+/// Records prover->verifier messages for verifier replay.
+fn record_for_verifier(seed: u64, batch_size: usize) -> (Vec<u8>, Block, Delta) {
     block_on(async {
-        let (mut ctx_p, mut ctx_v, recorded) =
+        // Swap: ctx_1 (prover) is recorded, ctx_0 (verifier) receives
+        let (mut ctx_v, mut ctx_p, recorded) =
             recording_st_context_with_limit(1024 * 1024, max_frame_length(&AES128, BLOCK_COUNT));
-        run_protocol(&mut ctx_p, &mut ctx_v, seed, batch_size).await;
-        // Clone the recorded bytes since contexts still hold Arc references
-        recorded.lock().unwrap().clone()
+
+        // Need to capture delta for verifier replay
+        let mut rng = StdRng::seed_from_u64(seed);
+        let delta = Delta::random(&mut rng);
+        let ot_seed: Block = rng.random();
+
+        run_protocol_record_prover(&mut ctx_p, &mut ctx_v, seed, batch_size).await;
+        (recorded.lock().unwrap().clone(), ot_seed, delta)
     })
 }
 
-/// Runs prover only with replay context.
-async fn run_prover_with_replay(ctx: &mut mpz_common::Context, batch_size: usize) {
-    // Create a fresh OT receiver - it will receive from replay context
-    let ot_recv = MsgIdealRCOTReceiver::new();
-    let prover_config = ProverConfig::builder()
+/// Runs verifier only with replay context.
+async fn run_verifier_with_replay(
+    ctx: &mut mpz_common::Context,
+    batch_size: usize,
+    delta: Delta,
+    ot_seed: Block,
+) {
+    // OT sender needs seed and delta to generate consistent correlations
+    let ot_send = MsgIdealRCOTSender::new(ot_seed, delta.into_inner());
+    let verifier_config = VerifierConfig::builder()
         .batch_size(batch_size)
         .build()
         .unwrap();
-    let mut prover = Prover::new(prover_config, ot_recv);
+    let mut verifier = Verifier::new(verifier_config, delta, ot_send);
 
-    // Set up prover with circuits (same as recording)
-    let key: Array<U8, 16> = prover.alloc().unwrap();
-    prover.mark_private(key).unwrap();
-    prover.assign(key, [0u8; 16]).unwrap();
-    prover.commit(key).unwrap();
+    let key: Array<U8, 16> = verifier.alloc().unwrap();
+    verifier.mark_blind(key).unwrap();
+    verifier.commit(key).unwrap();
 
     for _ in 0..BLOCK_COUNT {
-        let msg: Array<U8, 16> = prover.alloc().unwrap();
-        prover.mark_public(msg).unwrap();
-        prover.assign(msg, [42u8; 16]).unwrap();
-        prover.commit(msg).unwrap();
+        let msg: Array<U8, 16> = verifier.alloc().unwrap();
+        verifier.mark_public(msg).unwrap();
+        verifier.assign(msg, [42u8; 16]).unwrap();
+        verifier.commit(msg).unwrap();
 
-        let ciphertext: Array<U8, 16> = prover
+        let ciphertext: Array<U8, 16> = verifier
             .call(
                 Call::builder(AES128.clone())
                     .arg(key)
@@ -165,48 +176,44 @@ async fn run_prover_with_replay(ctx: &mut mpz_common::Context, batch_size: usize
             )
             .unwrap();
 
-        std::mem::drop(prover.decode(ciphertext).unwrap());
+        std::mem::drop(verifier.decode(ciphertext).unwrap());
     }
 
-    // Run prover - receives from replay context
-    prover.flush(ctx).await.unwrap();
-    prover.execute(ctx).await.unwrap();
-    prover.flush(ctx).await.unwrap();
+    verifier.flush(ctx).await.unwrap();
+    verifier.execute(ctx).await.unwrap();
+    verifier.flush(ctx).await.unwrap();
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("isolated");
+    let mut group = c.benchmark_group("isolated_verifier");
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(10));
 
-    // Throughput in AND gates
     let and_gates_per_circuit = AES128.and_count() as u64;
     group.throughput(Throughput::Elements(and_gates_per_circuit * BLOCK_COUNT as u64));
 
-    // Record and benchmark for each batch size
     for &batch_size in &BATCH_SIZES {
-        println!("Recording protocol with batch_size={}...", batch_size);
-        let recorded = record_protocol(0, batch_size);
+        println!("Recording for verifier with batch_size={}...", batch_size);
+        let (recorded, ot_seed, delta) = record_for_verifier(0, batch_size);
         println!("Recorded {} bytes", recorded.len());
 
         // Verify determinism
-        let recorded_2 = record_protocol(0, batch_size);
+        let (recorded_2, _, _) = record_for_verifier(0, batch_size);
         assert_eq!(
             recorded, recorded_2,
-            "Protocol recordings are not deterministic for batch_size={}",
+            "Verifier recordings not deterministic for batch_size={}",
             batch_size
         );
 
-        // Benchmark prover only with replay
         group.bench_with_input(
-            BenchmarkId::new("prover_only", format!("batch_{}k", batch_size / 1000)),
-            &(recorded, batch_size),
-            |b, (recorded, batch_size)| {
+            BenchmarkId::new("verifier", format!("batch_{}k", batch_size / 1000)),
+            &(recorded, batch_size, delta, ot_seed),
+            |b, (recorded, batch_size, delta, ot_seed)| {
                 b.iter(|| {
                     block_on(async {
                         let mut ctx =
                             replay_st_context(recorded.clone(), max_frame_length(&AES128, BLOCK_COUNT));
-                        run_prover_with_replay(&mut ctx, *batch_size).await;
+                        run_verifier_with_replay(&mut ctx, *batch_size, *delta, *ot_seed).await;
                     })
                 });
             },

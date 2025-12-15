@@ -52,5 +52,9 @@ name = "batch_size"
 harness = false
 
 [[bench]]
-name = "isolated"
+name = "isolated_prover"
+harness = false
+
+[[bench]]
+name = "isolated_verifier"
 harness = false
