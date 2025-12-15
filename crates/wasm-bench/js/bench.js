@@ -172,6 +172,11 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "garble_core", name: "garble_core/three_halves_garble", fn: (n) => wasm.garble_core_three_halves_garble(n), async: false },
         { category: "garble_core", name: "garble_core/half_gates_evaluate", fn: (n) => wasm.garble_core_half_gates_evaluate(n), async: false },
         { category: "garble_core", name: "garble_core/three_halves_evaluate", fn: (n) => wasm.garble_core_three_halves_evaluate(n), async: false },
+        // zk-core benchmarks (QuickSilver ZK protocol) - return BenchResult
+        { category: "zk_core", name: "zk_core/prover_execute", fn: (n) => wasm.zk_core_prover_execute(n), async: false, returnsBenchResult: true },
+        { category: "zk_core", name: "zk_core/verifier_execute", fn: (n) => wasm.zk_core_verifier_execute(n), async: false, returnsBenchResult: true },
+        { category: "zk_core", name: "zk_core/full_protocol", fn: (n) => wasm.zk_core_full_protocol(n), async: false, returnsBenchResult: true },
+        { category: "zk_core", name: "zk_core/check_only", fn: (n) => wasm.zk_core_check_only(n), async: false, returnsBenchResult: true },
         // garble benchmarks (full semihonest 2PC protocol)
         { category: "garble", name: "garble/semihonest_aes", fn: (n) => wasm.garble_semihonest_aes(n), async: true },
         { category: "garble", name: "garble/semihonest_aes_st_batched", fn: (n) => wasm.garble_semihonest_aes_st_batched(n), async: true, returnsBenchResult: true },

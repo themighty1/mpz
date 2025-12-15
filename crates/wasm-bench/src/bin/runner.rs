@@ -30,17 +30,34 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
+/// All available benchmark groups
+const ALL_GROUPS: &[&str] = &["garble_core", "zk_core", "garble", "test"];
+
 /// All available benchmarks
 const ALL_BENCHMARKS: &[&str] = &[
     "garble_core/half_gates_garble",
     "garble_core/three_halves_garble",
     "garble_core/half_gates_evaluate",
     "garble_core/three_halves_evaluate",
+    "zk_core/prover_execute",
+    "zk_core/verifier_execute",
+    "zk_core/full_protocol",
+    "zk_core/check_only",
     "garble/semihonest_aes",
     "garble/semihonest_aes_st_batched",
     "garble/semihonest_aes_mt_batched",
     "test/mt_context_only",
 ];
+
+/// Get all benchmarks in a group
+fn benchmarks_in_group(group: &str) -> Vec<&'static str> {
+    let prefix = format!("{}/", group);
+    ALL_BENCHMARKS
+        .iter()
+        .filter(|b| b.starts_with(&prefix))
+        .copied()
+        .collect()
+}
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -294,11 +311,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 headless = false;
             }
             "--list" | "-l" => {
+                println!("Available groups:");
+                for group in ALL_GROUPS {
+                    println!("  {}", group);
+                }
+                println!();
                 println!("Available benchmarks:");
                 for name in ALL_BENCHMARKS {
                     println!("  {}", name);
                 }
                 return Ok(());
+            }
+            "--group" | "-g" => {
+                i += 1;
+                if let Some(group) = args.get(i) {
+                    if ALL_GROUPS.contains(&group.as_str()) {
+                        for bench in benchmarks_in_group(group) {
+                            selected_benchmarks.push(bench.to_string());
+                        }
+                    } else {
+                        eprintln!("Unknown group: {}", group);
+                        eprintln!("Available groups: {}", ALL_GROUPS.join(", "));
+                        return Ok(());
+                    }
+                }
             }
             "--bench" | "-b" => {
                 i += 1;
@@ -321,16 +357,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  --iterations <N>     Number of iterations per benchmark (default: 100)");
                 println!("  --samples <N>        Number of samples per benchmark (default: 10)");
                 println!("  --concurrency, -c <N> Thread count for MT benchmarks (default: auto)");
-                println!("  --sweep              Run MT benchmarks with 1,2,3,4,6,8,12,16 threads");
+                println!("  --sweep              Run MT benchmarks with 2,3,4,6,8,12,16 threads");
+                println!("  --group, -g <GROUP>  Run all benchmarks in a group (can be repeated)");
                 println!("  --bench, -b <NAME>   Run specific benchmark (can be repeated)");
-                println!("  --list, -l           List available benchmarks");
+                println!("  --list, -l           List available groups and benchmarks");
                 println!("  --headed             Run with visible browser window");
                 println!("  --help, -h           Show this help");
                 println!();
+                println!("Groups: {}", ALL_GROUPS.join(", "));
+                println!();
                 println!("Examples:");
-                println!("  wasm-bench-runner                          # Run all benchmarks");
-                println!("  wasm-bench-runner -b half_gates_garble     # Run one benchmark");
-                println!("  wasm-bench-runner -b half_gates_garble -b half_gates_evaluate");
+                println!("  wasm-bench-runner                    # Run all benchmarks");
+                println!("  wasm-bench-runner -g garble_core     # Run all garble_core benchmarks");
+                println!("  wasm-bench-runner -g zk_core         # Run all zk_core benchmarks");
+                println!("  wasm-bench-runner -g garble --sweep  # Sweep thread counts for garble");
+                println!("  wasm-bench-runner -b zk_core/prover_execute  # Run one benchmark");
                 println!();
                 println!("Note: Run ./build-wasm.sh first to build the WASM module.");
                 return Ok(());

@@ -6,13 +6,16 @@
 //! Modules:
 //! - `garble_core`: Raw garbling/evaluation benchmarks (half-gates, three-halves)
 //! - `garble`: Full semihonest 2PC protocol benchmarks
+//! - `zk_core`: QuickSilver ZK protocol benchmarks (prover/verifier)
 
 mod garble_core;
 mod garble;
+mod zk_core;
 
 // Re-export all wasm_bindgen functions
 pub use garble_core::*;
 pub use garble::*;
+pub use zk_core::*;
 
 // Initialize web_spawn and rayon for MT benchmarks
 #[cfg(target_arch = "wasm32")]

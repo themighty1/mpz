@@ -37,6 +37,17 @@ Single-threaded benchmarks measuring raw garbling/evaluation speed without proto
 | `garble_core/half_gates_evaluate` | Half-gates evaluation of AES-128 circuit |
 | `garble_core/three_halves_evaluate` | Three-halves evaluation of AES-128 circuit |
 
+### zk_core (QuickSilver ZK protocol)
+
+Single-threaded benchmarks measuring the QuickSilver ZK proving/verification performance:
+
+| Benchmark | Description |
+|-----------|-------------|
+| `zk_core/prover_execute` | Prover execute phase only (generate adjustments) |
+| `zk_core/verifier_execute` | Verifier execute phase only (consume adjustments) |
+| `zk_core/full_protocol` | Complete ZK protocol (execute + check phases) |
+| `zk_core/check_only` | SVOLE-based consistency check phase only |
+
 ### garble (full semihonest 2PC protocol)
 
 End-to-end protocol benchmarks including garbling, evaluation, and communication:
@@ -63,10 +74,13 @@ Options:
   --samples <N>         Number of samples per benchmark (default: 10)
   --concurrency, -c <N> Thread count for MT benchmarks (default: auto, min: 2)
   --sweep               Run MT benchmarks with 2,3,4,6,8,12,16 threads
+  --group, -g <GROUP>   Run all benchmarks in a group (can be repeated)
   --bench, -b <NAME>    Run specific benchmark (can be repeated)
-  --list, -l            List available benchmarks
+  --list, -l            List available groups and benchmarks
   --headed              Run with visible browser window (for debugging)
   --help, -h            Show help
+
+Groups: garble_core, zk_core, garble, test
 ```
 
 ## Examples
@@ -107,15 +121,20 @@ cargo run --release --bin wasm-bench-runner -- \
   -b garble/semihonest_aes_mt_batched
 ```
 
-### garble-core Only
+### Run by Group
 
 ```bash
-# Run only the raw garbling primitive benchmarks
-cargo run --release --bin wasm-bench-runner -- \
-  -b garble_core/half_gates_garble \
-  -b garble_core/half_gates_evaluate \
-  -b garble_core/three_halves_garble \
-  -b garble_core/three_halves_evaluate
+# Run all garble_core benchmarks
+cargo run --release --bin wasm-bench-runner -- -g garble_core
+
+# Run all zk_core benchmarks
+cargo run --release --bin wasm-bench-runner -- -g zk_core
+
+# Run all garble benchmarks (includes MT)
+cargo run --release --bin wasm-bench-runner -- -g garble
+
+# Run multiple groups
+cargo run --release --bin wasm-bench-runner -- -g garble_core -g zk_core
 ```
 
 ## Output Format
