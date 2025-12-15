@@ -164,7 +164,8 @@ function calcStats(name, iterations, samples, times, circuitsPerIter = 1) {
 }
 
 // Define all benchmarks with their categories
-function getAllBenchmarkDefs() {
+// concurrency is passed to MT benchmarks to control thread count
+function getAllBenchmarkDefs(concurrency = 8) {
     return [
         // garble-core benchmarks (raw garbling primitives)
         { category: "garble_core", name: "garble_core/half_gates_garble", fn: (n) => wasm.garble_core_half_gates_garble(n), async: false },
@@ -174,7 +175,7 @@ function getAllBenchmarkDefs() {
         // garble benchmarks (full semihonest 2PC protocol)
         { category: "garble", name: "garble/semihonest_aes", fn: (n) => wasm.garble_semihonest_aes(n), async: true },
         { category: "garble", name: "garble/semihonest_aes_st_batched", fn: (n) => wasm.garble_semihonest_aes_st_batched(n), async: true, returnsBenchResult: true },
-        { category: "garble", name: "garble/semihonest_aes_mt_batched", fn: (n) => wasm.garble_semihonest_aes_batched(n), async: true, returnsBenchResult: true },
+        { category: "garble", name: "garble/semihonest_aes_mt_batched", fn: (n) => wasm.garble_semihonest_aes_batched(n, concurrency), async: true, returnsBenchResult: true },
         // test/debug benchmarks
         { category: "test", name: "test/mt_context_only", fn: async (n) => { for (let i = 0; i < n; i++) await wasm.test_mt_context_only(); return n; }, async: true },
     ];
@@ -197,10 +198,11 @@ export function runGarbleCoreBenchmarks(iterations = 100, samples = 10) {
 }
 
 // Run all benchmarks (or filtered subset)
-export async function runAllBenchmarks(iterations = 100, samples = 10, filter = null) {
+// concurrency controls thread count for MT benchmarks
+export async function runAllBenchmarks(iterations = 100, samples = 10, filter = null, concurrency = 8) {
     if (!wasm) throw new Error("WASM not initialized. Call init() first.");
 
-    let allDefs = getAllBenchmarkDefs();
+    let allDefs = getAllBenchmarkDefs(concurrency);
 
     // Filter benchmarks if specified
     if (filter && filter.length > 0) {

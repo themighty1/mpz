@@ -71,6 +71,102 @@ fn get_crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Run benchmarks with a specific concurrency setting, returns the results
+async fn run_benchmarks_with_concurrency(
+    browser: &Browser,
+    server_addr: std::net::SocketAddr,
+    benchmarks: &[String],
+    iterations: u32,
+    samples: u32,
+    concurrency: Option<u32>,
+) -> Result<BenchResults, Box<dyn std::error::Error>> {
+    let page = browser.new_page("about:blank").await?;
+
+    let benchmarks_param = benchmarks.join(",");
+    let concurrency_param = concurrency.map(|c| format!("&concurrency={}", c)).unwrap_or_default();
+    let url = format!(
+        "http://{}/?autorun=true&iterations={}&samples={}&benchmarks={}{}",
+        server_addr, iterations, samples, benchmarks_param, concurrency_param
+    );
+
+    if let Some(c) = concurrency {
+        println!("\n=== Running with {} threads ===", c);
+    }
+    println!("Loading {}...", url);
+    page.goto(NavigateParams::builder().url(&url).build()?)
+        .await?;
+
+    page.wait_for_navigation().await?;
+    println!("Page loaded, waiting for benchmarks...");
+    println!(
+        "Running benchmarks ({} iterations, {} samples)...\n",
+        iterations, samples
+    );
+
+    let timeout = Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    let mut last_status = String::new();
+    let mut last_log_count = 0usize;
+
+    let result: BenchOutput = loop {
+        if start.elapsed() > timeout {
+            return Err("Benchmark timed out after 5 minutes".into());
+        }
+
+        // Poll console logs
+        let logs_check = page
+            .evaluate("window.__consoleLogs ? JSON.stringify(window.__consoleLogs) : '[]'")
+            .await?;
+        if let Ok(logs_json) = logs_check.into_value::<String>() {
+            if let Ok(logs) = serde_json::from_str::<Vec<String>>(&logs_json) {
+                for log in logs.iter().skip(last_log_count) {
+                    println!("[console] {}", log);
+                }
+                last_log_count = logs.len();
+            }
+        }
+
+        // Check for errors
+        let error_check = page
+            .evaluate("window.__benchError || null")
+            .await?;
+        if let Ok(Some(error)) = error_check.into_value::<Option<String>>() {
+            return Err(format!("JavaScript error: {}", error).into());
+        }
+
+        // Check progress
+        let progress_check = page
+            .evaluate("window.__benchProgress || null")
+            .await?;
+        if let Ok(Some(progress)) = progress_check.into_value::<Option<String>>() {
+            if progress != last_status {
+                print!("\r\x1b[K{}", progress);
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                last_status = progress;
+            }
+        }
+
+        // Check if results are available
+        let check = page
+            .evaluate("window.__benchResults ? JSON.stringify(window.__benchResults) : null")
+            .await?;
+
+        match check.into_value::<Option<String>>() {
+            Ok(Some(json_str)) => {
+                println!();
+                break serde_json::from_str(&json_str)?;
+            }
+            Ok(None) => {}
+            Err(_) => {}
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+
+    drop(page);
+    Ok(result.results)
+}
 
 fn print_results(results: &BenchResults) {
     fn print_section(name: &str, benchmarks: &[BenchResult]) {
@@ -171,6 +267,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut iterations = 100u32;
     let mut samples = 10u32;
     let mut headless = true;
+    let mut concurrency: Option<u32> = None;
+    let mut sweep_concurrency = false;
     let mut selected_benchmarks: Vec<String> = Vec::new();
 
     // Parse arguments
@@ -184,6 +282,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--samples" => {
                 i += 1;
                 samples = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(10);
+            }
+            "--concurrency" | "-c" => {
+                i += 1;
+                concurrency = args.get(i).and_then(|s| s.parse().ok());
+            }
+            "--sweep" => {
+                sweep_concurrency = true;
             }
             "--headed" => {
                 headless = false;
@@ -213,12 +318,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Usage: wasm-bench-runner [OPTIONS]");
                 println!();
                 println!("Options:");
-                println!("  --iterations <N>   Number of iterations per benchmark (default: 100)");
-                println!("  --samples <N>      Number of samples per benchmark (default: 10)");
-                println!("  --bench, -b <NAME> Run specific benchmark (can be repeated)");
-                println!("  --list, -l         List available benchmarks");
-                println!("  --headed           Run with visible browser window");
-                println!("  --help, -h         Show this help");
+                println!("  --iterations <N>     Number of iterations per benchmark (default: 100)");
+                println!("  --samples <N>        Number of samples per benchmark (default: 10)");
+                println!("  --concurrency, -c <N> Thread count for MT benchmarks (default: auto)");
+                println!("  --sweep              Run MT benchmarks with 1,2,3,4,6,8,12,16 threads");
+                println!("  --bench, -b <NAME>   Run specific benchmark (can be repeated)");
+                println!("  --list, -l           List available benchmarks");
+                println!("  --headed             Run with visible browser window");
+                println!("  --help, -h           Show this help");
                 println!();
                 println!("Examples:");
                 println!("  wasm-bench-runner                          # Run all benchmarks");
@@ -239,6 +346,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         selected_benchmarks
     };
+
+    // Validate concurrency for MT benchmarks (need at least 2 threads)
+    let has_mt_benchmarks = benchmarks.iter().any(|b| b.contains("_mt"));
+    if has_mt_benchmarks {
+        if let Some(c) = concurrency {
+            if c < 2 {
+                return Err("MT benchmarks require at least 2 threads (garbler uses try_join). Use -c 2 or higher.".into());
+            }
+        }
+    }
 
     let crate_dir = get_crate_dir();
     let index_path = crate_dir.join("index.html");
@@ -293,97 +410,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Create page
-    let page = browser.new_page("about:blank").await?;
+    // Get available CPU count for sweep
+    let available_cpus = std::thread::available_parallelism()
+        .map(|p| p.get() as u32)
+        .unwrap_or(16);
 
-    // Navigate to the benchmark page with autorun
-    let benchmarks_param = benchmarks.join(",");
-    let url = format!(
-        "http://{}/?autorun=true&iterations={}&samples={}&benchmarks={}",
-        server_addr, iterations, samples, benchmarks_param
-    );
+    if sweep_concurrency {
+        // Only run MT benchmarks in sweep mode
+        let mt_benchmarks: Vec<String> = benchmarks
+            .iter()
+            .filter(|b| b.contains("_mt"))
+            .cloned()
+            .collect();
 
-    println!("Loading {}...", url);
-    page.goto(NavigateParams::builder().url(&url).build()?)
+        if mt_benchmarks.is_empty() {
+            return Err("No MT benchmarks selected for sweep. Use -b to select MT benchmarks.".into());
+        }
+
+        // MT context needs at least 2 threads (garbler uses try_join which forks into 2)
+        let thread_counts: Vec<u32> = vec![2, 3, 4, 6, 8, 12, 16]
+            .into_iter()
+            .filter(|&c| c <= available_cpus)
+            .collect();
+
+        println!("Sweeping thread counts: {:?} (max available: {})", thread_counts, available_cpus);
+
+        // Collect results for summary table
+        let mut sweep_results: Vec<(u32, BenchResults)> = Vec::new();
+
+        for thread_count in &thread_counts {
+            match run_benchmarks_with_concurrency(
+                &browser,
+                server_addr,
+                &mt_benchmarks,
+                iterations,
+                samples,
+                Some(*thread_count),
+            )
+            .await
+            {
+                Ok(results) => {
+                    print_results(&results);
+                    sweep_results.push((*thread_count, results));
+                }
+                Err(e) => {
+                    eprintln!("Error with {} threads: {}", thread_count, e);
+                }
+            }
+        }
+
+        // Print summary table
+        println!("\n\n=== CONCURRENCY SWEEP SUMMARY ===");
+        println!("{:<10} {:>15} {:>15}", "Threads", "Median (ms)", "AND gates/s");
+        println!("{}", "-".repeat(42));
+        for (threads, results) in &sweep_results {
+            for benchmarks in results.values() {
+                for b in benchmarks {
+                    println!(
+                        "{:<10} {:>15.2} {:>13.2}M",
+                        threads, b.median_ms, b.throughput / 1_000_000.0
+                    );
+                }
+            }
+        }
+    } else {
+        // Normal single run
+        let results = run_benchmarks_with_concurrency(
+            &browser,
+            server_addr,
+            &benchmarks,
+            iterations,
+            samples,
+            concurrency,
+        )
         .await?;
 
-    // Wait for navigation to complete
-    page.wait_for_navigation().await?;
-    println!("Page loaded, waiting for benchmarks...");
-
-    // Wait for benchmarks to complete (poll for results)
-    println!(
-        "Running benchmarks ({} iterations, {} samples)...\n",
-        iterations, samples
-    );
-
-    let timeout = Duration::from_secs(300); // 5 minute timeout
-    let start = std::time::Instant::now();
-    let mut last_status = String::new();
-    let mut last_log_count = 0usize;
-
-    let result: BenchOutput = loop {
-        if start.elapsed() > timeout {
-            return Err("Benchmark timed out after 5 minutes".into());
-        }
-
-        // Poll console logs from JS-side array
-        let logs_check = page
-            .evaluate("window.__consoleLogs ? JSON.stringify(window.__consoleLogs) : '[]'")
-            .await?;
-        if let Ok(logs_json) = logs_check.into_value::<String>() {
-            if let Ok(logs) = serde_json::from_str::<Vec<String>>(&logs_json) {
-                for log in logs.iter().skip(last_log_count) {
-                    println!("[console] {}", log);
-                }
-                last_log_count = logs.len();
-            }
-        }
-
-        // Check for errors first
-        let error_check = page
-            .evaluate("window.__benchError || null")
-            .await?;
-        if let Ok(Some(error)) = error_check.into_value::<Option<String>>() {
-            return Err(format!("JavaScript error: {}", error).into());
-        }
-
-        // Check progress
-        let progress_check = page
-            .evaluate("window.__benchProgress || null")
-            .await?;
-        if let Ok(Some(progress)) = progress_check.into_value::<Option<String>>() {
-            if progress != last_status {
-                // Clear line and print progress
-                print!("\r\x1b[K{}", progress);
-                use std::io::Write;
-                std::io::stdout().flush().ok();
-                last_status = progress;
-            }
-        }
-
-        // Check if results are available
-        let check = page
-            .evaluate("window.__benchResults ? JSON.stringify(window.__benchResults) : null")
-            .await?;
-
-        match check.into_value::<Option<String>>() {
-            Ok(Some(json_str)) => {
-                println!(); // New line after progress
-                break serde_json::from_str(&json_str)?;
-            }
-            Ok(None) => {}
-            Err(_) => {}
-        }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
-
-    // Print results
-    print_results(&result.results);
+        print_results(&results);
+    }
 
     // Cleanup
-    drop(page);
     drop(browser);
     handle.abort();
 

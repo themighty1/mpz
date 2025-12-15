@@ -56,3 +56,36 @@ where
             .unwrap(),
     )
 }
+
+/// Creates a pair of multi-threaded contexts with a custom spawn handler and concurrency.
+///
+/// Like [`test_mt_context_with_spawn`], but allows configuring the maximum concurrency
+/// level (number of worker threads) per context.
+pub fn test_mt_context_with_concurrency<F>(
+    io_buffer: usize,
+    concurrency: usize,
+    spawn: F,
+) -> (Multithread, Multithread)
+where
+    F: FnMut(Box<dyn FnOnce() + Send>) -> Result<(), SpawnError> + Clone + Send + 'static,
+{
+    let (mux_0, mux_1) = test_framed_mux(io_buffer);
+
+    let mux_0: Box<dyn Mux + Send> = Box::new(mux_0);
+    let mux_1: Box<dyn Mux + Send> = Box::new(mux_1);
+
+    (
+        Multithread::builder()
+            .concurrency(concurrency)
+            .spawn_handler(spawn.clone())
+            .mux_internal(mux_0)
+            .build()
+            .unwrap(),
+        Multithread::builder()
+            .concurrency(concurrency)
+            .spawn_handler(spawn)
+            .mux_internal(mux_1)
+            .build()
+            .unwrap(),
+    )
+}
