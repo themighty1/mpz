@@ -32,10 +32,13 @@ use tokio::net::TcpListener;
 
 /// All available benchmarks
 const ALL_BENCHMARKS: &[&str] = &[
-    "half_gates_garble",
-    "three_halves_garble",
-    "half_gates_evaluate",
-    "three_halves_evaluate",
+    "garble_core/half_gates_garble",
+    "garble_core/three_halves_garble",
+    "garble_core/half_gates_evaluate",
+    "garble_core/three_halves_evaluate",
+    "garble/semihonest_aes",
+    "garble/semihonest_aes_mt",
+    "test/mt_context_only",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -53,11 +56,8 @@ struct BenchResult {
     throughput: f64,
 }
 
-#[derive(Debug, Deserialize)]
-struct BenchResults {
-    garble: Option<Vec<BenchResult>>,
-    evaluate: Option<Vec<BenchResult>>,
-}
+/// Dynamic benchmark results by category
+type BenchResults = std::collections::HashMap<String, Vec<BenchResult>>;
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -75,23 +75,20 @@ fn print_results(results: &BenchResults) {
     fn print_section(name: &str, benchmarks: &[BenchResult]) {
         println!("\n=== {} ===", name);
         println!(
-            "{:<30} {:>12} {:>14} {:>12}",
+            "{:<40} {:>12} {:>14} {:>12}",
             "Name", "Median (ms)", "Per-iter (us)", "AND gates/s"
         );
-        println!("{}", "-".repeat(72));
+        println!("{}", "-".repeat(82));
         for b in benchmarks {
             println!(
-                "{:<30} {:>12.2} {:>14.2} {:>10.2}M",
+                "{:<40} {:>12.2} {:>14.2} {:>10.2}M",
                 b.name, b.median_ms, b.per_iter_us, b.throughput / 1_000_000.0
             );
         }
     }
 
-    if let Some(ref garble) = results.garble {
-        print_section("Garble (AES-128)", garble);
-    }
-    if let Some(ref evaluate) = results.evaluate {
-        print_section("Evaluate (AES-128)", evaluate);
+    for (category, benchmarks) in results {
+        print_section(category, benchmarks);
     }
 }
 
@@ -261,12 +258,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Launching browser (headless: {})...", headless);
 
     // Configure browser
-    let mut builder = BrowserConfig::builder();
+    let mut builder = BrowserConfig::builder()
+        .arg("--no-sandbox")
+        .arg("--disable-dev-shm-usage")
+        .arg("--disable-gpu")
+        .arg("--disable-cache")
+        .arg("--disable-application-cache");
+
     if headless {
-        builder = builder.arg("--headless=new");
+        builder = builder.arg("--headless");
     } else {
-        // For headed mode, need to disable headless explicitly
-        builder = builder.arg("--no-first-run").arg("--disable-gpu");
+        builder = builder.arg("--no-first-run");
     }
 
     // Set window size
@@ -317,10 +319,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(300); // 5 minute timeout
     let start = std::time::Instant::now();
     let mut last_status = String::new();
+    let mut last_log_count = 0usize;
 
     let result: BenchOutput = loop {
         if start.elapsed() > timeout {
             return Err("Benchmark timed out after 5 minutes".into());
+        }
+
+        // Poll console logs from JS-side array
+        let logs_check = page
+            .evaluate("window.__consoleLogs ? JSON.stringify(window.__consoleLogs) : '[]'")
+            .await?;
+        if let Ok(logs_json) = logs_check.into_value::<String>() {
+            if let Ok(logs) = serde_json::from_str::<Vec<String>>(&logs_json) {
+                for log in logs.iter().skip(last_log_count) {
+                    println!("[console] {}", log);
+                }
+                last_log_count = logs.len();
+            }
         }
 
         // Check for errors first

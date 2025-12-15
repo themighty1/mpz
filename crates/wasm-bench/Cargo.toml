@@ -8,19 +8,30 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 mpz-garble-core = { workspace = true }
+mpz-garble = { workspace = true }
 mpz-circuits = { workspace = true, features = ["aes"] }
 mpz-memory-core = { workspace = true }
 mpz-core = { workspace = true }
+mpz-common = { workspace = true, features = ["test-utils"] }
+mpz-ot = { workspace = true, features = ["ideal"] }
+mpz-vm-core = { workspace = true }
 
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 rand = { workspace = true }
+futures = { workspace = true }
+web-spawn = { version = "0.2", features = ["no-bundler"] }
+rayon = { workspace = true }
+web-sys = { version = "0.3", features = ["console"] }
+serio = { workspace = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-chromiumoxide = { version = "0.7", features = ["tokio-runtime"], default-features = false }
+chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "net", "io-util"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0"

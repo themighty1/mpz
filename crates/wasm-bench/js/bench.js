@@ -7,7 +7,7 @@ let andGateCount = 0;
 // Initialize WASM module
 export async function init(wasmModule) {
     wasm = wasmModule;
-    andGateCount = wasm.aes128_and_count();
+    andGateCount = wasm.garble_core_aes128_and_count();
 }
 
 // Progress callback (set by runner)
@@ -22,8 +22,8 @@ function reportProgress(message) {
     window.__benchProgress = message;
 }
 
-// Run a single benchmark with warmup and multiple samples
-function runBench(name, fn, iterations, samples = 10, warmupSamples = 3) {
+// Run a single benchmark with warmup and multiple samples (sync version)
+function runBenchSync(name, fn, iterations, samples = 10, warmupSamples = 3) {
     reportProgress(`Running: ${name} (warmup ${warmupSamples} runs)...`);
 
     // Warmup runs
@@ -48,7 +48,40 @@ function runBench(name, fn, iterations, samples = 10, warmupSamples = 3) {
         reportProgress(`Running: ${name} (${i + 1}/${samples} samples, ~${remainingSec}s remaining)...`);
     }
 
-    // Calculate statistics
+    return calcStats(name, iterations, samples, times);
+}
+
+// Run a single benchmark with warmup and multiple samples (async version)
+async function runBenchAsync(name, fn, iterations, samples = 10, warmupSamples = 3) {
+    reportProgress(`Running: ${name} (warmup ${warmupSamples} runs)...`);
+
+    // Warmup runs
+    for (let i = 0; i < warmupSamples; i++) {
+        await fn(iterations);
+    }
+
+    reportProgress(`Running: ${name} (0/${samples} samples)...`);
+
+    // Timed runs
+    const times = [];
+    for (let i = 0; i < samples; i++) {
+        const start = performance.now();
+        await fn(iterations);
+        const elapsed = performance.now() - start;
+        times.push(elapsed);
+
+        // Estimate remaining time
+        const avgTime = times.reduce((a, b) => a + b, 0) / times.length;
+        const remaining = avgTime * (samples - i - 1);
+        const remainingSec = (remaining / 1000).toFixed(1);
+        reportProgress(`Running: ${name} (${i + 1}/${samples} samples, ~${remainingSec}s remaining)...`);
+    }
+
+    return calcStats(name, iterations, samples, times);
+}
+
+// Calculate statistics from timing data
+function calcStats(name, iterations, samples, times) {
     times.sort((a, b) => a - b);
     const min = times[0];
     const max = times[times.length - 1];
@@ -77,39 +110,29 @@ function runBench(name, fn, iterations, samples = 10, warmupSamples = 3) {
 // Define all benchmarks with their categories
 function getAllBenchmarkDefs() {
     return [
-        { category: "garble", name: "half_gates_garble", fn: (n) => wasm.bench_half_gates_garble(n) },
-        { category: "garble", name: "three_halves_garble", fn: (n) => wasm.bench_three_halves_garble(n) },
-        { category: "evaluate", name: "half_gates_evaluate", fn: (n) => wasm.bench_half_gates_evaluate(n) },
-        { category: "evaluate", name: "three_halves_evaluate", fn: (n) => wasm.bench_three_halves_evaluate(n) },
+        // garble-core benchmarks (raw garbling primitives)
+        { category: "garble_core", name: "garble_core/half_gates_garble", fn: (n) => wasm.garble_core_half_gates_garble(n), async: false },
+        { category: "garble_core", name: "garble_core/three_halves_garble", fn: (n) => wasm.garble_core_three_halves_garble(n), async: false },
+        { category: "garble_core", name: "garble_core/half_gates_evaluate", fn: (n) => wasm.garble_core_half_gates_evaluate(n), async: false },
+        { category: "garble_core", name: "garble_core/three_halves_evaluate", fn: (n) => wasm.garble_core_three_halves_evaluate(n), async: false },
+        // garble benchmarks (full semihonest 2PC protocol)
+        { category: "garble", name: "garble/semihonest_aes", fn: (n) => wasm.garble_semihonest_aes(n), async: true },
+        { category: "garble", name: "garble/semihonest_aes_mt", fn: (n) => wasm.garble_semihonest_aes_mt(n), async: true },
+        // test/debug benchmarks
+        { category: "test", name: "test/mt_context_only", fn: async (n) => { for (let i = 0; i < n; i++) await wasm.test_mt_context_only(); return n; }, async: true },
     ];
 }
 
-// Run all garbling benchmarks
-export function runGarbleBenchmarks(iterations = 100, samples = 10) {
+// Run garble-core benchmarks
+export function runGarbleCoreBenchmarks(iterations = 100, samples = 10) {
     if (!wasm) throw new Error("WASM not initialized. Call init() first.");
 
-    const defs = getAllBenchmarkDefs().filter(d => d.category === "garble");
+    const defs = getAllBenchmarkDefs().filter(d => d.category === "garble_core");
     const results = [];
 
     for (let i = 0; i < defs.length; i++) {
         const def = defs[i];
-        reportProgress(`[Garble ${i + 1}/${defs.length}] Starting ${def.name}...`);
-        results.push(runBench(def.name, def.fn, iterations, samples));
-    }
-
-    return results;
-}
-
-// Run all evaluation benchmarks
-export function runEvaluateBenchmarks(iterations = 100, samples = 10) {
-    if (!wasm) throw new Error("WASM not initialized. Call init() first.");
-
-    const defs = getAllBenchmarkDefs().filter(d => d.category === "evaluate");
-    const results = [];
-
-    for (let i = 0; i < defs.length; i++) {
-        const def = defs[i];
-        reportProgress(`[Evaluate ${i + 1}/${defs.length}] Starting ${def.name}...`);
+        reportProgress(`[garble-core ${i + 1}/${defs.length}] Starting ${def.name}...`);
         results.push(runBench(def.name, def.fn, iterations, samples));
     }
 
@@ -117,7 +140,7 @@ export function runEvaluateBenchmarks(iterations = 100, samples = 10) {
 }
 
 // Run all benchmarks (or filtered subset)
-export function runAllBenchmarks(iterations = 100, samples = 10, filter = null) {
+export async function runAllBenchmarks(iterations = 100, samples = 10, filter = null) {
     if (!wasm) throw new Error("WASM not initialized. Call init() first.");
 
     let allDefs = getAllBenchmarkDefs();
@@ -128,7 +151,7 @@ export function runAllBenchmarks(iterations = 100, samples = 10, filter = null) 
     }
 
     const total = allDefs.length;
-    const results = { garble: [], evaluate: [] };
+    const results = {};
     const completedTimes = [];
 
     for (let i = 0; i < allDefs.length; i++) {
@@ -146,16 +169,18 @@ export function runAllBenchmarks(iterations = 100, samples = 10, filter = null) 
         reportProgress(`[${i + 1}/${total}] Starting ${def.name}...${etaStr}`);
 
         const startTime = performance.now();
-        const result = runBench(def.name, def.fn, iterations, samples);
+        const result = def.async
+            ? await runBenchAsync(def.name, def.fn, iterations, samples)
+            : runBenchSync(def.name, def.fn, iterations, samples);
         const elapsed = performance.now() - startTime;
         completedTimes.push(elapsed);
 
+        // Initialize category array if needed
+        if (!results[def.category]) {
+            results[def.category] = [];
+        }
         results[def.category].push(result);
     }
-
-    // Remove empty categories
-    if (results.garble.length === 0) delete results.garble;
-    if (results.evaluate.length === 0) delete results.evaluate;
 
     return results;
 }
@@ -166,10 +191,10 @@ export function formatResults(results) {
 
     const formatSection = (name, benchmarks) => {
         output += `\n=== ${name} ===\n`;
-        output += "Name                          | Median (ms) | Per-iter (µs) | AND gates/s\n";
-        output += "-".repeat(78) + "\n";
+        output += "Name                                    | Median (ms) | Per-iter (µs) | AND gates/s\n";
+        output += "-".repeat(88) + "\n";
         for (const b of benchmarks) {
-            const name = b.name.padEnd(29);
+            const name = b.name.padEnd(39);
             const median = b.median_ms.toFixed(2).padStart(11);
             const perIter = b.per_iter_us.toFixed(2).padStart(13);
             const throughput = (b.throughput / 1e6).toFixed(2).padStart(11) + "M";
@@ -177,10 +202,21 @@ export function formatResults(results) {
         }
     };
 
-    if (results.garble) formatSection("Garble (AES-128)", results.garble);
-    if (results.evaluate) formatSection("Evaluate (AES-128)", results.evaluate);
+    // Format each category dynamically
+    for (const [category, benchmarks] of Object.entries(results)) {
+        formatSection(category, benchmarks);
+    }
 
     return output;
+}
+
+// Test MT context in isolation
+export async function testMtContext() {
+    if (!wasm) throw new Error("WASM not initialized. Call init() first.");
+    console.log("Starting MT context test...");
+    const result = await wasm.test_mt_context_only();
+    console.log("MT context test result:", result);
+    return result;
 }
 
 // Main entry point for browser/chromiumoxide

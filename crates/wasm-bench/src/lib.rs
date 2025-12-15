@@ -1,181 +1,137 @@
-//! WASM benchmarks for mpz-garble-core.
+//! WASM benchmarks for mpz garbling libraries.
 //!
 //! This crate exposes garbling benchmarks as WASM-callable functions
 //! for browser performance testing.
+//!
+//! Modules:
+//! - `garble_core`: Raw garbling/evaluation benchmarks (half-gates, three-halves)
+//! - `garble`: Full semihonest 2PC protocol benchmarks
 
+mod garble_core;
+mod garble;
+
+// Re-export all wasm_bindgen functions
+pub use garble_core::*;
+pub use garble::*;
+
+// Initialize web_spawn and rayon for MT benchmarks
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-use mpz_circuits::AES128;
-use mpz_core::Block;
-use mpz_garble_core::{half_gates, three_halves, Key};
-use mpz_memory_core::correlated::Delta;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+/// Initialize the web_spawn spawner and rayon thread pool for MT benchmarks.
+/// Must be called before running any MT benchmarks.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn init_thread_pool(thread_count: usize) -> Result<(), JsValue> {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Arc;
+    use wasm_bindgen_futures::JsFuture;
 
-/// Shared benchmark state, initialized once.
-struct BenchState {
-    delta: Delta,
-    hg_inputs: Vec<Key>,
-    th_inputs: Vec<Key>,
-    hg_eval_inputs: Vec<mpz_memory_core::correlated::Mac>,
-    th_eval_inputs: Vec<mpz_memory_core::correlated::Mac>,
-    hg_gates: Vec<mpz_garble_core::EncryptedGate>,
-    th_gates: Vec<three_halves::EncryptedGate>,
-}
+    const INIT_PENDING: u8 = 0;
+    const INIT_SUCCESS: u8 = 1;
+    const INIT_FAILED: u8 = 2;
 
-impl BenchState {
-    fn new() -> Self {
-        let mut rng = StdRng::seed_from_u64(0);
-        let delta = Delta::random(&mut rng);
+    web_sys::console::log_1(&"[rust] init_thread_pool: starting web_spawn spawner...".into());
 
-        // Half-gates inputs
-        let hg_inputs: Vec<Key> = (0..256).map(|_| rng.random()).collect();
+    // Check if SharedArrayBuffer is available (requires COOP/COEP headers)
+    let sab_available = ::js_sys::Reflect::has(&::js_sys::global(), &"SharedArrayBuffer".into())
+        .unwrap_or(false);
+    web_sys::console::log_1(&format!("[rust] SharedArrayBuffer available: {}", sab_available).into());
 
-        // Three-halves inputs (LSB = 0)
-        let th_inputs: Vec<Key> = (0..256)
-            .map(|_| {
-                let mut block: Block = rng.random();
-                block.set_lsb(false);
-                block.into()
+    if !sab_available {
+        return Err(JsValue::from_str("SharedArrayBuffer not available - check COOP/COEP headers"));
+    }
+
+    // Initialize web_spawn spawner
+    web_sys::console::log_1(&"[rust] Calling web_spawn::start_spawner()...".into());
+    JsFuture::from(web_spawn::start_spawner()).await?;
+
+    web_sys::console::log_1(&"[rust] init_thread_pool: web_spawn spawner ready".into());
+    web_sys::console::log_1(&format!("[rust] init_thread_pool: building rayon pool with {} threads in worker...", thread_count).into());
+
+    // Initialize rayon in a worker thread (Atomics.wait is allowed there)
+    let init_status = Arc::new(AtomicU8::new(INIT_PENDING));
+    let init_status_clone = init_status.clone();
+
+    web_spawn::spawn(move || {
+        web_sys::console::log_1(&"[rust] worker: starting rayon init...".into());
+        let result = rayon::ThreadPoolBuilder::new()
+            .num_threads(thread_count)
+            .spawn_handler(|thread| {
+                web_sys::console::log_1(&"[rust] rayon spawn_handler called".into());
+                let _ = web_spawn::spawn(move || thread.run());
+                Ok(())
             })
-            .collect();
+            .build_global();
 
-        // Choices for evaluation
-        let choices: Vec<bool> = (0..256).map(|_| rng.random()).collect();
+        match result {
+            Ok(_) => {
+                web_sys::console::log_1(&"[rust] worker: rayon init success".into());
+                init_status_clone.store(INIT_SUCCESS, Ordering::SeqCst);
+            }
+            Err(e) => {
+                web_sys::console::log_1(&format!("[rust] worker: rayon init failed: {}", e).into());
+                init_status_clone.store(INIT_FAILED, Ordering::SeqCst);
+            }
+        }
+    });
 
-        // Half-gates eval inputs
-        let hg_eval_inputs: Vec<_> = hg_inputs
-            .iter()
-            .zip(&choices)
-            .map(|(k, &c)| k.auth(c, &delta))
-            .collect();
-
-        // Generate half-gates garbled circuit for evaluation benchmarks
-        let mut hg_gb = half_gates::Garbler::default();
-        let mut hg_iter = hg_gb.generate(&AES128, delta, &hg_inputs).unwrap();
-        let hg_gates: Vec<_> = hg_iter.by_ref().collect();
-        let _ = hg_iter.finish().unwrap();
-
-        // Generate three-halves garbled circuit and get input pairs
-        let mut th_gb = three_halves::Garbler::default();
-        let mut th_rng = StdRng::seed_from_u64(42);
-        let mut th_iter = th_gb
-            .generate(&AES128, delta, &th_inputs, &mut th_rng)
-            .unwrap();
-        let th_gates: Vec<_> = th_iter.by_ref().collect();
-        let three_halves::GarblerOutput {
-            inputs: input_pairs,
-            ..
-        } = th_iter.finish().unwrap();
-
-        let th_eval_inputs: Vec<_> = input_pairs
-            .iter()
-            .zip(&choices)
-            .map(|((f, t), &c)| if c { *t } else { *f })
-            .collect();
-
-        Self {
-            delta,
-            hg_inputs,
-            th_inputs,
-            hg_eval_inputs,
-            th_eval_inputs,
-            hg_gates,
-            th_gates,
+    // Poll for completion (non-blocking on main thread)
+    loop {
+        match init_status.load(Ordering::SeqCst) {
+            INIT_SUCCESS => {
+                web_sys::console::log_1(&"[rust] init_thread_pool: complete".into());
+                return Ok(());
+            }
+            INIT_FAILED => {
+                return Err(JsValue::from_str("rayon thread pool initialization failed"));
+            }
+            _ => {
+                // Yield to event loop
+                JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)).await?;
+            }
         }
     }
 }
 
-// Thread-local state for benchmarks (WASM is single-threaded)
-thread_local! {
-    static STATE: BenchState = BenchState::new();
-}
-
-/// Returns the number of AND gates in the AES-128 circuit.
+/// Test if MT context works at all - minimal ping-pong test.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
-pub fn aes128_and_count() -> u32 {
-    AES128.and_count() as u32
-}
+pub async fn test_mt_context_only() -> Result<u32, JsValue> {
+    use mpz_common::context::test_mt_context_with_spawn;
+    use serio::{SinkExt, stream::IoStreamExt};
 
-/// Benchmark half-gates garbling: garble AES circuit n times.
-/// Returns a checksum to prevent optimization.
-#[wasm_bindgen]
-pub fn bench_half_gates_garble(n: u32) -> u32 {
-    STATE.with(|state| {
-        let mut gb = half_gates::Garbler::default();
-        let mut checksum = 0u32;
+    let (mut mt1, mut mt2) = test_mt_context_with_spawn(8, |f| {
+        let _ = web_spawn::spawn(f);
+        Ok(())
+    });
 
-        for _ in 0..n {
-            let mut iter = gb.generate(&AES128, state.delta, &state.hg_inputs).unwrap();
-            let gates: Vec<_> = iter.by_ref().collect();
-            let _ = iter.finish().unwrap();
-            checksum = checksum.wrapping_add(gates.len() as u32);
+    web_sys::console::log_1(&"Created MT contexts".into());
+
+    let mut ctx1 = mt1.new_context().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mut ctx2 = mt2.new_context().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    web_sys::console::log_1(&"Got contexts from MT".into());
+
+    // Simple ping-pong: ctx1 sends, ctx2 receives
+    let (res1, res2) = futures::join!(
+        async {
+            web_sys::console::log_1(&"ctx1: sending...".into());
+            ctx1.io_mut().send(42u32).await.map_err(|e| e.to_string())?;
+            web_sys::console::log_1(&"ctx1: send done".into());
+            Ok::<_, String>(42u32)
+        },
+        async {
+            web_sys::console::log_1(&"ctx2: receiving...".into());
+            let val: u32 = ctx2.io_mut().expect_next().await.map_err(|e| e.to_string())?;
+            web_sys::console::log_1(&"ctx2: receive done".into());
+            Ok::<_, String>(val)
         }
+    );
 
-        checksum
-    })
+    let v1 = res1.map_err(|e| JsValue::from_str(&e))?;
+    let v2 = res2.map_err(|e| JsValue::from_str(&e))?;
+
+    web_sys::console::log_1(&format!("Test complete: {} + {} = {}", v1, v2, v1 + v2).into());
+    Ok(v1 + v2)
 }
-
-/// Benchmark three-halves garbling: garble AES circuit n times.
-/// Returns a checksum to prevent optimization.
-#[wasm_bindgen]
-pub fn bench_three_halves_garble(n: u32) -> u32 {
-    STATE.with(|state| {
-        let mut gb = three_halves::Garbler::default();
-        let mut checksum = 0u32;
-
-        for _ in 0..n {
-            let mut bench_rng = StdRng::seed_from_u64(42);
-            let mut iter = gb
-                .generate(&AES128, state.delta, &state.th_inputs, &mut bench_rng)
-                .unwrap();
-            let gates: Vec<_> = iter.by_ref().collect();
-            let _ = iter.finish().unwrap();
-            checksum = checksum.wrapping_add(gates.len() as u32);
-        }
-
-        checksum
-    })
-}
-
-/// Benchmark half-gates evaluation: evaluate AES circuit n times.
-/// Returns a checksum to prevent optimization.
-#[wasm_bindgen]
-pub fn bench_half_gates_evaluate(n: u32) -> u32 {
-    STATE.with(|state| {
-        let mut ev = half_gates::Evaluator::default();
-        let mut checksum = 0u32;
-
-        for _ in 0..n {
-            let mut consumer = ev.evaluate(&AES128, &state.hg_eval_inputs).unwrap();
-            for gate in &state.hg_gates {
-                consumer.next(*gate);
-            }
-            let output = consumer.finish().unwrap();
-            checksum = checksum.wrapping_add(output.outputs.len() as u32);
-        }
-
-        checksum
-    })
-}
-
-/// Benchmark three-halves evaluation: evaluate AES circuit n times.
-/// Returns a checksum to prevent optimization.
-#[wasm_bindgen]
-pub fn bench_three_halves_evaluate(n: u32) -> u32 {
-    STATE.with(|state| {
-        let mut ev = three_halves::Evaluator::default();
-        let mut checksum = 0u32;
-
-        for _ in 0..n {
-            let mut consumer = ev.evaluate(&AES128, &state.th_eval_inputs).unwrap();
-            for gate in &state.th_gates {
-                consumer.next(gate.clone());
-            }
-            let output = consumer.finish().unwrap();
-            checksum = checksum.wrapping_add(output.outputs.len() as u32);
-        }
-
-        checksum
-    })
-}
-

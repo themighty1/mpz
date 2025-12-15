@@ -63,138 +63,19 @@
     </style>
 </head>
 <body>
-    <h1>mpz-garble-core WASM Benchmarks</h1>
+    <h1>mpz WASM Benchmarks</h1>
 
     <div id="controls">
         <label>Iterations: <input type="number" id="iterations" value="100" min="1"></label>
         <label>Samples: <input type="number" id="samples" value="10" min="1"></label>
         <br><br>
         <button id="runAll" disabled>Run All Benchmarks</button>
-        <button id="runGarble" disabled>Garble Only</button>
-        <button id="runEvaluate" disabled>Evaluate Only</button>
+        <button id="runGarbleCore" disabled>garble-core Only</button>
     </div>
 
     <div id="status">Loading WASM module...</div>
     <div id="output"></div>
 
-    <script type="module">
-        import init, * as wasm from './pkg/mpz_wasm_bench.js';
-        import * as bench from './js/bench.js';
-
-        const statusEl = document.getElementById('status');
-        const outputEl = document.getElementById('output');
-        const runAllBtn = document.getElementById('runAll');
-        const runGarbleBtn = document.getElementById('runGarble');
-        const runEvaluateBtn = document.getElementById('runEvaluate');
-        const iterationsInput = document.getElementById('iterations');
-        const samplesInput = document.getElementById('samples');
-
-        function getConfig() {
-            return {
-                iterations: parseInt(iterationsInput.value) || 100,
-                samples: parseInt(samplesInput.value) || 10,
-            };
-        }
-
-        function setStatus(msg, isError = false) {
-            statusEl.textContent = msg;
-            statusEl.className = isError ? 'error' : 'success';
-        }
-
-        function disableButtons(disabled) {
-            runAllBtn.disabled = disabled;
-            runGarbleBtn.disabled = disabled;
-            runEvaluateBtn.disabled = disabled;
-        }
-
-        async function runBenchmarks(type, filter = null) {
-            const config = getConfig();
-            disableButtons(true);
-            const filterInfo = filter ? ` [${filter.length} selected]` : '';
-            setStatus(`Running ${type} benchmarks${filterInfo} (${config.iterations} iterations, ${config.samples} samples)...`);
-            outputEl.textContent = '';
-
-            // Use setTimeout to allow UI update before blocking
-            await new Promise(r => setTimeout(r, 50));
-
-            try {
-                let results;
-                if (type === 'all') {
-                    results = bench.runAllBenchmarks(config.iterations, config.samples, filter);
-                } else if (type === 'garble') {
-                    results = { garble: bench.runGarbleBenchmarks(config.iterations, config.samples) };
-                } else if (type === 'evaluate') {
-                    results = { evaluate: bench.runEvaluateBenchmarks(config.iterations, config.samples) };
-                }
-
-                const formatted = bench.formatResults(results);
-                outputEl.textContent = formatted;
-                setStatus('Benchmarks complete!');
-
-                // Store results for chromiumoxide to retrieve
-                window.__benchResults = { results, formatted };
-            } catch (e) {
-                setStatus(`Error: ${e.message}`, true);
-                outputEl.textContent = e.stack || e.toString();
-            } finally {
-                disableButtons(false);
-            }
-        }
-
-        // Initialize
-        async function main() {
-            try {
-                setStatus('Initializing WASM...');
-                await init();
-                bench.init(wasm);
-                setStatus('WASM loaded. Ready to run benchmarks.');
-                disableButtons(false);
-
-                // Check for auto-run (for chromiumoxide)
-                const params = new URLSearchParams(window.location.search);
-                if (params.get('autorun') === 'true') {
-                    const iterations = parseInt(params.get('iterations')) || 100;
-                    const samples = parseInt(params.get('samples')) || 10;
-                    const benchmarksParam = params.get('benchmarks');
-                    const filter = benchmarksParam ? benchmarksParam.split(',').filter(s => s) : null;
-
-                    iterationsInput.value = iterations;
-                    samplesInput.value = samples;
-                    await runBenchmarks('all', filter);
-                }
-            } catch (e) {
-                setStatus(`Failed to load WASM: ${e.message}`, true);
-                outputEl.textContent = e.stack || e.toString();
-                window.__benchError = e.message || e.toString();
-            }
-        }
-
-        // Global error handler
-        window.onerror = (msg, url, line, col, error) => {
-            window.__benchError = `${msg} at ${url}:${line}:${col}`;
-            setStatus(`Error: ${msg}`, true);
-        };
-
-        window.onunhandledrejection = (event) => {
-            window.__benchError = event.reason?.message || event.reason?.toString() || 'Unknown promise rejection';
-            setStatus(`Error: ${window.__benchError}`, true);
-        };
-
-        runAllBtn.addEventListener('click', () => runBenchmarks('all'));
-        runGarbleBtn.addEventListener('click', () => runBenchmarks('garble'));
-        runEvaluateBtn.addEventListener('click', () => runBenchmarks('evaluate'));
-
-        // Expose for chromiumoxide
-        window.runBenchmark = async (config) => {
-            const iterations = config?.iterations || 100;
-            const samples = config?.samples || 10;
-            iterationsInput.value = iterations;
-            samplesInput.value = samples;
-            await runBenchmarks('all');
-            return window.__benchResults;
-        };
-
-        main();
-    </script>
+    <script type="module" src="./js/main.js"></script>
 </body>
 </html>

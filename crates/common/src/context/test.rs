@@ -2,7 +2,7 @@ use serio::channel::duplex;
 use uid_mux::test_utils::test_framed_mux;
 
 use crate::{
-    context::{Context, Multithread},
+    context::{Context, Multithread, SpawnError},
     io::Io,
     mux::Mux,
 };
@@ -27,5 +27,32 @@ pub fn test_mt_context(io_buffer: usize) -> (Multithread, Multithread) {
     (
         Multithread::builder().mux_internal(mux_0).build().unwrap(),
         Multithread::builder().mux_internal(mux_1).build().unwrap(),
+    )
+}
+
+/// Creates a pair of multi-threaded contexts with a custom spawn handler.
+///
+/// This is useful for WASM environments where `std::thread::spawn` is not available
+/// and a custom spawner like `web_spawn` is needed.
+pub fn test_mt_context_with_spawn<F>(io_buffer: usize, spawn: F) -> (Multithread, Multithread)
+where
+    F: FnMut(Box<dyn FnOnce() + Send>) -> Result<(), SpawnError> + Clone + Send + 'static,
+{
+    let (mux_0, mux_1) = test_framed_mux(io_buffer);
+
+    let mux_0: Box<dyn Mux + Send> = Box::new(mux_0);
+    let mux_1: Box<dyn Mux + Send> = Box::new(mux_1);
+
+    (
+        Multithread::builder()
+            .spawn_handler(spawn.clone())
+            .mux_internal(mux_0)
+            .build()
+            .unwrap(),
+        Multithread::builder()
+            .spawn_handler(spawn)
+            .mux_internal(mux_1)
+            .build()
+            .unwrap(),
     )
 }

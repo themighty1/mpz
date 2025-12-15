@@ -10,7 +10,7 @@ pub use mt::{
     StdSpawn,
 };
 #[cfg(any(test, feature = "test-utils"))]
-pub use test::{test_mt_context, test_st_context};
+pub use test::{test_mt_context, test_mt_context_with_spawn, test_st_context};
 
 use core::fmt;
 use std::sync::{Arc, Mutex};
