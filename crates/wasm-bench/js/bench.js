@@ -173,8 +173,8 @@ function getAllBenchmarkDefs() {
         { category: "garble_core", name: "garble_core/three_halves_evaluate", fn: (n) => wasm.garble_core_three_halves_evaluate(n), async: false },
         // garble benchmarks (full semihonest 2PC protocol)
         { category: "garble", name: "garble/semihonest_aes", fn: (n) => wasm.garble_semihonest_aes(n), async: true },
-        { category: "garble", name: "garble/semihonest_aes_mt", fn: (n) => wasm.garble_semihonest_aes_mt(n), async: true, returnsBenchResult: true },
-        { category: "garble", name: "garble/semihonest_aes_batched", fn: (n) => wasm.garble_semihonest_aes_batched(n), async: true, returnsBenchResult: true },
+        { category: "garble", name: "garble/semihonest_aes_st_batched", fn: (n) => wasm.garble_semihonest_aes_st_batched(n), async: true, returnsBenchResult: true },
+        { category: "garble", name: "garble/semihonest_aes_mt_batched", fn: (n) => wasm.garble_semihonest_aes_batched(n), async: true, returnsBenchResult: true },
         // test/debug benchmarks
         { category: "test", name: "test/mt_context_only", fn: async (n) => { for (let i = 0; i < n; i++) await wasm.test_mt_context_only(); return n; }, async: true },
     ];
