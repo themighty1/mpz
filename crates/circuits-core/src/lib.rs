@@ -10,6 +10,7 @@ pub(crate) mod components;
 pub mod ops;
 #[cfg(feature = "parse")]
 mod parse;
+pub mod remap;
 
 pub use builder::{BuilderError, CircuitBuilder};
 pub use circuit::{Circuit, CircuitError};

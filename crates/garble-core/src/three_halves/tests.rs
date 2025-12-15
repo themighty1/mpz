@@ -4,7 +4,7 @@
 
 use super::control::{
     and_truth_table_with_permute, expand_marginal, extract_marginal, extract_truth_table_bits,
-    sample_r_odd, verify_k_r_a, verify_k_r_b, verify_k_r_dollar_is_zero, verify_k_r_p, R_P,
+    sample_r_odd_with_r, verify_k_r_a, verify_k_r_b, verify_k_r_dollar_is_zero, verify_k_r_p, R_P,
 };
 use super::matrices::{
     compute_v_inv_m, matmul_gf2, verify_km_is_zero, verify_kv_is_zero,
@@ -62,7 +62,7 @@ fn test_complete_constraint_and_gate() {
     // Test all random combinations
     for r0 in [false, true] {
         for r1 in [false, true] {
-            let (r_bool, r_bar) = sample_r_odd(pi_a, pi_b, [r0, r1]);
+            let (r_bool, r_bar) = sample_r_odd_with_r(pi_a, pi_b, [r0, r1]);
             let r = bool_to_u8_matrix(&r_bool);
 
             // Verify K × R = K × [0 0 t]

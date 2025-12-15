@@ -570,10 +570,24 @@ const SAMPLE_R_ODD_TABLE: [([[bool; 6]; 8], [[bool; 2]; 4]); 16] = {
 /// * `rand_bits` - Two random bits [r₀, r₁] for sampling R$
 ///
 /// # Returns
-/// * `R` - The 8×6 control matrix (bool values)
 /// * `r_bar` - The 4×2 compressed representation for encryption (bool values)
 #[inline]
-pub fn sample_r_odd(pi_a: bool, pi_b: bool, rand_bits: [bool; 2]) -> ([[bool; 6]; 8], [[bool; 2]; 4]) {
+pub fn sample_r_odd(pi_a: bool, pi_b: bool, rand_bits: [bool; 2]) -> [[bool; 2]; 4] {
+    let index = (pi_a as usize) << 3 | (pi_b as usize) << 2 | (rand_bits[0] as usize) << 1 | rand_bits[1] as usize;
+    SAMPLE_R_ODD_TABLE[index].1
+}
+
+/// Sample control matrix R for ODD mode gates (test version that also returns R).
+///
+/// This is the same as `sample_r_odd` but also returns the full R matrix
+/// for test verification purposes.
+///
+/// # Returns
+/// * `R` - The 8×6 control matrix (bool values)
+/// * `r_bar` - The 4×2 compressed representation for encryption (bool values)
+#[cfg(test)]
+#[inline]
+pub fn sample_r_odd_with_r(pi_a: bool, pi_b: bool, rand_bits: [bool; 2]) -> ([[bool; 6]; 8], [[bool; 2]; 4]) {
     let index = (pi_a as usize) << 3 | (pi_b as usize) << 2 | (rand_bits[0] as usize) << 1 | rand_bits[1] as usize;
     SAMPLE_R_ODD_TABLE[index]
 }
@@ -857,7 +871,7 @@ mod tests {
                 // Test with all 4 random bit combinations
                 for r0 in [false, true] {
                     for r1 in [false, true] {
-                        let (r_bool, _r_bar) = sample_r_odd(pi_a, pi_b, [r0, r1]);
+                        let (r_bool, _r_bar) = sample_r_odd_with_r(pi_a, pi_b, [r0, r1]);
                         let r = bool_to_u8_matrix(&r_bool);
 
                         // Compute K × R
@@ -891,7 +905,7 @@ mod tests {
 
         for r0 in [false, true] {
             for r1 in [false, true] {
-                let (r_bool, r_bar) = sample_r_odd(pi_a, pi_b, [r0, r1]);
+                let (r_bool, r_bar) = sample_r_odd_with_r(pi_a, pi_b, [r0, r1]);
                 let r = bool_to_u8_matrix(&r_bool);
 
                 // For ODD mode, we need to add R_p to the marginal before checking
@@ -938,7 +952,7 @@ mod tests {
 
         for r0 in [false, true] {
             for r1 in [false, true] {
-                let (_r, r_bar) = sample_r_odd(pi_a, pi_b, [r0, r1]);
+                let (_r, r_bar) = sample_r_odd_with_r(pi_a, pi_b, [r0, r1]);
                 marginals_00.push(r_bar[0]); // (0,0) marginal
             }
         }

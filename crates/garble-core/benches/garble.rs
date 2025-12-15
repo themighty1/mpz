@@ -1,18 +1,13 @@
 //! Benchmarks comparing half-gates vs three-halves garbling schemes.
 //!
 //! Run with: `cargo bench -p mpz-garble-core --bench garble`
-//!
-//! View HTML reports: `open target/criterion/report/index.html`
-//!
-//! For a quick comparison table in terminal:
-//!   `cargo bench -p mpz-garble-core --bench garble -- --noplot 2>&1 | grep -E "time:|half_gates|three_halves"`
 
-use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use mpz_circuits::AES128;
-use mpz_garble_core::{Key, half_gates, three_halves};
-use mpz_memory_core::correlated::Delta;
 use mpz_core::Block;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use mpz_garble_core::{half_gates, three_halves, Key};
+use mpz_memory_core::correlated::Delta;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 /// Benchmark single AES circuit garbling
 fn bench_garble_aes(c: &mut Criterion) {
@@ -47,7 +42,9 @@ fn bench_garble_aes(c: &mut Criterion) {
         let mut gb = three_halves::Garbler::default();
         b.iter(|| {
             let mut bench_rng = StdRng::seed_from_u64(42);
-            let mut iter = gb.generate(&AES128, delta, &th_inputs, &mut bench_rng).unwrap();
+            let mut iter = gb
+                .generate(&AES128, delta, &th_inputs, &mut bench_rng)
+                .unwrap();
             let _: Vec<_> = iter.by_ref().collect();
             black_box(iter.finish().unwrap())
         })
@@ -89,9 +86,14 @@ fn bench_evaluate_aes(c: &mut Criterion) {
 
     let mut th_gb = three_halves::Garbler::default();
     let mut th_rng = StdRng::seed_from_u64(42);
-    let mut th_iter = th_gb.generate(&AES128, delta, &th_inputs, &mut th_rng).unwrap();
+    let mut th_iter = th_gb
+        .generate(&AES128, delta, &th_inputs, &mut th_rng)
+        .unwrap();
     let th_gates: Vec<_> = th_iter.by_ref().collect();
-    let three_halves::GarblerOutput { inputs: input_pairs, .. } = th_iter.finish().unwrap();
+    let three_halves::GarblerOutput {
+        inputs: input_pairs,
+        ..
+    } = th_iter.finish().unwrap();
 
     let th_eval_inputs: Vec<_> = input_pairs
         .iter()
@@ -152,9 +154,14 @@ fn bench_100_aes(c: &mut Criterion) {
     // Get input pairs for three-halves evaluation
     let mut setup_gb = three_halves::Garbler::default();
     let mut setup_rng = StdRng::seed_from_u64(42);
-    let mut setup_iter = setup_gb.generate(&AES128, delta, &th_inputs, &mut setup_rng).unwrap();
+    let mut setup_iter = setup_gb
+        .generate(&AES128, delta, &th_inputs, &mut setup_rng)
+        .unwrap();
     let _: Vec<_> = setup_iter.by_ref().collect();
-    let three_halves::GarblerOutput { inputs: input_pairs, .. } = setup_iter.finish().unwrap();
+    let three_halves::GarblerOutput {
+        inputs: input_pairs,
+        ..
+    } = setup_iter.finish().unwrap();
 
     let th_eval_inputs: Vec<_> = input_pairs
         .iter()
@@ -177,7 +184,9 @@ fn bench_100_aes(c: &mut Criterion) {
     let th_all_gates: Vec<Vec<_>> = (0..N)
         .map(|_| {
             let mut bench_rng = StdRng::seed_from_u64(42);
-            let mut iter = th_gb.generate(&AES128, delta, &th_inputs, &mut bench_rng).unwrap();
+            let mut iter = th_gb
+                .generate(&AES128, delta, &th_inputs, &mut bench_rng)
+                .unwrap();
             let gates: Vec<_> = iter.by_ref().collect();
             let _ = iter.finish().unwrap();
             gates
@@ -205,7 +214,9 @@ fn bench_100_aes(c: &mut Criterion) {
             b.iter(|| {
                 for _ in 0..N {
                     let mut bench_rng = StdRng::seed_from_u64(42);
-                    let mut iter = gb.generate(&AES128, delta, &th_inputs, &mut bench_rng).unwrap();
+                    let mut iter = gb
+                        .generate(&AES128, delta, &th_inputs, &mut bench_rng)
+                        .unwrap();
                     let _: Vec<_> = iter.by_ref().collect();
                     black_box(iter.finish().unwrap());
                 }
@@ -276,7 +287,9 @@ fn bench_100_aes(c: &mut Criterion) {
             b.iter(|| {
                 for _ in 0..N {
                     let mut bench_rng = StdRng::seed_from_u64(42);
-                    let mut gb_iter = gb.generate(&AES128, delta, &th_inputs, &mut bench_rng).unwrap();
+                    let mut gb_iter = gb
+                        .generate(&AES128, delta, &th_inputs, &mut bench_rng)
+                        .unwrap();
                     let mut ev_consumer = ev.evaluate(&AES128, &th_eval_inputs).unwrap();
                     for gate in gb_iter.by_ref() {
                         ev_consumer.next(gate);
