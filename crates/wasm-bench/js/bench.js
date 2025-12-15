@@ -80,14 +80,70 @@ async function runBenchAsync(name, fn, iterations, samples = 10, warmupSamples =
     return calcStats(name, iterations, samples, times);
 }
 
-// Calculate statistics from timing data
-function calcStats(name, iterations, samples, times) {
+// Run benchmark that returns BenchResult { elapsed_ms, and_gates }
+async function runBenchWithResult(name, fn, iterations, samples = 10, warmupSamples = 3) {
+    reportProgress(`Running: ${name} (warmup ${warmupSamples} runs)...`);
+
+    // Warmup runs
+    for (let i = 0; i < warmupSamples; i++) {
+        await fn(iterations);
+    }
+
+    reportProgress(`Running: ${name} (0/${samples} samples)...`);
+
+    // Timed runs - function returns { elapsed_ms, and_gates }
+    const times = [];
+    let totalAndGates = 0;
+    for (let i = 0; i < samples; i++) {
+        const result = await fn(iterations);
+        console.log("BenchResult:", result, "elapsed_ms:", result.elapsed_ms, "and_gates:", result.and_gates);
+        times.push(result.elapsed_ms);
+        totalAndGates = Number(result.and_gates); // Same for all samples, convert BigInt if needed
+
+        // Estimate remaining time
+        const avgTime = times.reduce((a, b) => a + b, 0) / times.length;
+        const remaining = avgTime * (samples - i - 1);
+        const remainingSec = (remaining / 1000).toFixed(1);
+        reportProgress(`Running: ${name} (${i + 1}/${samples} samples, ~${remainingSec}s remaining)...`);
+    }
+
+    return calcStatsFromResult(name, iterations, samples, times, totalAndGates);
+}
+
+// Calculate statistics from BenchResult (elapsed_ms, and_gates)
+function calcStatsFromResult(name, iterations, samples, times, andGates) {
     times.sort((a, b) => a - b);
     const min = times[0];
     const max = times[times.length - 1];
     const median = times[Math.floor(times.length / 2)];
     const mean = times.reduce((a, b) => a + b, 0) / times.length;
-    const perIter = mean / iterations;
+
+    // Throughput: AND gates per second
+    const andGatesPerSec = (andGates * 1000) / mean;
+
+    return {
+        name,
+        iterations,
+        samples,
+        min_ms: min,
+        max_ms: max,
+        median_ms: median,
+        mean_ms: mean,
+        per_iter_ms: mean / iterations,
+        per_iter_us: (mean / iterations) * 1000,
+        throughput: andGatesPerSec,
+    };
+}
+
+// Calculate statistics from timing data
+function calcStats(name, iterations, samples, times, circuitsPerIter = 1) {
+    times.sort((a, b) => a - b);
+    const min = times[0];
+    const max = times[times.length - 1];
+    const median = times[Math.floor(times.length / 2)];
+    const mean = times.reduce((a, b) => a + b, 0) / times.length;
+    const totalCircuits = iterations * circuitsPerIter;
+    const perIter = mean / totalCircuits;
 
     // Throughput in AND gates per second
     // perIter is ms per AES circuit, each circuit has andGateCount AND gates
@@ -117,7 +173,8 @@ function getAllBenchmarkDefs() {
         { category: "garble_core", name: "garble_core/three_halves_evaluate", fn: (n) => wasm.garble_core_three_halves_evaluate(n), async: false },
         // garble benchmarks (full semihonest 2PC protocol)
         { category: "garble", name: "garble/semihonest_aes", fn: (n) => wasm.garble_semihonest_aes(n), async: true },
-        { category: "garble", name: "garble/semihonest_aes_mt", fn: (n) => wasm.garble_semihonest_aes_mt(n), async: true },
+        { category: "garble", name: "garble/semihonest_aes_mt", fn: (n) => wasm.garble_semihonest_aes_mt(n), async: true, returnsBenchResult: true },
+        { category: "garble", name: "garble/semihonest_aes_batched", fn: (n) => wasm.garble_semihonest_aes_batched(n), async: true, returnsBenchResult: true },
         // test/debug benchmarks
         { category: "test", name: "test/mt_context_only", fn: async (n) => { for (let i = 0; i < n; i++) await wasm.test_mt_context_only(); return n; }, async: true },
     ];
@@ -169,9 +226,14 @@ export async function runAllBenchmarks(iterations = 100, samples = 10, filter = 
         reportProgress(`[${i + 1}/${total}] Starting ${def.name}...${etaStr}`);
 
         const startTime = performance.now();
-        const result = def.async
-            ? await runBenchAsync(def.name, def.fn, iterations, samples)
-            : runBenchSync(def.name, def.fn, iterations, samples);
+        let result;
+        if (def.returnsBenchResult) {
+            result = await runBenchWithResult(def.name, def.fn, iterations, samples);
+        } else if (def.async) {
+            result = await runBenchAsync(def.name, def.fn, iterations, samples);
+        } else {
+            result = runBenchSync(def.name, def.fn, iterations, samples);
+        }
         const elapsed = performance.now() - startTime;
         completedTimes.push(elapsed);
 

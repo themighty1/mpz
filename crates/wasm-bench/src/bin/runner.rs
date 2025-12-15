@@ -38,6 +38,7 @@ const ALL_BENCHMARKS: &[&str] = &[
     "garble_core/three_halves_evaluate",
     "garble/semihonest_aes",
     "garble/semihonest_aes_mt",
+    "garble/semihonest_aes_batched",
     "test/mt_context_only",
 ];
 
