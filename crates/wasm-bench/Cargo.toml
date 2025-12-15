@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 mpz-garble-core = { workspace = true }
 mpz-garble = { workspace = true }
 mpz-zk-core = { workspace = true }
+mpz-zk = { workspace = true }
 mpz-circuits = { workspace = true, features = ["aes"] }
 mpz-memory-core = { workspace = true }
 mpz-core = { workspace = true }

@@ -14,8 +14,10 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("zk");
 
-    const BLOCK_COUNT: usize = 100;
-    group.throughput(Throughput::Bytes(16 * BLOCK_COUNT as u64));
+    const BLOCK_COUNT: usize = 1000;
+    // Throughput in AND gates (elem/s = AND gates/s)
+    let and_gates_per_circuit = AES128.and_count() as u64;
+    group.throughput(Throughput::Elements(and_gates_per_circuit * BLOCK_COUNT as u64));
     group.bench_function("aes128", |b| {
         let mut rng = StdRng::seed_from_u64(0);
         let delta = Delta::random(&mut rng);

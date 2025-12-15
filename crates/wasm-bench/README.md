@@ -37,9 +37,9 @@ Single-threaded benchmarks measuring raw garbling/evaluation speed without proto
 | `garble_core/half_gates_evaluate` | Half-gates evaluation of AES-128 circuit |
 | `garble_core/three_halves_evaluate` | Three-halves evaluation of AES-128 circuit |
 
-### zk_core (QuickSilver ZK protocol)
+### zk_core (QuickSilver ZK core)
 
-Single-threaded benchmarks measuring the QuickSilver ZK proving/verification performance:
+Single-threaded benchmarks measuring the QuickSilver ZK core proving/verification performance:
 
 | Benchmark | Description |
 |-----------|-------------|
@@ -47,6 +47,15 @@ Single-threaded benchmarks measuring the QuickSilver ZK proving/verification per
 | `zk_core/verifier_execute` | Verifier execute phase only (consume adjustments) |
 | `zk_core/full_protocol` | Complete ZK protocol (execute + check phases) |
 | `zk_core/check_only` | SVOLE-based consistency check phase only |
+
+### zk (full ZK protocol with VM)
+
+End-to-end ZK protocol benchmarks including proof generation, verification, and communication:
+
+| Benchmark | Description |
+|-----------|-------------|
+| `zk/zk_st_batched` | 256 AES circuits batched, single-threaded context |
+| `zk/zk_mt_batched` | 256 AES circuits batched, multi-threaded context |
 
 ### garble (full semihonest 2PC protocol)
 
@@ -80,7 +89,7 @@ Options:
   --headed              Run with visible browser window (for debugging)
   --help, -h            Show help
 
-Groups: garble_core, zk_core, garble, test
+Groups: garble_core, zk_core, zk, garble, test
 ```
 
 ## Examples

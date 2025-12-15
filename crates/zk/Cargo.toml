@@ -30,7 +30,9 @@ tokio = { workspace = true, features = [
     "macros",
     "rt",
     "rt-multi-thread",
+    "io-util",
 ] }
+tokio-util = { workspace = true, features = ["compat"] }
 rand = { workspace = true }
 mpz-circuits = { workspace = true, features = ["aes"] }
 mpz-common = { workspace = true, features = [
@@ -43,4 +45,12 @@ criterion = { workspace = true }
 
 [[bench]]
 name = "zk"
+harness = false
+
+[[bench]]
+name = "batch_size"
+harness = false
+
+[[bench]]
+name = "isolated"
 harness = false

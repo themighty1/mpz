@@ -177,6 +177,9 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "zk_core", name: "zk_core/verifier_execute", fn: (n) => wasm.zk_core_verifier_execute(n), async: false, returnsBenchResult: true },
         { category: "zk_core", name: "zk_core/full_protocol", fn: (n) => wasm.zk_core_full_protocol(n), async: false, returnsBenchResult: true },
         { category: "zk_core", name: "zk_core/check_only", fn: (n) => wasm.zk_core_check_only(n), async: false, returnsBenchResult: true },
+        // zk benchmarks (full ZK protocol with VM)
+        { category: "zk", name: "zk/zk_st_batched", fn: (n) => wasm.zk_st_batched(n), async: true, returnsBenchResult: true },
+        { category: "zk", name: "zk/zk_mt_batched", fn: (n) => wasm.zk_mt_batched(n, concurrency), async: true, returnsBenchResult: true },
         // garble benchmarks (full semihonest 2PC protocol)
         { category: "garble", name: "garble/semihonest_aes", fn: (n) => wasm.garble_semihonest_aes(n), async: true },
         { category: "garble", name: "garble/semihonest_aes_st_batched", fn: (n) => wasm.garble_semihonest_aes_st_batched(n), async: true, returnsBenchResult: true },
