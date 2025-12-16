@@ -13,14 +13,16 @@ mod garble_core;
 mod garble;
 mod zk_core;
 mod zk;
-mod zk_isolated;
+mod zk_prover;
+mod zk_verifier;
 
 // Re-export all wasm_bindgen functions
 pub use garble_core::*;
 pub use garble::*;
 pub use zk_core::*;
 pub use zk::*;
-pub use zk_isolated::*;
+pub use zk_prover::*;
+pub use zk_verifier::*;
 
 // Initialize web_spawn and rayon for MT benchmarks
 #[cfg(target_arch = "wasm32")]

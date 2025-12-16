@@ -101,7 +101,7 @@ async function main() {
             const concurrency = concurrencyParam ? parseInt(concurrencyParam) : (navigator.hardwareConcurrency || 8);
 
             // Only initialize thread pool if MT benchmarks are selected
-            const needsMT = !filter || filter.some(b => b.includes('_mt'));
+            const needsMT = bench.needsThreadPool(filter, concurrency);
             if (needsMT) {
                 console.log(`Initializing thread pool with ${concurrency} threads...`);
                 setStatus(`Initializing thread pool (${concurrency} threads)...`);

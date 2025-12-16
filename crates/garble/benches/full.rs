@@ -9,7 +9,7 @@ use mpz_vm_core::{Call, prelude::*};
 use rand::{SeedableRng, rngs::StdRng};
 
 fn criterion_benchmark(c: &mut Criterion) {
-    let mut group = c.benchmark_group("semihonest");
+    let mut group = c.benchmark_group("full");
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     group.throughput(Throughput::Bytes(16));

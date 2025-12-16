@@ -38,13 +38,12 @@ When providing benchmark commands, specify what needs rebuilding:
 
 ## Command Examples
 
+When showing benchmark commands to the user, always use `--iterations 1 --samples 1` for quick testing:
+
 ```bash
 # Run specific group
-../../target/release/wasm-bench-runner -g zk_core
+../../target/release/wasm-bench-runner -g zk_core --iterations 1 --samples 1
 
 # Run specific benchmark
-../../target/release/wasm-bench-runner -b zk_core/full_protocol
-
-# Quick test (fewer iterations/samples)
-../../target/release/wasm-bench-runner -g zk_core --iterations 10 --samples 3
+../../target/release/wasm-bench-runner -b zk_core/full_protocol --iterations 1 --samples 1
 ```

@@ -31,7 +31,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 
 /// All available benchmark groups
-const ALL_GROUPS: &[&str] = &["garble_core", "zk_core", "zk", "zk_isolated", "garble", "garble_isolated", "test"];
+const ALL_GROUPS: &[&str] = &["garble_core", "zk_core", "zk", "zk_prover", "zk_verifier", "garble", "garble_isolated", "test"];
 
 /// All available benchmarks
 const ALL_BENCHMARKS: &[&str] = &[
@@ -45,18 +45,28 @@ const ALL_BENCHMARKS: &[&str] = &[
     "zk_core/check_only",
     "zk/zk_st_batched",
     "zk/zk_mt_batched",
-    "zk_isolated/prover_batch_200k",
-    "zk_isolated/prover_batch_400k",
-    "zk_isolated/prover_batch_600k",
-    "zk_isolated/prover_batch_800k",
-    "zk_isolated/prover_batch_1000k",
-    "zk_isolated/prover_mt_batch_200k",
-    "zk_isolated/prover_mt_batch_400k",
-    "zk_isolated/prover_mt_batch_600k",
-    "zk_isolated/prover_mt_batch_800k",
-    "zk_isolated/prover_mt_batch_1000k",
-    "zk_isolated/replay_throughput",
-    "zk_isolated/channel_throughput",
+    "zk_prover/batch_200k",
+    "zk_prover/batch_400k",
+    "zk_prover/batch_600k",
+    "zk_prover/batch_800k",
+    "zk_prover/batch_1000k",
+    "zk_prover/mt_batch_200k",
+    "zk_prover/mt_batch_400k",
+    "zk_prover/mt_batch_600k",
+    "zk_prover/mt_batch_800k",
+    "zk_prover/mt_batch_1000k",
+    "zk_prover/replay_throughput",
+    "zk_prover/channel_throughput",
+    "zk_verifier/batch_200k",
+    "zk_verifier/batch_400k",
+    "zk_verifier/batch_600k",
+    "zk_verifier/batch_800k",
+    "zk_verifier/batch_1000k",
+    "zk_verifier/mt_batch_200k",
+    "zk_verifier/mt_batch_400k",
+    "zk_verifier/mt_batch_600k",
+    "zk_verifier/mt_batch_800k",
+    "zk_verifier/mt_batch_1000k",
     "garble/garble_st",
     "garble/garble_mt",
     "garble_isolated/garbler_mt",
