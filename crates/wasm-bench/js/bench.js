@@ -180,12 +180,29 @@ function getAllBenchmarkDefs(concurrency = 8) {
         // zk benchmarks (full ZK protocol with VM)
         { category: "zk", name: "zk/zk_st_batched", fn: (n) => wasm.zk_st_batched(n), async: true, returnsBenchResult: true },
         { category: "zk", name: "zk/zk_mt_batched", fn: (n) => wasm.zk_mt_batched(n, concurrency), async: true, returnsBenchResult: true },
-        // garble benchmarks (full semihonest 2PC protocol)
-        { category: "garble", name: "garble/semihonest_aes", fn: (n) => wasm.garble_semihonest_aes(n), async: true },
-        { category: "garble", name: "garble/semihonest_aes_st_batched", fn: (n) => wasm.garble_semihonest_aes_st_batched(n), async: true, returnsBenchResult: true },
-        { category: "garble", name: "garble/semihonest_aes_mt_batched", fn: (n) => wasm.garble_semihonest_aes_batched(n, concurrency), async: true, returnsBenchResult: true },
+        // zk_isolated benchmarks (isolated prover with message replay)
+        // warmup=1 since recording phase is expensive
+        { category: "zk_isolated", name: "zk_isolated/prover_batch_200k", fn: (n) => wasm.zk_isolated_prover(n, 200000), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_isolated", name: "zk_isolated/prover_batch_400k", fn: (n) => wasm.zk_isolated_prover(n, 400000), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_isolated", name: "zk_isolated/prover_batch_600k", fn: (n) => wasm.zk_isolated_prover(n, 600000), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_isolated", name: "zk_isolated/prover_batch_800k", fn: (n) => wasm.zk_isolated_prover(n, 800000), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_isolated", name: "zk_isolated/prover_batch_1000k", fn: (n) => wasm.zk_isolated_prover(n, 1000000), async: true, returnsBenchResult: true, warmup: 1 },
+        // MT isolated prover benchmarks
+        { category: "zk_isolated", name: "zk_isolated/prover_mt_batch_200k", fn: (n) => wasm.zk_isolated_prover_mt(n, 200000, concurrency), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_isolated", name: "zk_isolated/prover_mt_batch_400k", fn: (n) => wasm.zk_isolated_prover_mt(n, 400000, concurrency), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_isolated", name: "zk_isolated/prover_mt_batch_600k", fn: (n) => wasm.zk_isolated_prover_mt(n, 600000, concurrency), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_isolated", name: "zk_isolated/prover_mt_batch_800k", fn: (n) => wasm.zk_isolated_prover_mt(n, 800000, concurrency), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_isolated", name: "zk_isolated/prover_mt_batch_1000k", fn: (n) => wasm.zk_isolated_prover_mt(n, 1000000, concurrency), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_isolated", name: "zk_isolated/replay_throughput", fn: (n) => wasm.zk_isolated_replay_throughput(n), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_isolated", name: "zk_isolated/channel_throughput", fn: (n) => wasm.zk_isolated_channel_throughput(n), async: true, returnsBenchResult: true },
+        // garble benchmarks (full semihonest 2PC protocol, 1000 AES circuits)
+        { category: "garble", name: "garble/garble_st", fn: (n) => wasm.garble_st(n), async: true, returnsBenchResult: true },
+        { category: "garble", name: "garble/garble_mt", fn: (n) => wasm.garble_mt(n, concurrency), async: true, returnsBenchResult: true },
+        // garble_isolated benchmarks (isolated garbler with message replay)
+        { category: "garble_isolated", name: "garble_isolated/garbler_mt", fn: (n) => wasm.garble_isolated_mt(n, concurrency), async: true, returnsBenchResult: true, warmup: 1 },
         // test/debug benchmarks
         { category: "test", name: "test/mt_context_only", fn: async (n) => { for (let i = 0; i < n; i++) await wasm.test_mt_context_only(); return n; }, async: true },
+        { category: "test", name: "test/recording_layer", fn: async (n) => { for (let i = 0; i < n; i++) await wasm.zk_isolated_test_recording(); return n; }, async: true },
     ];
 }
 
@@ -236,13 +253,14 @@ export async function runAllBenchmarks(iterations = 100, samples = 10, filter = 
         reportProgress(`[${i + 1}/${total}] Starting ${def.name}...${etaStr}`);
 
         const startTime = performance.now();
+        const warmup = def.warmup !== undefined ? def.warmup : 3;
         let result;
         if (def.returnsBenchResult) {
-            result = await runBenchWithResult(def.name, def.fn, iterations, samples);
+            result = await runBenchWithResult(def.name, def.fn, iterations, samples, warmup);
         } else if (def.async) {
-            result = await runBenchAsync(def.name, def.fn, iterations, samples);
+            result = await runBenchAsync(def.name, def.fn, iterations, samples, warmup);
         } else {
-            result = runBenchSync(def.name, def.fn, iterations, samples);
+            result = runBenchSync(def.name, def.fn, iterations, samples, warmup);
         }
         const elapsed = performance.now() - startTime;
         completedTimes.push(elapsed);

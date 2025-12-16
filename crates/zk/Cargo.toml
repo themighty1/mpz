@@ -58,3 +58,7 @@ harness = false
 [[bench]]
 name = "isolated_verifier"
 harness = false
+
+[[bench]]
+name = "recording_overhead"
+harness = false

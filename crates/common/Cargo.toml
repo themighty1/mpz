@@ -43,3 +43,4 @@ rstest = { workspace = true }
 name = "io"
 path = "benches/io.rs"
 harness = false
+required-features = ["test-utils"]

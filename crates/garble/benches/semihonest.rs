@@ -4,7 +4,7 @@ use mpz_circuits::AES128;
 use mpz_common::context::{test_mt_context, test_st_context};
 use mpz_garble::protocol::semihonest::{Evaluator, Garbler};
 use mpz_memory_core::{Array, binary::*, correlated::Delta};
-use mpz_ot::ideal::cot::ideal_cot;
+use mpz_ot::ideal::msg_cot::msg_ideal_cot;
 use mpz_vm_core::{Call, prelude::*};
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -19,7 +19,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             let delta = Delta::random(&mut rng);
 
             let (mut ctx_a, mut ctx_b) = test_st_context(8);
-            let (cot_send, cot_recv) = ideal_cot(delta.into_inner());
+            let (cot_send, cot_recv) = msg_ideal_cot(delta.into_inner());
 
             let mut gb = Garbler::new(cot_send, [0u8; 16], delta);
             let mut ev = Evaluator::new(cot_recv);
@@ -98,7 +98,7 @@ fn criterion_benchmark(c: &mut Criterion) {
             let mut ctx_ev = exec_ev.new_context().await.unwrap();
 
             let delta = Delta::random(&mut rng);
-            let (cot_send, cot_recv) = ideal_cot(delta.into_inner());
+            let (cot_send, cot_recv) = msg_ideal_cot(delta.into_inner());
 
             let mut gb = Garbler::new(cot_send, [0u8; 16], delta);
             let mut ev = Evaluator::new(cot_recv);
