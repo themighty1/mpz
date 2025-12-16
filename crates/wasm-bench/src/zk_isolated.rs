@@ -683,63 +683,117 @@ async fn run_prover_with_replay_mt(exec: &mut Multithread, batch_size: usize) {
 /// * `n` - Number of iterations
 /// * `batch_size` - Batch size for consistency checks (e.g., 200000, 400000, etc.)
 /// * `concurrency` - Number of worker threads for parallel execution
+///
+/// # Implementation Note
+///
+/// This benchmark runs on a Web Worker (via `web_spawn::spawn`) rather than
+/// the main browser thread. This is required because mpz-zk-core's consistency
+/// check (`prover.check()`) uses rayon parallel iterators internally, which call
+/// `Atomics.wait` to synchronize worker threads. `Atomics.wait` is forbidden on
+/// the main browser thread but allowed in Web Workers.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn zk_isolated_prover_mt(n: u32, batch_size: u32, concurrency: u32) -> BenchResult {
+    use std::sync::{Arc, Mutex};
+    use wasm_bindgen::JsValue;
+    use wasm_bindgen_futures::JsFuture;
+
     let and_gates_per_circuit = AES128.and_count() as u64;
-    let batch_size = batch_size as usize;
 
-    let performance = web_sys::window().unwrap().performance().unwrap();
+    // Shared slot for benchmark result
+    let result: Arc<Mutex<Option<BenchResult>>> = Arc::new(Mutex::new(None));
+    let result_clone = result.clone();
 
-    // Record messages once (not timed)
-    web_sys::console::log_1(
-        &format!(
-            "[rust] Recording MT messages for batch_size={}, concurrency={}...",
-            batch_size, concurrency
-        )
-        .into(),
-    );
-    yield_to_browser().await;
+    web_sys::console::log_1(&"[rust] About to call web_spawn::spawn...".into());
 
-    let recorded = record_for_prover_mt(0, batch_size, concurrency as usize).await;
-    let total_bytes: usize = recorded.channels.values().map(|v| v.len()).sum();
-    web_sys::console::log_1(
-        &format!(
-            "[rust] Recorded {} channels, {} total bytes",
-            recorded.channels.len(),
-            total_bytes
-        )
-        .into(),
-    );
-    yield_to_browser().await;
+    // Run benchmark on web worker thread (where Atomics.wait is allowed)
+    // We use web_spawn instead of rayon::spawn because rayon's global pool
+    // initialized in a worker isn't accessible from the main thread.
+    let _handle = web_spawn::spawn(move || {
+        web_sys::console::log_1(&"[rust] web_spawn started".into());
+        let bench_result = pollster::block_on(async {
+            web_sys::console::log_1(&"[rust] pollster::block_on started".into());
+            let batch_size = batch_size as usize;
+            // Workers don't have `window`, use global scope to get performance
+            let global = js_sys::global();
+            let performance: web_sys::Performance = js_sys::Reflect::get(&global, &"performance".into())
+                .expect("performance should exist")
+                .unchecked_into();
+            web_sys::console::log_1(&"[rust] got performance object".into());
 
-    let mut total_elapsed_ms = 0.0;
+            // Record messages once (not timed)
+            web_sys::console::log_1(
+                &format!(
+                    "[rust] Recording MT messages for batch_size={}, concurrency={}...",
+                    batch_size, concurrency
+                )
+                .into(),
+            );
 
-    for i in 0..n {
-        if i % 10 == 0 {
-            web_sys::console::log_1(&format!("[rust] MT Iteration {}/{}", i, n).into());
-            yield_to_browser().await;
+            let recorded = record_for_prover_mt(0, batch_size, concurrency as usize).await;
+            let total_bytes: usize = recorded.channels.values().map(|v| v.len()).sum();
+            web_sys::console::log_1(
+                &format!(
+                    "[rust] Recorded {} channels, {} total bytes",
+                    recorded.channels.len(),
+                    total_bytes
+                )
+                .into(),
+            );
+
+            let mut total_elapsed_ms = 0.0;
+
+            for i in 0..n {
+                if i % 10 == 0 {
+                    web_sys::console::log_1(&format!("[rust] MT Iteration {}/{}", i, n).into());
+                }
+
+                // Timed section: prover replay with MT context
+                let start = performance.now();
+
+                let mut exec = replay_mt_context_with_spawn_and_limit(
+                    recorded.clone(),
+                    max_frame_length(&AES128, BLOCK_COUNT),
+                    concurrency as usize,
+                    |f| {
+                        let _ = web_spawn::spawn(f);
+                        Ok(())
+                    },
+                );
+                run_prover_with_replay_mt(&mut exec, batch_size).await;
+
+                total_elapsed_ms += performance.now() - start;
+            }
+
+            BenchResult {
+                elapsed_ms: total_elapsed_ms,
+                and_gates: n as u64 * BLOCK_COUNT as u64 * and_gates_per_circuit,
+            }
+        });
+        web_sys::console::log_1(&"[rust] web_spawn storing result".into());
+        *result_clone.lock().unwrap() = Some(bench_result);
+        web_sys::console::log_1(&"[rust] web_spawn done".into());
+    });
+
+    web_sys::console::log_1(&"[rust] web_spawn::spawn returned JoinHandle, starting poll loop".into());
+
+    // Initial yield to let the worker start
+    JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)).await.unwrap();
+    web_sys::console::log_1(&"[rust] after initial yield".into());
+
+    // Poll for result on main thread (non-blocking)
+    loop {
+        if let Some(r) = result.lock().unwrap().take() {
+            return r;
         }
-
-        // Timed section: prover replay with MT context
-        let start = performance.now();
-
-        let mut exec = replay_mt_context_with_spawn_and_limit(
-            recorded.clone(),
-            max_frame_length(&AES128, BLOCK_COUNT),
-            concurrency as usize,
-            |f| {
-                let _ = web_spawn::spawn(f);
-                Ok(())
-            },
-        );
-        run_prover_with_replay_mt(&mut exec, batch_size).await;
-
-        total_elapsed_ms += performance.now() - start;
-    }
-
-    BenchResult {
-        elapsed_ms: total_elapsed_ms,
-        and_gates: n as u64 * BLOCK_COUNT as u64 * and_gates_per_circuit,
+        // Yield with 10ms delay to avoid busy-spinning
+        JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 10)
+                .unwrap();
+        }))
+        .await
+        .unwrap();
     }
 }
