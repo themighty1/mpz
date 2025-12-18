@@ -38,7 +38,9 @@ const ALL_BENCHMARKS: &[&str] = &[
     "garble_core/half_gates_garble",
     "garble_core/half_gates_evaluate",
     "zk_core/prover_execute",
+    "zk_core/prover_check",
     "zk_core/verifier_execute",
+    "zk_core/verifier_check",
     "zk_core/full_protocol",
     "zk_core/check_only",
     "zk/zk_st_batched",
@@ -54,11 +56,6 @@ const ALL_BENCHMARKS: &[&str] = &[
     "zk_prover/batch_600k",
     "zk_prover/batch_800k",
     "zk_prover/batch_1000k",
-    "zk_prover/mt_batch_200k",
-    "zk_prover/mt_batch_400k",
-    "zk_prover/mt_batch_600k",
-    "zk_prover/mt_batch_800k",
-    "zk_prover/mt_batch_1000k",
     "zk_prover/replay_throughput",
     "zk_prover/channel_throughput",
     "zk_verifier/batch_200k",
@@ -66,11 +63,6 @@ const ALL_BENCHMARKS: &[&str] = &[
     "zk_verifier/batch_600k",
     "zk_verifier/batch_800k",
     "zk_verifier/batch_1000k",
-    "zk_verifier/mt_batch_200k",
-    "zk_verifier/mt_batch_400k",
-    "zk_verifier/mt_batch_600k",
-    "zk_verifier/mt_batch_800k",
-    "zk_verifier/mt_batch_1000k",
     "garble/garbler_100k",
     "garble/garbler_1m",
     "garble/garbler_10m",
@@ -91,6 +83,23 @@ fn benchmarks_in_group(group: &str) -> Vec<&'static str> {
         .filter(|b| b.starts_with(&prefix))
         .copied()
         .collect()
+}
+
+/// Check if a benchmark is multi-threaded (uses concurrency parameter)
+fn is_mt_benchmark(name: &str) -> bool {
+    // MT groups: all benchmarks in these groups are MT
+    let mt_groups = ["zk_overhead", "zk_prover", "zk_verifier", "garble"];
+    for group in mt_groups {
+        if name.starts_with(&format!("{}/", group)) {
+            // Exclude specific ST benchmarks
+            if name == "zk_prover/replay_throughput" || name == "zk_prover/channel_throughput" {
+                return false;
+            }
+            return true;
+        }
+    }
+    // Individual MT benchmarks
+    matches!(name, "zk/zk_mt_batched" | "ferret/sender_mt" | "test/mt_context_only")
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,7 +437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Validate concurrency for MT benchmarks (need at least 2 threads)
-    let has_mt_benchmarks = benchmarks.iter().any(|b| b.contains("_mt"));
+    let has_mt_benchmarks = benchmarks.iter().any(|b| is_mt_benchmark(b));
     if has_mt_benchmarks {
         if let Some(c) = concurrency {
             if c < 2 {
@@ -499,7 +508,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Only run MT benchmarks in sweep mode
         let mt_benchmarks: Vec<String> = benchmarks
             .iter()
-            .filter(|b| b.contains("_mt"))
+            .filter(|b| is_mt_benchmark(b))
             .cloned()
             .collect();
 

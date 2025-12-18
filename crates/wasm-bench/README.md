@@ -1,6 +1,6 @@
 # mpz-wasm-bench
 
-WASM benchmarks for mpz garbling libraries. Runs in headless Chrome via chromiumoxide to measure real browser performance with Web Workers and SharedArrayBuffer.
+WASM benchmarks for mpz libraries. Runs in headless Chrome via chromiumoxide to measure real browser performance with Web Workers and SharedArrayBuffer.
 
 ## Prerequisites
 
@@ -14,14 +14,17 @@ WASM benchmarks for mpz garbling libraries. Runs in headless Chrome via chromium
 # Build WASM module
 ./build-wasm.sh
 
-# Run all benchmarks
-cargo run --release --bin wasm-bench-runner
+# Build runner
+cargo build --release --bin wasm-bench-runner
 
-# Run specific benchmark
-cargo run --release --bin wasm-bench-runner -- -b garble/semihonest_aes_mt_batched
+# Run all benchmarks
+../../target/release/wasm-bench-runner
+
+# Run specific group
+../../target/release/wasm-bench-runner -g garble --iterations 1 --samples 1
 
 # List available benchmarks
-cargo run --release --bin wasm-bench-runner -- --list
+../../target/release/wasm-bench-runner --list
 ```
 
 ## Available Benchmarks
@@ -35,41 +38,62 @@ Single-threaded benchmarks measuring raw garbling/evaluation speed without proto
 | `garble_core/half_gates_garble` | Half-gates garbling of AES-128 circuit |
 | `garble_core/half_gates_evaluate` | Half-gates evaluation of AES-128 circuit |
 
+### garble (garbler/evaluator with message replay)
+
+Isolated garbler and evaluator benchmarks using recorded messages for replay:
+
+| Benchmark | Description |
+|-----------|-------------|
+| `garble/garbler_100k` | Garbler with 100K AND gates |
+| `garble/garbler_1m` | Garbler with 1M AND gates |
+| `garble/garbler_10m` | Garbler with 10M AND gates |
+| `garble/evaluator_100k` | Evaluator with 100K AND gates |
+| `garble/evaluator_1m` | Evaluator with 1M AND gates |
+| `garble/evaluator_10m` | Evaluator with 10M AND gates |
+
 ### zk_core (QuickSilver ZK core)
 
 Single-threaded benchmarks measuring the QuickSilver ZK core proving/verification performance:
 
 | Benchmark | Description |
 |-----------|-------------|
-| `zk_core/prover_execute` | Prover execute phase only (generate adjustments) |
-| `zk_core/verifier_execute` | Verifier execute phase only (consume adjustments) |
-| `zk_core/full_protocol` | Complete ZK protocol (execute + check phases) |
-| `zk_core/check_only` | SVOLE-based consistency check phase only |
+| `zk_core/prover_execute` | Prover execute phase only |
+| `zk_core/verifier_execute` | Verifier execute phase only |
+| `zk_core/full_protocol` | Complete ZK protocol (execute + check) |
+| `zk_core/check_only` | SVOLE-based consistency check only |
 
 ### zk (full ZK protocol with VM)
 
-End-to-end ZK protocol benchmarks including proof generation, verification, and communication:
+End-to-end ZK protocol benchmarks:
 
 | Benchmark | Description |
 |-----------|-------------|
-| `zk/zk_st_batched` | 256 AES circuits batched, single-threaded context |
-| `zk/zk_mt_batched` | 256 AES circuits batched, multi-threaded context |
+| `zk/zk_st_batched` | Single-threaded context |
+| `zk/zk_mt_batched` | Multi-threaded context |
 
-### garble (full semihonest 2PC protocol)
+### zk_overhead (recording overhead measurement)
 
-End-to-end protocol benchmarks including garbling, evaluation, and communication:
-
-| Benchmark | Description |
-|-----------|-------------|
-| `garble/semihonest_aes` | Single AES circuit, single-threaded context |
-| `garble/semihonest_aes_st_batched` | 256 AES circuits batched, single-threaded context |
-| `garble/semihonest_aes_mt_batched` | 256 AES circuits batched, multi-threaded context |
-
-### test (debugging)
+Compares baseline MT context vs recording MT context:
 
 | Benchmark | Description |
 |-----------|-------------|
-| `test/mt_context_only` | Minimal MT context ping-pong test |
+| `zk_overhead/baseline_100k` | Baseline context, 100K gates |
+| `zk_overhead/baseline_1m` | Baseline context, 1M gates |
+| `zk_overhead/baseline_10m` | Baseline context, 10M gates |
+| `zk_overhead/recording_100k` | Recording context, 100K gates |
+| `zk_overhead/recording_1m` | Recording context, 1M gates |
+| `zk_overhead/recording_10m` | Recording context, 10M gates |
+
+### zk_prover / zk_verifier (isolated with message replay)
+
+Isolated prover/verifier benchmarks with various batch sizes (200k-1000k) in both ST and MT variants.
+
+### ferret (Ferret OT)
+
+| Benchmark | Description |
+|-----------|-------------|
+| `ferret/sender_st` | Single-threaded Ferret sender |
+| `ferret/sender_mt` | Multi-threaded Ferret sender |
 
 ## CLI Options
 
@@ -87,90 +111,30 @@ Options:
   --headed              Run with visible browser window (for debugging)
   --help, -h            Show help
 
-Groups: garble_core, zk_core, zk, garble, test
+Groups: garble_core, zk_core, zk, zk_overhead, zk_prover, zk_verifier, garble, ferret, test
 ```
 
 ## Examples
 
-### Basic Usage
-
 ```bash
-# Run all benchmarks with defaults (100 iterations, 10 samples)
-cargo run --release --bin wasm-bench-runner
-
 # Quick test run
-cargo run --release --bin wasm-bench-runner -- --iterations 10 --samples 3
+../../target/release/wasm-bench-runner -g garble --iterations 1 --samples 1
 
-# Run with visible browser for debugging
-cargo run --release --bin wasm-bench-runner -- --headed -b garble_core/half_gates_garble
-```
+# Run garble benchmarks with more accuracy
+../../target/release/wasm-bench-runner -g garble --iterations 3 --samples 5
 
-### Comparing ST vs MT
+# Compare recording overhead
+../../target/release/wasm-bench-runner -b zk_overhead/baseline_1m -b zk_overhead/recording_1m --iterations 3 --samples 5
 
-```bash
-# Compare single-threaded vs multi-threaded batched benchmarks
-cargo run --release --bin wasm-bench-runner -- \
-  -b garble/semihonest_aes_st_batched \
-  -b garble/semihonest_aes_mt_batched
-```
-
-### Thread Scaling Analysis
-
-```bash
-# Sweep thread counts to analyze scaling
-cargo run --release --bin wasm-bench-runner -- \
-  --sweep \
-  -b garble/semihonest_aes_mt_batched
-
-# Run MT benchmark with specific thread count
-cargo run --release --bin wasm-bench-runner -- \
-  -c 4 \
-  -b garble/semihonest_aes_mt_batched
-```
-
-### Run by Group
-
-```bash
-# Run all garble_core benchmarks
-cargo run --release --bin wasm-bench-runner -- -g garble_core
-
-# Run all zk_core benchmarks
-cargo run --release --bin wasm-bench-runner -- -g zk_core
-
-# Run all garble benchmarks (includes MT)
-cargo run --release --bin wasm-bench-runner -- -g garble
-
-# Run multiple groups
-cargo run --release --bin wasm-bench-runner -- -g garble_core -g zk_core
-```
-
-## Output Format
-
-Results are displayed as a table with:
-
-- **Median (ms)**: Median time for all iterations in a sample
-- **Per-iter (us)**: Time per iteration (circuit) in microseconds
-- **AND gates/s**: Throughput in AND gates processed per second
-
-Example output:
-```
-=== garble_core ===
-Name                                     Median (ms)   Per-iter (us)   AND gates/s
-----------------------------------------------------------------------------------
-garble_core/half_gates_garble                  45.23          452.30       14.52M
+# Thread scaling analysis
+../../target/release/wasm-bench-runner --sweep -g garble
 ```
 
 ## Architecture Notes
 
-### Multi-threaded Context
+### Web Worker Requirement
 
-The MT benchmarks use `web_spawn` for WASM threading via Web Workers. The `--concurrency` parameter controls the maximum number of worker threads used for parallel garbling.
-
-**Minimum concurrency is 2** because the garbler internally uses `ctx.try_join()` which forks into 2 threads (one for OT setup, one for circuit preprocessing).
-
-### Batched Benchmarks
-
-The batched benchmarks process 256 AES circuits in one batch to amortize context setup overhead and better demonstrate parallelism benefits. This is more representative of real-world usage where multiple circuits are processed together.
+MT benchmarks that use rayon internally (zk, zk_overhead) must run on Web Workers because `Atomics.wait` is forbidden on the main browser thread. These benchmarks use `web_spawn::spawn` to run on workers.
 
 ### SharedArrayBuffer Requirements
 
@@ -179,29 +143,3 @@ MT benchmarks require SharedArrayBuffer which needs specific HTTP headers:
 - `Cross-Origin-Embedder-Policy: require-corp`
 
 The built-in HTTP server sets these headers automatically.
-
-## Development
-
-### Manual Browser Testing
-
-Start the server and open in browser:
-```bash
-# Start dev server (requires a simple HTTP server with COOP/COEP headers)
-cd crates/wasm-bench
-python3 -m http.server 8080  # Note: won't work for MT without proper headers
-
-# Or use the runner in headed mode
-cargo run --release --bin wasm-bench-runner -- --headed
-```
-
-### Rebuilding WASM
-
-After modifying Rust code:
-```bash
-./build-wasm.sh
-```
-
-The script builds with:
-- `--target web` for ES module output
-- Atomics and bulk-memory features enabled
-- Release optimizations
