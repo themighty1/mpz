@@ -133,18 +133,19 @@ pub async fn garble_core_half_gates_evaluate_parallel(n: u32, concurrency: u32) 
     let result_clone = result.clone();
 
     let _handle = web_spawn::spawn(move || {
-        // Initialize rayon with spawn_handler that uses web_spawn
-        // (spawner already running on main thread from init_thread_pool)
-        rayon::ThreadPoolBuilder::new()
+        // Create a local thread pool (don't use build_global which fails if pool exists)
+        let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(concurrency as usize)
             .spawn_handler(|thread| {
                 let _ = web_spawn::spawn(move || thread.run());
                 Ok(())
             })
-            .build_global()
-            .ok();
+            .build()
+            .expect("failed to build rayon pool");
 
-        let bench_result = {
+        let bench_result = pool.install(|| {
+            use rayon::prelude::*;
+
             let global = js_sys::global();
             let performance: web_sys::Performance =
                 js_sys::Reflect::get(&global, &"performance".into())
@@ -180,15 +181,22 @@ pub async fn garble_core_half_gates_evaluate_parallel(n: u32, concurrency: u32) 
                 }
 
                 for _ in 0..n {
-                    // Build input for evaluate_garbled_circuits
+                    // Build input for parallel evaluation
                     let circs: Vec<_> = garbled_circuits
                         .iter()
                         .map(|gc| (circuit.clone(), eval_inputs.clone(), gc.clone()))
                         .collect();
 
-                    // Timed: only the parallel evaluation
+                    // Timed: parallel evaluation using par_iter directly in local pool
                     let start = performance.now();
-                    let _outputs = evaluate_garbled_circuits(circs).unwrap();
+                    let _outputs: Vec<_> = circs.into_par_iter().map(|(circ, inputs, garbled_circuit)| {
+                        let mut ev = half_gates::Evaluator::with_capacity(circ.feed_count());
+                        let mut consumer = ev.evaluate(&circ, &inputs).unwrap();
+                        for gate in garbled_circuit.gates {
+                            consumer.next(gate);
+                        }
+                        consumer.finish().unwrap()
+                    }).collect();
                     total_eval_time += performance.now() - start;
                 }
 
@@ -199,7 +207,7 @@ pub async fn garble_core_half_gates_evaluate_parallel(n: u32, concurrency: u32) 
                 elapsed_ms: total_eval_time,
                 and_gates: total_gates,
             }
-        };
+        });
         *result_clone.lock().unwrap() = Some(bench_result);
     });
 

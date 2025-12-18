@@ -52,6 +52,7 @@ const ALL_BENCHMARKS: &[&str] = &[
     "gf128_compare/gf128_zig_native",
     "trivial/single",
     "trivial/parallel",
+    "rayon_debug/test",
 ];
 
 /// Get all benchmarks in a group

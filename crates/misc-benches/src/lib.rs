@@ -7,11 +7,13 @@ mod aes_compare;
 mod gf128_compare;
 mod gf128_polyval;
 mod gf128_zig;
+mod rayon_debug;
 
 pub use aes_compare::*;
 pub use gf128_compare::*;
 pub use gf128_polyval::*;
 pub use gf128_zig::*;
+pub use rayon_debug::*;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;

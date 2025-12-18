@@ -23,13 +23,16 @@ window.__consoleLogs.push('[wrapper] Console wrapper installed');
 const statusEl = document.getElementById('status');
 const outputEl = document.getElementById('output');
 const runAllBtn = document.getElementById('runAll');
+const runRayonDebugBtn = document.getElementById('runRayonDebug');
 const iterationsInput = document.getElementById('iterations');
 const samplesInput = document.getElementById('samples');
+const concurrencyInput = document.getElementById('concurrency');
 
 function getConfig() {
     return {
         iterations: parseInt(iterationsInput.value) || 100,
         samples: parseInt(samplesInput.value) || 10,
+        concurrency: parseInt(concurrencyInput.value) || 4,
     };
 }
 
@@ -40,6 +43,7 @@ function setStatus(msg, isError = false) {
 
 function disableButtons(disabled) {
     runAllBtn.disabled = disabled;
+    runRayonDebugBtn.disabled = disabled;
 }
 
 async function runBenchmarks(type, filter = null, concurrency = 8) {
@@ -141,6 +145,33 @@ window.onunhandledrejection = (event) => {
 };
 
 runAllBtn.addEventListener('click', () => runBenchmarks('all'));
+
+runRayonDebugBtn.addEventListener('click', async () => {
+    const config = getConfig();
+    disableButtons(true);
+    setStatus(`Running rayon debug test with ${config.concurrency} threads...`);
+    outputEl.textContent = '';
+
+    try {
+        // Initialize thread pool first
+        console.log(`Initializing thread pool with ${config.concurrency} threads...`);
+        await wasm.init_thread_pool(config.concurrency);
+        console.log('Thread pool initialized');
+
+        // Run the debug test
+        console.log('Running rayon_debug_test...');
+        const result = await wasm.rayon_debug_test(config.concurrency);
+        console.log('Result:', result);
+
+        outputEl.textContent = `Rayon Debug Test Result:\n${result}`;
+        setStatus('Rayon debug test complete!');
+    } catch (e) {
+        setStatus(`Error: ${e.message}`, true);
+        outputEl.textContent = e.stack || e.toString();
+    } finally {
+        disableButtons(false);
+    }
+});
 
 // Expose for chromiumoxide
 window.runBenchmark = async (config) => {

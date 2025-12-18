@@ -136,6 +136,19 @@ function zigGf128Bench(n) {
     return { elapsed_ms, and_gates: n };
 }
 
+// Rayon debug test - runs rayon parallel work and returns debug info
+async function rayonDebugBench(n, concurrency) {
+    const start = performance.now();
+    const result = await wasm.rayon_debug_test(concurrency);
+    const elapsed_ms = performance.now() - start;
+    console.log("[rayon_debug] Result:", result);
+    // Parse result to extract threads_used
+    const match = result.match(/threads_used=(\d+)/);
+    const threads_used = match ? parseInt(match[1]) : 0;
+    // Return n * threads_used as "and_gates" to show parallelism
+    return { elapsed_ms, and_gates: n * threads_used };
+}
+
 // Progress callback (set by runner)
 let progressCallback = null;
 
@@ -230,6 +243,8 @@ function getAllBenchmarkDefs(concurrency = 8) {
         // Private memory benchmarks (no SharedArrayBuffer overhead)
         { category: "private", name: "private/gf128_single", fn: (n) => privateGf128Bench(n), async: false, returnsBenchResult: true },
         { category: "private", name: "private/gf128_parallel", fn: (n) => privateGf128BenchParallel(n), async: true, returnsBenchResult: true },
+        // Rayon debug test - tests if rayon parallelism works
+        { category: "rayon_debug", name: "rayon_debug/test", fn: (n) => rayonDebugBench(n, concurrency), async: true, returnsBenchResult: true, mt: true },
     ];
 }
 
