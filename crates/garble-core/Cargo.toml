@@ -61,9 +61,5 @@ name = "garble"
 harness = false
 
 [[bench]]
-name = "iteration"
-harness = false
-
-[[bench]]
-name = "remapped"
+name = "evaluate"
 harness = false
