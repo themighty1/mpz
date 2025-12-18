@@ -113,7 +113,7 @@ pub fn garble_core_half_gates_evaluate_batched(n: u32) -> BenchResult {
     })
 }
 
-// Circuit count thresholds for parallel evaluation (matches approximate gate counts)
+// Circuit count thresholds for parallel evaluation
 #[cfg(target_arch = "wasm32")]
 const PARALLEL_THRESHOLDS: &[usize] = &[100, 200, 400];
 
@@ -133,16 +133,16 @@ pub async fn garble_core_half_gates_evaluate_parallel(n: u32, concurrency: u32) 
     let result_clone = result.clone();
 
     let _handle = web_spawn::spawn(move || {
-        // Initialize rayon thread pool (spawner already set up on main thread)
+        // Initialize rayon with spawn_handler that uses web_spawn
+        // (spawner already running on main thread from init_thread_pool)
         rayon::ThreadPoolBuilder::new()
             .num_threads(concurrency as usize)
+            .spawn_handler(|thread| {
+                let _ = web_spawn::spawn(move || thread.run());
+                Ok(())
+            })
             .build_global()
             .ok();
-
-        // Yield to browser to let rayon workers start
-        pollster::block_on(async {
-            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&wasm_bindgen::JsValue::NULL)).await.ok();
-        });
 
         let bench_result = {
             let global = js_sys::global();
