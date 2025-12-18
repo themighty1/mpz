@@ -61,3 +61,11 @@ harness = false
 name = "ideal_cmp"
 harness = false
 required-features = ["ideal"]
+
+[[bench]]
+name = "ferret_sender"
+harness = false
+
+[[bench]]
+name = "ferret_receiver"
+harness = false

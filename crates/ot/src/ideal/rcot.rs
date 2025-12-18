@@ -6,12 +6,12 @@
 
 use async_trait::async_trait;
 use mpz_common::{Context, Flush, future::{MaybeDone, Sender, new_output}};
-use mpz_core::{Block, prg::Prg};
+use mpz_core::Block;
 use mpz_ot_core::{
     TransferId,
     rcot::{RCOTReceiver, RCOTReceiverOutput, RCOTSender, RCOTSenderOutput},
 };
-use rand::Rng;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use serio::{SinkExt, stream::IoStreamExt};
 
@@ -195,8 +195,8 @@ impl Flush for IdealRCOTSender {
 ///
 /// Regenerates keys locally from the received seed via counter addition.
 pub struct IdealRCOTReceiver {
-    /// PRG for generating choices.
-    prg: Prg,
+    /// RNG for generating choices (seeded for determinism).
+    rng: StdRng,
     /// Pending allocation count.
     pending: usize,
     /// Received choice bits.
@@ -210,10 +210,16 @@ pub struct IdealRCOTReceiver {
 }
 
 impl IdealRCOTReceiver {
-    /// Creates a new receiver.
+    /// Creates a new receiver with a fixed seed for deterministic behavior.
     pub fn new() -> Self {
+        // Use a constant seed for deterministic benchmarking
+        Self::from_seed(0)
+    }
+
+    /// Creates a new receiver with the given seed.
+    pub fn from_seed(seed: u64) -> Self {
         Self {
-            prg: Prg::new(),
+            rng: StdRng::seed_from_u64(seed),
             pending: 0,
             choices: Vec::new(),
             msgs: Vec::new(),
@@ -310,8 +316,8 @@ impl Flush for IdealRCOTReceiver {
             // Regenerate keys via counter addition (same as sender)
             let keys = generate_keys(flush_msg.seed, flush_msg.offset, flush_msg.count);
 
-            // Generate random choices via PRG
-            let choices: Vec<bool> = (0..flush_msg.count).map(|_| self.prg.random()).collect();
+            // Generate random choices via seeded RNG
+            let choices: Vec<bool> = (0..flush_msg.count).map(|_| self.rng.random()).collect();
 
             // Compute receiver's messages: msg_i = key_i XOR (choice_i * delta)
             let msgs: Vec<Block> = keys

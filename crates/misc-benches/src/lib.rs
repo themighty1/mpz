@@ -1,34 +1,35 @@
-//! WASM benchmarks for mpz garbling libraries.
+//! Miscellaneous WASM benchmarks.
 //!
-//! This crate exposes garbling benchmarks as WASM-callable functions
-//! for browser performance testing.
-//!
-//! Modules:
-//! - `garble_core`: Raw garbling/evaluation benchmarks (half-gates, three-halves)
-//! - `garble`: Full semihonest 2PC protocol benchmarks
-//! - `zk_core`: QuickSilver ZK core benchmarks (prover/verifier primitives)
-//! - `zk`: Full ZK protocol benchmarks with VM
+//! This crate is for quick iteration on new benchmarks without the
+//! compilation overhead of wasm-bench.
 
-mod garble_core;
-mod garble;
-mod zk_core;
-mod zk;
-mod zk_prover;
-mod zk_verifier;
-mod ferret;
+mod aes_compare;
+mod gf128_compare;
+mod gf128_polyval;
+mod gf128_zig;
 
-// Re-export all wasm_bindgen functions
-pub use garble_core::*;
-pub use garble::*;
-pub use zk_core::*;
-pub use zk::*;
-pub use zk_prover::*;
-pub use zk_verifier::*;
-pub use ferret::*;
+pub use aes_compare::*;
+pub use gf128_compare::*;
+pub use gf128_polyval::*;
+pub use gf128_zig::*;
 
-// Initialize web_spawn and rayon for MT benchmarks
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
+
+/// Benchmark result returned to JavaScript.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub struct BenchResult {
+    pub elapsed_ms: f64,
+    pub and_gates: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BenchResult {
+    pub fn new(elapsed_ms: f64, and_gates: u64) -> Self {
+        Self { elapsed_ms, and_gates }
+    }
+}
 
 /// Initialize the web_spawn spawner and rayon thread pool for MT benchmarks.
 /// Must be called before running any MT benchmarks.
@@ -104,46 +105,4 @@ pub async fn init_thread_pool(thread_count: usize) -> Result<(), JsValue> {
             }
         }
     }
-}
-
-/// Test if MT context works at all - minimal ping-pong test.
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-pub async fn test_mt_context_only() -> Result<u32, JsValue> {
-    use mpz_common::context::test_mt_context_with_spawn;
-    use serio::{SinkExt, stream::IoStreamExt};
-
-    let (mut mt1, mut mt2) = test_mt_context_with_spawn(8, |f| {
-        let _ = web_spawn::spawn(f);
-        Ok(())
-    });
-
-    web_sys::console::log_1(&"Created MT contexts".into());
-
-    let mut ctx1 = mt1.new_context().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let mut ctx2 = mt2.new_context().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    web_sys::console::log_1(&"Got contexts from MT".into());
-
-    // Simple ping-pong: ctx1 sends, ctx2 receives
-    let (res1, res2) = futures::join!(
-        async {
-            web_sys::console::log_1(&"ctx1: sending...".into());
-            ctx1.io_mut().send(42u32).await.map_err(|e| e.to_string())?;
-            web_sys::console::log_1(&"ctx1: send done".into());
-            Ok::<_, String>(42u32)
-        },
-        async {
-            web_sys::console::log_1(&"ctx2: receiving...".into());
-            let val: u32 = ctx2.io_mut().expect_next().await.map_err(|e| e.to_string())?;
-            web_sys::console::log_1(&"ctx2: receive done".into());
-            Ok::<_, String>(val)
-        }
-    );
-
-    let v1 = res1.map_err(|e| JsValue::from_str(&e))?;
-    let v2 = res2.map_err(|e| JsValue::from_str(&e))?;
-
-    web_sys::console::log_1(&format!("Test complete: {} + {} = {}", v1, v2, v1 + v2).into());
-    Ok(v1 + v2)
 }

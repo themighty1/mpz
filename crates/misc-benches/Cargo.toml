@@ -1,5 +1,5 @@
 [package]
-name = "mpz-wasm-bench"
+name = "mpz-misc-benches"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,32 +7,23 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mpz-garble-core = { workspace = true }
-mpz-garble = { workspace = true }
-mpz-zk-core = { workspace = true, features = ["rayon"] }
-mpz-zk = { workspace = true, features = ["rayon"] }
-pollster = { workspace = true }
-mpz-circuits = { workspace = true, features = ["aes"] }
-mpz-memory-core = { workspace = true }
-mpz-core = { workspace = true }
-mpz-common = { workspace = true, features = ["test-utils"] }
-mpz-ot = { workspace = true, features = ["ideal", "rayon"] }
-mpz-ot-core = { workspace = true, features = ["rayon"] }
-mpz-vm-core = { workspace = true }
-blake3 = { workspace = true }
+rand = { workspace = true }
+futures = { workspace = true }
+rayon = { workspace = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 getrandom = { version = "0.3", features = ["wasm_js"] }
-rand = { workspace = true }
-futures = { workspace = true }
 web-spawn = { version = "0.2", features = ["no-bundler"] }
-rayon = { workspace = true }
 web-sys = { version = "0.3", features = ["console", "Window", "Performance"] }
-serio = { workspace = true }
 aes-wasm = "0.1"
 aes = { workspace = true }
+mpz-fields = { workspace = true }
+ghash_rc = { workspace = true }
+# getrandom 0.2 needed by ghash dependencies, requires "js" for wasm
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
@@ -49,6 +40,6 @@ http-body-util = "0.1"
 mime_guess = "2.0"
 
 [[bin]]
-name = "wasm-bench-runner"
+name = "misc-bench-runner"
 path = "src/bin/runner.rs"
 required-features = []

@@ -212,6 +212,9 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "garble", name: "garble/garble_mt", fn: (n) => wasm.garble_mt(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         // garble_isolated benchmarks (isolated garbler with message replay)
         { category: "garble_isolated", name: "garble_isolated/garbler_mt", fn: (n) => wasm.garble_isolated_mt(n, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        // ferret benchmarks (isolated Ferret OT sender with message replay)
+        { category: "ferret", name: "ferret/sender_st", fn: (n) => wasm.ferret_sender_st(n), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "ferret", name: "ferret/sender_mt", fn: (n) => wasm.ferret_sender_mt(n, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         // test/debug benchmarks
         { category: "test", name: "test/mt_context_only", fn: async (n) => { for (let i = 0; i < n; i++) await wasm.test_mt_context_only(); return n; }, async: true, mt: true },
         { category: "test", name: "test/recording_layer", fn: async (n) => { for (let i = 0; i < n; i++) await wasm.zk_prover_test_recording(); return n; }, async: true },

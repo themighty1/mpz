@@ -5,7 +5,7 @@
 //!
 //! Usage:
 //!   ./build-wasm.sh
-//!   cargo run --release --bin wasm-bench-runner -- [OPTIONS]
+//!   cargo run --release --bin misc-bench-runner -- [OPTIONS]
 //!
 //! Options:
 //!   --iterations <N>   Number of iterations per benchmark (default: 100)
@@ -31,49 +31,27 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 
 /// All available benchmark groups
-const ALL_GROUPS: &[&str] = &["garble_core", "zk_core", "zk", "zk_prover", "zk_verifier", "garble", "garble_isolated", "ferret", "test"];
+const ALL_GROUPS: &[&str] = &["aes_compare", "gf128_compare"];
 
 /// All available benchmarks
 const ALL_BENCHMARKS: &[&str] = &[
-    "garble_core/half_gates_garble",
-    "garble_core/three_halves_garble",
-    "garble_core/half_gates_evaluate",
-    "garble_core/three_halves_evaluate",
-    "zk_core/prover_execute",
-    "zk_core/verifier_execute",
-    "zk_core/full_protocol",
-    "zk_core/check_only",
-    "zk/zk_st_batched",
-    "zk/zk_mt_batched",
-    "zk_prover/batch_200k",
-    "zk_prover/batch_400k",
-    "zk_prover/batch_600k",
-    "zk_prover/batch_800k",
-    "zk_prover/batch_1000k",
-    "zk_prover/mt_batch_200k",
-    "zk_prover/mt_batch_400k",
-    "zk_prover/mt_batch_600k",
-    "zk_prover/mt_batch_800k",
-    "zk_prover/mt_batch_1000k",
-    "zk_prover/replay_throughput",
-    "zk_prover/channel_throughput",
-    "zk_verifier/batch_200k",
-    "zk_verifier/batch_400k",
-    "zk_verifier/batch_600k",
-    "zk_verifier/batch_800k",
-    "zk_verifier/batch_1000k",
-    "zk_verifier/mt_batch_200k",
-    "zk_verifier/mt_batch_400k",
-    "zk_verifier/mt_batch_600k",
-    "zk_verifier/mt_batch_800k",
-    "zk_verifier/mt_batch_1000k",
-    "garble/garble_st",
-    "garble/garble_mt",
-    "garble_isolated/garbler_mt",
-    "ferret/sender_st",
-    "ferret/sender_mt",
-    "test/mt_context_only",
-    "test/recording_layer",
+    "aes_compare/aes_crate",
+    "aes_compare/aes_crate_alloc",
+    "aes_compare/aes_crate_batch",
+    "aes_compare/aes_wasm_ctr",
+    "aes_compare/aes_crate_parallel",
+    "gf128_compare/gf128_mpz",
+    "gf128_compare/gf128_ghash",
+    "gf128_compare/gf128_polyval",
+    "gf128_compare/gf128_polyval_no_red",
+    "gf128_compare/gf128_polyval_parallel",
+    "gf128_compare/gf128_polyval_no_red_parallel",
+    "gf128_compare/gf128_aes_wasm_gcm",
+    "gf128_compare/gf128_aes_wasm_ctr",
+    "gf128_compare/gf128_zig_rust",
+    "gf128_compare/gf128_zig_native",
+    "trivial/single",
+    "trivial/parallel",
 ];
 
 /// Get all benchmarks in a group
@@ -217,7 +195,7 @@ fn print_results(results: &BenchResults) {
         println!("\n=== {} ===", name);
         println!(
             "{:<40} {:>12} {:>14} {:>12}",
-            "Name", "Median (ms)", "Per-iter (us)", "AND gates/s"
+            "Name", "Median (ms)", "Per-iter (us)", "Blocks/s"
         );
         println!("{}", "-".repeat(82));
         for b in benchmarks {
@@ -347,43 +325,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for name in ALL_BENCHMARKS {
                     println!("  {}", name);
                 }
-                println!();
-                println!("Notes:");
-                println!("  zk_isolated/prover_batch_Xk: 'batch' is the number of AND gates processed");
-                println!("    before a consistency check is triggered. Smaller batch = more frequent");
-                println!("    checks = lower latency but higher overhead.");
                 return Ok(());
             }
             "--group" | "-g" => {
                 i += 1;
                 if let Some(group) = args.get(i) {
-                    if ALL_GROUPS.contains(&group.as_str()) {
-                        for bench in benchmarks_in_group(group) {
-                            selected_benchmarks.push(bench.to_string());
-                        }
+                    // Pass group as prefix filter to JS - let JS handle unknown groups
+                    let prefix = format!("{}/", group);
+                    // Add any matching known benchmarks, or just the prefix for JS to handle
+                    let matching: Vec<_> = ALL_BENCHMARKS.iter()
+                        .filter(|b| b.starts_with(&prefix))
+                        .map(|b| b.to_string())
+                        .collect();
+                    if matching.is_empty() {
+                        // Unknown group - pass as-is, JS will filter
+                        selected_benchmarks.push(format!("{}/*", group));
                     } else {
-                        eprintln!("Unknown group: {}", group);
-                        eprintln!("Available groups: {}", ALL_GROUPS.join(", "));
-                        return Ok(());
+                        selected_benchmarks.extend(matching);
                     }
                 }
             }
             "--bench" | "-b" => {
                 i += 1;
                 if let Some(name) = args.get(i) {
-                    if ALL_BENCHMARKS.contains(&name.as_str()) {
-                        selected_benchmarks.push(name.clone());
-                    } else {
-                        eprintln!("Unknown benchmark: {}", name);
-                        eprintln!("Use --list to see available benchmarks.");
-                        return Ok(());
-                    }
+                    // Pass any name to JS - let JS handle unknown benchmarks
+                    selected_benchmarks.push(name.clone());
                 }
             }
             "--help" | "-h" => {
-                println!("WASM Benchmark Runner");
+                println!("Misc Benchmark Runner");
                 println!();
-                println!("Usage: wasm-bench-runner [OPTIONS]");
+                println!("Usage: misc-bench-runner [OPTIONS]");
                 println!();
                 println!("Options:");
                 println!("  --iterations <N>     Number of iterations per benchmark (default: 100)");
@@ -399,11 +371,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Groups: {}", ALL_GROUPS.join(", "));
                 println!();
                 println!("Examples:");
-                println!("  wasm-bench-runner                    # Run all benchmarks");
-                println!("  wasm-bench-runner -g garble_core     # Run all garble_core benchmarks");
-                println!("  wasm-bench-runner -g zk_core         # Run all zk_core benchmarks");
-                println!("  wasm-bench-runner -g garble --sweep  # Sweep thread counts for garble");
-                println!("  wasm-bench-runner -b zk_core/prover_execute  # Run one benchmark");
+                println!("  misc-bench-runner                    # Run all benchmarks");
+                println!("  misc-bench-runner -g aes_compare     # Run all aes_compare benchmarks");
+                println!("  misc-bench-runner -b aes_compare/aes_crate  # Run one benchmark");
                 println!();
                 println!("Note: Run ./build-wasm.sh first to build the WASM module.");
                 return Ok(());
@@ -421,11 +391,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Validate concurrency for MT benchmarks (need at least 2 threads)
-    let has_mt_benchmarks = benchmarks.iter().any(|b| b.contains("_mt"));
+    let has_mt_benchmarks = benchmarks.iter().any(|b| b.contains("parallel"));
     if has_mt_benchmarks {
         if let Some(c) = concurrency {
             if c < 2 {
-                return Err("MT benchmarks require at least 2 threads (garbler uses try_join). Use -c 2 or higher.".into());
+                return Err("MT benchmarks require at least 2 threads. Use -c 2 or higher.".into());
             }
         }
     }
@@ -471,7 +441,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (browser, mut handler) = Browser::launch(config).await?;
 
     // Spawn handler (filter out known false-positive error from chromiumoxide)
-    // See: https://github.com/mattsse/chromiumoxide/issues/167
     let handle = tokio::spawn(async move {
         while let Some(event) = handler.next().await {
             if let Err(e) = event {
@@ -492,7 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Only run MT benchmarks in sweep mode
         let mt_benchmarks: Vec<String> = benchmarks
             .iter()
-            .filter(|b| b.contains("_mt"))
+            .filter(|b| b.contains("parallel"))
             .cloned()
             .collect();
 
@@ -500,7 +469,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("No MT benchmarks selected for sweep. Use -b to select MT benchmarks.".into());
         }
 
-        // MT context needs at least 2 threads (garbler uses try_join which forks into 2)
         let thread_counts: Vec<u32> = vec![2, 3, 4, 6, 8, 12, 16]
             .into_iter()
             .filter(|&c| c <= available_cpus)
@@ -534,7 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Print summary table
         println!("\n\n=== CONCURRENCY SWEEP SUMMARY ===");
-        println!("{:<10} {:>15} {:>15}", "Threads", "Median (ms)", "AND gates/s");
+        println!("{:<10} {:>15} {:>15}", "Threads", "Median (ms)", "Blocks/s");
         println!("{}", "-".repeat(42));
         for (threads, results) in &sweep_results {
             for benchmarks in results.values() {

@@ -13,7 +13,7 @@
 
 ## Benchmark Execution
 
-- **Do not run benchmarks yourself** - always give the user the command to run
+- **NEVER run benchmarks or builds yourself** - always give the user the command to run
 - After making changes, provide the appropriate command with notes on what needs rebuilding
 
 ## Rebuild Requirements
@@ -38,7 +38,7 @@ When providing benchmark commands, specify what needs rebuilding:
 
 ## Command Examples
 
-When showing benchmark commands to the user, always use `--iterations 1 --samples 1` for quick testing:
+**ALWAYS use `--iterations 1 --samples 1` when giving benchmark commands:**
 
 ```bash
 # Run specific group
