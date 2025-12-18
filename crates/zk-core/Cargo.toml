@@ -36,7 +36,9 @@ rstest = { workspace = true }
 [[bench]]
 name = "prover"
 harness = false
+required-features = ["rayon"]
 
 [[bench]]
 name = "verifier"
 harness = false
+required-features = ["rayon"]

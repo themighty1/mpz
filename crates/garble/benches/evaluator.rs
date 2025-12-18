@@ -315,9 +315,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(actual_gates));
 
-        println!("Recording for evaluator ({})...", name);
         let recorded = record_for_evaluator(circuit.clone(), circuit_count, 0);
-        println!("Recorded {} bytes", recorded.len());
 
         let circuit_clone = circuit.clone();
         group.bench_function(BenchmarkId::new("st", name), |b| {
@@ -343,14 +341,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         group_mt.throughput(Throughput::Elements(actual_gates));
 
-        println!("Recording for MT evaluator ({})...", name);
         let recorded_mt = record_for_evaluator_mt(circuit.clone(), circuit_count, 0);
-        let total_bytes: usize = recorded_mt.channels.values().map(|v| v.len()).sum();
-        println!(
-            "Recorded {} channels, {} total bytes",
-            recorded_mt.channels.len(),
-            total_bytes
-        );
 
         let circuit_clone = circuit.clone();
         group_mt.bench_function(BenchmarkId::new("mt", name), |b| {

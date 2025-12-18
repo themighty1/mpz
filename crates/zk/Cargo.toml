@@ -49,11 +49,6 @@ harness = false
 required-features = ["rayon"]
 
 [[bench]]
-name = "batch_size"
-harness = false
-required-features = ["rayon"]
-
-[[bench]]
 name = "prover"
 harness = false
 required-features = ["rayon"]

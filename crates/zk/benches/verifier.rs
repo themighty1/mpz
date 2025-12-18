@@ -322,9 +322,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(actual_gates));
 
-        println!("Recording for ST verifier ({})...", name);
         let (recorded, ot_seed, delta) = record_for_verifier(circuit_count, 0);
-        println!("Recorded {} bytes", recorded.len());
 
         group.bench_function(BenchmarkId::new("st", name), |b| {
             b.iter(|| {
@@ -348,10 +346,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         group_mt.throughput(Throughput::Elements(actual_gates));
 
-        println!("Recording for MT verifier ({})...", name);
         let (recorded_mt, ot_seed, delta) = record_for_verifier_mt(circuit_count, 0);
-        let total_bytes: usize = recorded_mt.channels.values().map(|v| v.len()).sum();
-        println!("Recorded {} channels, {} total bytes", recorded_mt.channels.len(), total_bytes);
 
         group_mt.bench_function(BenchmarkId::new("mt", name), |b| {
             b.iter(|| {
