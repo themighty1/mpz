@@ -96,7 +96,6 @@ async function runBenchWithResult(name, fn, iterations, samples = 10, warmupSamp
     let totalAndGates = 0;
     for (let i = 0; i < samples; i++) {
         const result = await fn(iterations);
-        console.log("BenchResult:", result, "elapsed_ms:", result.elapsed_ms, "and_gates:", result.and_gates);
         times.push(result.elapsed_ms);
         totalAndGates = Number(result.and_gates); // Same for all samples, convert BigInt if needed
 
@@ -330,9 +329,7 @@ export function formatResults(results) {
 // Test MT context in isolation
 export async function testMtContext() {
     if (!wasm) throw new Error("WASM not initialized. Call init() first.");
-    console.log("Starting MT context test...");
     const result = await wasm.test_mt_context_only();
-    console.log("MT context test result:", result);
     return result;
 }
 
