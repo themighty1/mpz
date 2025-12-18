@@ -31,7 +31,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 
 /// All available benchmark groups
-const ALL_GROUPS: &[&str] = &["garble_core", "zk_core", "zk", "zk_prover", "zk_verifier", "garble", "ferret", "test"];
+const ALL_GROUPS: &[&str] = &["garble_core", "zk_core", "zk", "zk_overhead", "zk_prover", "zk_verifier", "garble", "ferret", "test"];
 
 /// All available benchmarks
 const ALL_BENCHMARKS: &[&str] = &[
@@ -43,6 +43,12 @@ const ALL_BENCHMARKS: &[&str] = &[
     "zk_core/check_only",
     "zk/zk_st_batched",
     "zk/zk_mt_batched",
+    "zk_overhead/baseline_100k",
+    "zk_overhead/baseline_1m",
+    "zk_overhead/baseline_10m",
+    "zk_overhead/recording_100k",
+    "zk_overhead/recording_1m",
+    "zk_overhead/recording_10m",
     "zk_prover/batch_200k",
     "zk_prover/batch_400k",
     "zk_prover/batch_600k",

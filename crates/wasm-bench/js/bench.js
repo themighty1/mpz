@@ -178,6 +178,13 @@ function getAllBenchmarkDefs(concurrency = 8) {
         // zk benchmarks (full ZK protocol with VM)
         { category: "zk", name: "zk/zk_st_batched", fn: (n) => wasm.zk_st_batched(n), async: true, returnsBenchResult: true },
         { category: "zk", name: "zk/zk_mt_batched", fn: (n) => wasm.zk_mt_batched(n, concurrency), async: true, returnsBenchResult: true, mt: true },
+        // zk_overhead benchmarks (baseline vs recording context)
+        { category: "zk_overhead", name: "zk_overhead/baseline_100k", fn: (n) => wasm.zk_overhead_baseline(n, 100000, concurrency), async: true, returnsBenchResult: true, mt: true },
+        { category: "zk_overhead", name: "zk_overhead/baseline_1m", fn: (n) => wasm.zk_overhead_baseline(n, 1000000, concurrency), async: true, returnsBenchResult: true, mt: true },
+        { category: "zk_overhead", name: "zk_overhead/baseline_10m", fn: (n) => wasm.zk_overhead_baseline(n, 10000000, concurrency), async: true, returnsBenchResult: true, mt: true },
+        { category: "zk_overhead", name: "zk_overhead/recording_100k", fn: (n) => wasm.zk_overhead_recording(n, 100000, concurrency), async: true, returnsBenchResult: true, mt: true },
+        { category: "zk_overhead", name: "zk_overhead/recording_1m", fn: (n) => wasm.zk_overhead_recording(n, 1000000, concurrency), async: true, returnsBenchResult: true, mt: true },
+        { category: "zk_overhead", name: "zk_overhead/recording_10m", fn: (n) => wasm.zk_overhead_recording(n, 10000000, concurrency), async: true, returnsBenchResult: true, mt: true },
         // zk_prover benchmarks (isolated prover with message replay)
         // warmup=1 since recording phase is expensive
         { category: "zk_prover", name: "zk_prover/batch_200k", fn: (n) => wasm.zk_prover(n, 200000), async: true, returnsBenchResult: true, warmup: 1 },
