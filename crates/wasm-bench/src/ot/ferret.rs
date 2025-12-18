@@ -26,7 +26,7 @@ use mpz_core::Block;
 #[cfg(target_arch = "wasm32")]
 use mpz_ot::ferret::{FerretConfig, Receiver, Sender};
 #[cfg(target_arch = "wasm32")]
-use mpz_ot::ideal::rcot::{IdealRCOTSender, ideal_rcot};
+use mpz_ot::ideal::rcot::ideal_rcot;
 #[cfg(target_arch = "wasm32")]
 use mpz_ot_core::rcot::{RCOTReceiver, RCOTSender};
 #[cfg(target_arch = "wasm32")]
@@ -283,7 +283,7 @@ async fn record_for_sender(seed: u64) -> RecordedData {
 /// Runs sender only with replay context.
 #[cfg(target_arch = "wasm32")]
 async fn run_sender_with_replay(ctx: &mut Context, data: &RecordedData) {
-    let cot_send = IdealRCOTSender::new(data.cot_seed, data.delta);
+    let (cot_send, _) = ideal_rcot(data.cot_seed, data.delta);
     let config = bench_config();
     let mut sender = Sender::new(config, data.sender_seed, cot_send);
 
@@ -484,7 +484,7 @@ async fn record_for_sender_mt(seed: u64, concurrency: usize) -> RecordedDataMt {
 /// Runs MT sender only with replay context.
 #[cfg(target_arch = "wasm32")]
 async fn run_sender_with_replay_mt(exec: &mut Multithread, data: &RecordedDataMt) {
-    let cot_send = IdealRCOTSender::new(data.cot_seed, data.delta);
+    let (cot_send, _) = ideal_rcot(data.cot_seed, data.delta);
     let config = bench_config();
     let mut sender = Sender::new(config, data.sender_seed, cot_send);
 

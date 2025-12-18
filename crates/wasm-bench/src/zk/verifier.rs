@@ -1,7 +1,7 @@
-//! Isolated ZK benchmarks for WASM.
+//! Isolated ZK verifier benchmarks for WASM.
 //!
 //! Records protocol messages for replay-based isolated benchmarking.
-//! This allows benchmarking prover performance without network overhead.
+//! This allows benchmarking verifier performance without network overhead.
 
 use wasm_bindgen::prelude::*;
 
@@ -19,7 +19,8 @@ use mpz_common::context::{
     recording_mt_context_with_spawn_and_limit, replay_mt_context_with_spawn_and_limit,
     Multithread, RecordedMtData,
 };
-use mpz_ot::ideal::rcot::{IdealRCOTReceiver, ideal_rcot};
+use mpz_core::Block;
+use mpz_ot::ideal::rcot::ideal_rcot;
 use mpz_memory_core::{Array, binary::U8, correlated::Delta};
 use mpz_vm_core::{Call, prelude::*};
 use mpz_zk::{Prover, ProverConfig, Verifier, VerifierConfig};
@@ -95,7 +96,6 @@ impl AsyncRead for BiStream {
         }
 
         let to_read = buf.len().min(state.buffer.len());
-        // Use as_slices for zero-allocation bulk copy
         let (front, back) = state.buffer.as_slices();
         if to_read <= front.len() {
             buf[..to_read].copy_from_slice(&front[..to_read]);
@@ -141,7 +141,7 @@ impl AsyncWrite for BiStream {
     }
 }
 
-/// Creates recording context pair for WASM (no tokio dependency).
+/// Creates recording context pair for WASM.
 /// Writes from ctx_1 to ctx_0 are recorded.
 fn wasm_recording_context(max_frame_length: usize) -> (Context, Context, Arc<Mutex<Vec<u8>>>) {
     let (writer_a, reader_a) = byte_channel();
@@ -175,8 +175,8 @@ fn max_frame_length(circuit: &mpz_circuits::Circuit, circuit_count: usize) -> us
 }
 
 /// Runs the full ZK protocol with prover and verifier.
-/// Records verifier->prover messages (ctx_v is the recording context).
-async fn run_protocol_record_verifier(
+/// Records prover->verifier messages (ctx_p is the recording context).
+async fn run_protocol_record_prover(
     ctx_p: &mut Context,
     ctx_v: &mut Context,
     seed: u64,
@@ -264,35 +264,49 @@ async fn run_protocol_record_verifier(
     );
 }
 
-/// Records verifier->prover messages for prover replay.
-async fn record_for_prover(seed: u64, batch_size: usize) -> Vec<u8> {
-    let (mut ctx_p, mut ctx_v, recorded) =
+/// Records prover->verifier messages for verifier replay.
+/// Returns (recorded_bytes, ot_seed, delta) needed for deterministic replay.
+async fn record_for_verifier(seed: u64, batch_size: usize) -> (Vec<u8>, Block, Delta) {
+    // ctx_1's writes are recorded, so prover uses ctx_1
+    let (mut ctx_v, mut ctx_p, recorded) =
         wasm_recording_context(max_frame_length(&AES128, BLOCK_COUNT));
-    run_protocol_record_verifier(&mut ctx_p, &mut ctx_v, seed, batch_size).await;
-    recorded.lock().unwrap().clone()
+
+    // Capture delta and ot_seed for verifier replay
+    let mut rng = StdRng::seed_from_u64(seed);
+    let delta = Delta::random(&mut rng);
+    let ot_seed: Block = rng.random();
+
+    run_protocol_record_prover(&mut ctx_p, &mut ctx_v, seed, batch_size).await;
+
+    (recorded.lock().unwrap().clone(), ot_seed, delta)
 }
 
-/// Runs prover only with replay context.
-async fn run_prover_with_replay(ctx: &mut Context, batch_size: usize) {
-    let ot_recv = IdealRCOTReceiver::new();
-    let prover_config = ProverConfig::builder()
+/// Runs verifier only with replay context.
+async fn run_verifier_with_replay(
+    ctx: &mut Context,
+    batch_size: usize,
+    delta: Delta,
+    ot_seed: Block,
+) {
+    // OT sender needs seed and delta to generate consistent correlations
+    let (ot_send, _) = ideal_rcot(ot_seed, delta.into_inner());
+    let verifier_config = VerifierConfig::builder()
         .batch_size(batch_size)
         .build()
         .unwrap();
-    let mut prover = Prover::new(prover_config, ot_recv);
+    let mut verifier = Verifier::new(verifier_config, delta, ot_send);
 
-    let key: Array<U8, 16> = prover.alloc().unwrap();
-    prover.mark_private(key).unwrap();
-    prover.assign(key, [0u8; 16]).unwrap();
-    prover.commit(key).unwrap();
+    let key: Array<U8, 16> = verifier.alloc().unwrap();
+    verifier.mark_blind(key).unwrap();
+    verifier.commit(key).unwrap();
 
     for _ in 0..BLOCK_COUNT {
-        let msg: Array<U8, 16> = prover.alloc().unwrap();
-        prover.mark_public(msg).unwrap();
-        prover.assign(msg, [42u8; 16]).unwrap();
-        prover.commit(msg).unwrap();
+        let msg: Array<U8, 16> = verifier.alloc().unwrap();
+        verifier.mark_public(msg).unwrap();
+        verifier.assign(msg, [42u8; 16]).unwrap();
+        verifier.commit(msg).unwrap();
 
-        let ciphertext: Array<U8, 16> = prover
+        let ciphertext: Array<U8, 16> = verifier
             .call(
                 Call::builder(AES128.clone())
                     .arg(key)
@@ -302,197 +316,34 @@ async fn run_prover_with_replay(ctx: &mut Context, batch_size: usize) {
             )
             .unwrap();
 
-        std::mem::drop(prover.decode(ciphertext).unwrap());
+        std::mem::drop(verifier.decode(ciphertext).unwrap());
     }
 
-    prover.flush(ctx).await.unwrap();
-    prover.execute(ctx).await.unwrap();
-    prover.flush(ctx).await.unwrap();
+    verifier.flush(ctx).await.unwrap();
+    verifier.execute(ctx).await.unwrap();
+    verifier.flush(ctx).await.unwrap();
 }
 
-/// Simple ping-pong test for recording layer.
+/// Benchmark isolated verifier with message replay.
 ///
-/// Verifies that wasm_recording_context records correctly and replay works.
-/// Returns number of messages successfully round-tripped.
-#[wasm_bindgen]
-pub async fn zk_prover_test_recording() -> Result<u32, JsValue> {
-    use mpz_common::context::replay_st_context;
-    use serio::{SinkExt, stream::IoStreamExt};
-
-    web_sys::console::log_1(&"[rust] Testing recording layer...".into());
-
-    // Test 1: Record some messages
-    // Note: wasm_recording_context records ctx_1's writes (second context)
-    // So ctx_1 should be the sender for recording to work
-    let (mut ctx_receiver, mut ctx_sender, recorded_arc) =
-        wasm_recording_context(1024 * 1024);
-
-    let test_messages: Vec<Vec<u8>> = vec![
-        vec![1, 2, 3, 4],
-        vec![10; 100],
-        vec![42; 1000],
-    ];
-
-    for msg in &test_messages {
-        futures::try_join!(
-            ctx_sender.io_mut().send(msg.clone()),
-            ctx_receiver.io_mut().expect_next::<Vec<u8>>()
-        ).map_err(|e| JsValue::from_str(&format!("Record failed: {}", e)))?;
-    }
-
-    let recorded = recorded_arc.lock().unwrap().clone();
-    web_sys::console::log_1(&format!("[rust] Recorded {} bytes", recorded.len()).into());
-
-    drop(ctx_sender);
-    drop(ctx_receiver);
-
-    // Test 2: Replay and verify
-    let mut replay_ctx = replay_st_context(recorded, 1024 * 1024);
-
-    let mut success_count = 0u32;
-    for expected in &test_messages {
-        let received: Vec<u8> = replay_ctx.io_mut().expect_next().await
-            .map_err(|e| JsValue::from_str(&format!("Replay failed: {}", e)))?;
-
-        if received == *expected {
-            success_count += 1;
-        } else {
-            web_sys::console::log_1(&format!(
-                "[rust] Mismatch: expected {} bytes, got {} bytes",
-                expected.len(), received.len()
-            ).into());
-        }
-    }
-
-    web_sys::console::log_1(&format!(
-        "[rust] Recording test: {}/{} messages OK",
-        success_count, test_messages.len()
-    ).into());
-
-    Ok(success_count)
-}
-
-/// Benchmark ReplayDuplex read throughput.
-///
-/// Measures replay performance (reading from pre-recorded buffer).
-/// This is what the isolated prover uses during benchmarking.
-///
-/// NOTE: This benchmark may not be needed - in the isolated prover benchmark,
-/// the replay overhead is negligible compared to crypto work. The replay layer
-/// itself is not what's being benchmarked. Consider removing this later.
-///
-/// # Arguments
-/// * `n` - Number of iterations (each reads 1 MiB)
-#[wasm_bindgen]
-pub async fn zk_prover_replay_throughput(n: u32) -> BenchResult {
-    use mpz_common::context::replay_st_context;
-    use serio::{SinkExt, stream::IoStreamExt};
-
-    const MSG_SIZE: usize = 1024 * 1024; // 1 MiB per message
-
-    let performance = web_sys::window().unwrap().performance().unwrap();
-    let msg: Vec<u8> = vec![0u8; MSG_SIZE];
-
-    // Record n messages using wasm_recording_context (setup, not timed)
-    // Note: ctx_1 (second returned) writes are recorded, so it should be sender
-    let (mut ctx_receiver, mut ctx_sender, recorded_arc) =
-        wasm_recording_context(16 * 1024 * 1024);
-
-    for _ in 0..n {
-        futures::try_join!(
-            ctx_sender.io_mut().send(msg.clone()),
-            ctx_receiver.io_mut().expect_next::<Vec<u8>>()
-        ).unwrap();
-    }
-
-    let recorded = recorded_arc.lock().unwrap().clone();
-    drop(ctx_sender);
-    drop(ctx_receiver);
-
-    // Benchmark replay (timed)
-    let start = performance.now();
-
-    let mut replay_ctx = replay_st_context(recorded, 16 * 1024 * 1024);
-    for _ in 0..n {
-        let received: Vec<u8> = replay_ctx.io_mut().expect_next().await.unwrap();
-        std::hint::black_box(received);
-    }
-
-    let elapsed_ms = performance.now() - start;
-    let total_bytes = n as u64 * MSG_SIZE as u64;
-
-    BenchResult {
-        elapsed_ms,
-        and_gates: total_bytes,
-    }
-}
-
-/// Benchmark BiStream channel throughput.
-///
-/// Measures raw channel performance to compare against native (~400 MiB/s).
-/// Sends 1 MiB messages back and forth.
-///
-/// # Arguments
-/// * `n` - Number of iterations (each sends 1 MiB)
-#[wasm_bindgen]
-pub async fn zk_prover_channel_throughput(n: u32) -> BenchResult {
-    use mpz_common::Context;
-    use serio::{SinkExt, stream::IoStreamExt};
-
-    const MSG_SIZE: usize = 1024 * 1024; // 1 MiB per message
-
-    let performance = web_sys::window().unwrap().performance().unwrap();
-
-    // Create BiStream pair wrapped in Context (same as protocol uses)
-    let (writer_a, reader_a) = byte_channel();
-    let (writer_b, reader_b) = byte_channel();
-    let stream_0 = BiStream { reader: reader_b, writer: writer_a };
-    let stream_1 = BiStream { reader: reader_a, writer: writer_b };
-    let mut ctx_0 = Context::new_single_threaded_with_limit(stream_0, 16 * 1024 * 1024);
-    let mut ctx_1 = Context::new_single_threaded_with_limit(stream_1, 16 * 1024 * 1024);
-
-    let data: Vec<u8> = vec![0u8; MSG_SIZE];
-
-    let start = performance.now();
-
-    for _ in 0..n {
-        let (_, received): (_, Vec<u8>) = futures::try_join!(
-            ctx_0.io_mut().send(data.clone()),
-            ctx_1.io_mut().expect_next()
-        ).unwrap();
-        std::hint::black_box(received);
-    }
-
-    let elapsed_ms = performance.now() - start;
-    let total_bytes = n as u64 * MSG_SIZE as u64;
-
-    // Return bytes as "and_gates" for throughput calculation
-    BenchResult {
-        elapsed_ms,
-        and_gates: total_bytes,
-    }
-}
-
-/// Benchmark isolated prover with message replay.
-///
-/// Records verifier->prover messages once during setup, then benchmarks
-/// prover execution in isolation using replay.
+/// Records prover->verifier messages once during setup, then benchmarks
+/// verifier execution in isolation using replay.
 ///
 /// # Arguments
 /// * `n` - Number of iterations
 /// * `batch_size` - Batch size for consistency checks (e.g., 200000, 400000, etc.)
 #[wasm_bindgen]
-pub async fn zk_prover(n: u32, batch_size: u32) -> BenchResult {
+pub async fn zk_verifier(n: u32, batch_size: u32) -> BenchResult {
     let and_gates_per_circuit = AES128.and_count() as u64;
     let batch_size = batch_size as usize;
 
     let performance = web_sys::window().unwrap().performance().unwrap();
 
     // Record messages once (not timed)
-    web_sys::console::log_1(&format!("[rust] Recording messages for batch_size={}...", batch_size).into());
+    web_sys::console::log_1(&format!("[rust] Recording messages for verifier, batch_size={}...", batch_size).into());
     yield_to_browser().await;
 
-    let recorded = record_for_prover(0, batch_size).await;
+    let (recorded, ot_seed, delta) = record_for_verifier(0, batch_size).await;
     web_sys::console::log_1(&format!("[rust] Recorded {} bytes", recorded.len()).into());
     yield_to_browser().await;
 
@@ -504,11 +355,11 @@ pub async fn zk_prover(n: u32, batch_size: u32) -> BenchResult {
             yield_to_browser().await;
         }
 
-        // Timed section: prover replay
+        // Timed section: verifier replay
         let start = performance.now();
 
         let mut ctx = replay_st_context(recorded.clone(), max_frame_length(&AES128, BLOCK_COUNT));
-        run_prover_with_replay(&mut ctx, batch_size).await;
+        run_verifier_with_replay(&mut ctx, batch_size, delta, ot_seed).await;
 
         total_elapsed_ms += performance.now() - start;
     }
@@ -520,13 +371,13 @@ pub async fn zk_prover(n: u32, batch_size: u32) -> BenchResult {
 }
 
 // ============================================================================
-// Multi-threaded isolated prover benchmark
+// Multi-threaded isolated verifier benchmark
 // ============================================================================
 
 /// Runs the full ZK protocol with MT contexts.
-/// Records verifier->prover messages.
+/// Records prover->verifier messages.
 #[cfg(target_arch = "wasm32")]
-async fn run_protocol_record_verifier_mt(
+async fn run_protocol_record_prover_mt(
     exec_p: &mut Multithread,
     exec_v: &mut Multithread,
     seed: u64,
@@ -617,10 +468,11 @@ async fn run_protocol_record_verifier_mt(
     );
 }
 
-/// Records verifier->prover messages for MT prover replay.
+/// Records prover->verifier messages for MT verifier replay.
 #[cfg(target_arch = "wasm32")]
-async fn record_for_prover_mt(seed: u64, batch_size: usize, concurrency: usize) -> RecordedMtData {
-    let (mut exec_p, mut exec_v, recorded) = recording_mt_context_with_spawn_and_limit(
+async fn record_for_verifier_mt(seed: u64, batch_size: usize, concurrency: usize) -> (RecordedMtData, Block, Delta) {
+    // exec_1's writes are recorded, so prover uses exec_1
+    let (mut exec_v, mut exec_p, recorded) = recording_mt_context_with_spawn_and_limit(
         1024 * 1024,
         max_frame_length(&AES128, BLOCK_COUNT),
         concurrency,
@@ -629,34 +481,45 @@ async fn record_for_prover_mt(seed: u64, batch_size: usize, concurrency: usize) 
             Ok(())
         },
     );
-    run_protocol_record_verifier_mt(&mut exec_p, &mut exec_v, seed, batch_size).await;
-    recorded.lock().unwrap().clone()
+
+    // Capture delta and ot_seed for verifier replay
+    let mut rng = StdRng::seed_from_u64(seed);
+    let delta = Delta::random(&mut rng);
+    let ot_seed: Block = rng.random();
+
+    run_protocol_record_prover_mt(&mut exec_p, &mut exec_v, seed, batch_size).await;
+
+    (recorded.lock().unwrap().clone(), ot_seed, delta)
 }
 
-/// Runs MT prover only with replay context.
+/// Runs MT verifier only with replay context.
 #[cfg(target_arch = "wasm32")]
-async fn run_prover_with_replay_mt(exec: &mut Multithread, batch_size: usize) {
-    let ot_recv = IdealRCOTReceiver::new();
-    let prover_config = ProverConfig::builder()
+async fn run_verifier_with_replay_mt(
+    exec: &mut Multithread,
+    batch_size: usize,
+    delta: Delta,
+    ot_seed: Block,
+) {
+    let (ot_send, _) = ideal_rcot(ot_seed, delta.into_inner());
+    let verifier_config = VerifierConfig::builder()
         .batch_size(batch_size)
         .build()
         .unwrap();
-    let mut prover = Prover::new(prover_config, ot_recv);
+    let mut verifier = Verifier::new(verifier_config, delta, ot_send);
 
     let mut ctx = exec.new_context().await.unwrap();
 
-    let key: Array<U8, 16> = prover.alloc().unwrap();
-    prover.mark_private(key).unwrap();
-    prover.assign(key, [0u8; 16]).unwrap();
-    prover.commit(key).unwrap();
+    let key: Array<U8, 16> = verifier.alloc().unwrap();
+    verifier.mark_blind(key).unwrap();
+    verifier.commit(key).unwrap();
 
     for _ in 0..BLOCK_COUNT {
-        let msg: Array<U8, 16> = prover.alloc().unwrap();
-        prover.mark_public(msg).unwrap();
-        prover.assign(msg, [42u8; 16]).unwrap();
-        prover.commit(msg).unwrap();
+        let msg: Array<U8, 16> = verifier.alloc().unwrap();
+        verifier.mark_public(msg).unwrap();
+        verifier.assign(msg, [42u8; 16]).unwrap();
+        verifier.commit(msg).unwrap();
 
-        let ciphertext: Array<U8, 16> = prover
+        let ciphertext: Array<U8, 16> = verifier
             .call(
                 Call::builder(AES128.clone())
                     .arg(key)
@@ -666,18 +529,18 @@ async fn run_prover_with_replay_mt(exec: &mut Multithread, batch_size: usize) {
             )
             .unwrap();
 
-        std::mem::drop(prover.decode(ciphertext).unwrap());
+        std::mem::drop(verifier.decode(ciphertext).unwrap());
     }
 
-    prover.flush(&mut ctx).await.unwrap();
-    prover.execute(&mut ctx).await.unwrap();
-    prover.flush(&mut ctx).await.unwrap();
+    verifier.flush(&mut ctx).await.unwrap();
+    verifier.execute(&mut ctx).await.unwrap();
+    verifier.flush(&mut ctx).await.unwrap();
 }
 
-/// Benchmark isolated prover with MT context and message replay.
+/// Benchmark isolated verifier with MT context and message replay.
 ///
-/// Records verifier->prover messages once during setup using MT contexts,
-/// then benchmarks prover execution in isolation using MT replay.
+/// Records prover->verifier messages once during setup using MT contexts,
+/// then benchmarks verifier execution in isolation using MT replay.
 ///
 /// # Arguments
 /// * `n` - Number of iterations
@@ -687,14 +550,11 @@ async fn run_prover_with_replay_mt(exec: &mut Multithread, batch_size: usize) {
 /// # Implementation Note
 ///
 /// This benchmark runs on a Web Worker (via `web_spawn::spawn`) rather than
-/// the main browser thread. This is required because mpz-zk-core's consistency
-/// check (`prover.check()`) uses rayon parallel iterators internally, which call
-/// `Atomics.wait` to synchronize worker threads. `Atomics.wait` is forbidden on
-/// the main browser thread but allowed in Web Workers.
+/// the main browser thread. This is required because rayon parallel iterators
+/// call `Atomics.wait` which is forbidden on the main browser thread.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
-pub async fn zk_prover_mt(n: u32, batch_size: u32, concurrency: u32) -> BenchResult {
-    use std::sync::{Arc, Mutex};
+pub async fn zk_verifier_mt(n: u32, batch_size: u32, concurrency: u32) -> BenchResult {
     use wasm_bindgen::JsValue;
     use wasm_bindgen_futures::JsFuture;
 
@@ -704,33 +564,27 @@ pub async fn zk_prover_mt(n: u32, batch_size: u32, concurrency: u32) -> BenchRes
     let result: Arc<Mutex<Option<BenchResult>>> = Arc::new(Mutex::new(None));
     let result_clone = result.clone();
 
-    web_sys::console::log_1(&"[rust] About to call web_spawn::spawn...".into());
+    web_sys::console::log_1(&"[rust] zk_verifier_mt: spawning worker...".into());
 
     // Run benchmark on web worker thread (where Atomics.wait is allowed)
-    // We use web_spawn instead of rayon::spawn because rayon's global pool
-    // initialized in a worker isn't accessible from the main thread.
     let _handle = web_spawn::spawn(move || {
-        web_sys::console::log_1(&"[rust] web_spawn started".into());
+        web_sys::console::log_1(&"[rust] verifier worker started".into());
         let bench_result = pollster::block_on(async {
-            web_sys::console::log_1(&"[rust] pollster::block_on started".into());
             let batch_size = batch_size as usize;
-            // Workers don't have `window`, use global scope to get performance
             let global = js_sys::global();
             let performance: web_sys::Performance = js_sys::Reflect::get(&global, &"performance".into())
                 .expect("performance should exist")
                 .unchecked_into();
-            web_sys::console::log_1(&"[rust] got performance object".into());
 
-            // Record messages once (not timed)
             web_sys::console::log_1(
                 &format!(
-                    "[rust] Recording MT messages for batch_size={}, concurrency={}...",
+                    "[rust] Recording MT messages for verifier, batch_size={}, concurrency={}...",
                     batch_size, concurrency
                 )
                 .into(),
             );
 
-            let recorded = record_for_prover_mt(0, batch_size, concurrency as usize).await;
+            let (recorded, ot_seed, delta) = record_for_verifier_mt(0, batch_size, concurrency as usize).await;
             let total_bytes: usize = recorded.channels.values().map(|v| v.len()).sum();
             web_sys::console::log_1(
                 &format!(
@@ -745,10 +599,9 @@ pub async fn zk_prover_mt(n: u32, batch_size: u32, concurrency: u32) -> BenchRes
 
             for i in 0..n {
                 if i % 10 == 0 {
-                    web_sys::console::log_1(&format!("[rust] MT Iteration {}/{}", i, n).into());
+                    web_sys::console::log_1(&format!("[rust] MT Verifier Iteration {}/{}", i, n).into());
                 }
 
-                // Timed section: prover replay with MT context
                 let start = performance.now();
 
                 let mut exec = replay_mt_context_with_spawn_and_limit(
@@ -760,7 +613,7 @@ pub async fn zk_prover_mt(n: u32, batch_size: u32, concurrency: u32) -> BenchRes
                         Ok(())
                     },
                 );
-                run_prover_with_replay_mt(&mut exec, batch_size).await;
+                run_verifier_with_replay_mt(&mut exec, batch_size, delta, ot_seed).await;
 
                 total_elapsed_ms += performance.now() - start;
             }
@@ -770,16 +623,12 @@ pub async fn zk_prover_mt(n: u32, batch_size: u32, concurrency: u32) -> BenchRes
                 and_gates: n as u64 * BLOCK_COUNT as u64 * and_gates_per_circuit,
             }
         });
-        web_sys::console::log_1(&"[rust] web_spawn storing result".into());
+        web_sys::console::log_1(&"[rust] verifier worker storing result".into());
         *result_clone.lock().unwrap() = Some(bench_result);
-        web_sys::console::log_1(&"[rust] web_spawn done".into());
     });
-
-    web_sys::console::log_1(&"[rust] web_spawn::spawn returned JoinHandle, starting poll loop".into());
 
     // Initial yield to let the worker start
     JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)).await.unwrap();
-    web_sys::console::log_1(&"[rust] after initial yield".into());
 
     // Poll for result on main thread (non-blocking)
     loop {

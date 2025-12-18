@@ -1,30 +1,21 @@
-//! WASM benchmarks for mpz garbling libraries.
+//! WASM benchmarks for mpz libraries.
 //!
-//! This crate exposes garbling benchmarks as WASM-callable functions
+//! This crate exposes benchmarks as WASM-callable functions
 //! for browser performance testing.
 //!
 //! Modules:
-//! - `garble_core`: Raw garbling/evaluation benchmarks (half-gates, three-halves)
-//! - `garble`: Full semihonest 2PC protocol benchmarks
-//! - `zk_core`: QuickSilver ZK core benchmarks (prover/verifier primitives)
-//! - `zk`: Full ZK protocol benchmarks with VM
+//! - `garble`: Garbled circuits benchmarks (core + protocol)
+//! - `zk`: QuickSilver ZK benchmarks (core + protocol + prover/verifier)
+//! - `ot`: Oblivious transfer benchmarks (Ferret)
 
-mod garble_core;
 mod garble;
-mod zk_core;
 mod zk;
-mod zk_prover;
-mod zk_verifier;
-mod ferret;
+mod ot;
 
 // Re-export all wasm_bindgen functions
-pub use garble_core::*;
 pub use garble::*;
-pub use zk_core::*;
 pub use zk::*;
-pub use zk_prover::*;
-pub use zk_verifier::*;
-pub use ferret::*;
+pub use ot::*;
 
 // Initialize web_spawn and rayon for MT benchmarks
 #[cfg(target_arch = "wasm32")]
