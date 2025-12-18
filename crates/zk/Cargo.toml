@@ -46,19 +46,24 @@ criterion = { workspace = true }
 [[bench]]
 name = "zk"
 harness = false
+required-features = ["rayon"]
 
 [[bench]]
 name = "batch_size"
 harness = false
+required-features = ["rayon"]
 
 [[bench]]
 name = "prover"
 harness = false
+required-features = ["rayon"]
 
 [[bench]]
 name = "verifier"
 harness = false
+required-features = ["rayon"]
 
 [[bench]]
 name = "recording_overhead"
 harness = false
+required-features = ["rayon"]

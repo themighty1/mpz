@@ -53,7 +53,9 @@ tracing-subscriber = { workspace = true, features = ["fmt"] }
 [[bench]]
 name = "garbler"
 harness = false
+required-features = ["rayon"]
 
 [[bench]]
 name = "evaluator"
 harness = false
+required-features = ["rayon"]
