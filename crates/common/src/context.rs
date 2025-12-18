@@ -72,6 +72,7 @@ impl Context {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn from_io(io: Io) -> Self {
         Self {
             id: ThreadId::default(),

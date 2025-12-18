@@ -3,8 +3,15 @@ use itybity::ToBits;
 use mpz_core::{Block, lpn::LpnType};
 use mpz_ot_core::{
     chou_orlandi,
+    cot::{COTReceiver, COTSender},
     ferret::{self, FerretConfig},
-    ideal::rcot::IdealRCOT,
+    ideal::{
+        cot::{IdealCOT, ideal_cot},
+        ot::{IdealOT, ideal_ot},
+        rcot::IdealRCOT,
+        rot::{IdealROT, ideal_rot},
+    },
+    rot::{ROTReceiver, ROTSender},
     kos,
     ot::{OTReceiver, OTSender},
     rcot::{RCOTReceiver, RCOTSender},
@@ -132,6 +139,156 @@ fn ferret(c: &mut Criterion) {
     }
 }
 
+// TODO: This benchmark is temporary. Can be removed once transition to msg-based COT
+// is complete and all dependent crates have been updated.
+fn ideal_cot_cmp(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ideal_cot_cmp");
+
+    for n in [100, 1000, 10000, 1_000_000] {
+        group.throughput(Throughput::Elements(n as u64));
+
+        // Benchmark IdealCOT wrapper (message-based internally)
+        group.bench_with_input(BenchmarkId::new("wrapper", n), &n, |b, &n| {
+            let mut rng = ChaCha12Rng::seed_from_u64(0);
+            let delta = Block::random(&mut rng);
+            let choices: Vec<bool> = (0..n).map(|_| rng.random()).collect();
+            let keys: Vec<Block> = (0..n).map(|_| rng.random()).collect();
+
+            b.iter(|| {
+                let mut ideal = IdealCOT::new(delta);
+
+                let sender_out = ideal.queue_send_cot(&keys).unwrap();
+                let receiver_out = ideal.queue_recv_cot(&choices).unwrap();
+                ideal.flush().unwrap();
+
+                black_box((sender_out, receiver_out))
+            })
+        });
+
+        // Benchmark separate sender/receiver with explicit message passing
+        group.bench_with_input(BenchmarkId::new("msg_based", n), &n, |b, &n| {
+            let mut rng = ChaCha12Rng::seed_from_u64(0);
+            let delta = Block::random(&mut rng);
+            let choices: Vec<bool> = (0..n).map(|_| rng.random()).collect();
+            let keys: Vec<Block> = (0..n).map(|_| rng.random()).collect();
+
+            b.iter(|| {
+                let (mut sender, mut receiver) = ideal_cot(delta);
+
+                let sender_out = sender.queue_send_cot(&keys).unwrap();
+                let receiver_out = receiver.queue_recv_cot(&choices).unwrap();
+
+                let flush_msg = sender.flush().unwrap();
+                receiver.flush(flush_msg).unwrap();
+
+                black_box((sender_out, receiver_out))
+            })
+        });
+    }
+
+    group.finish();
+}
+
+// TODO: This benchmark is temporary. Can be removed once transition to msg-based OT
+// is complete and all dependent crates have been updated.
+fn ideal_ot_cmp(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ideal_ot_cmp");
+
+    for n in [100, 1000, 10000, 1_000_000] {
+        group.throughput(Throughput::Elements(n as u64));
+
+        // Benchmark IdealOT wrapper (message-based internally)
+        group.bench_with_input(BenchmarkId::new("wrapper", n), &n, |b, &n| {
+            let mut rng = ChaCha12Rng::seed_from_u64(0);
+            let choices: Vec<bool> = (0..n).map(|_| rng.random()).collect();
+            let msgs: Vec<[Block; 2]> = (0..n).map(|_| [rng.random(), rng.random()]).collect();
+
+            b.iter(|| {
+                let mut ideal = IdealOT::new();
+
+                let sender_out = ideal.queue_send_ot(&msgs).unwrap();
+                let receiver_out = ideal.queue_recv_ot(&choices).unwrap();
+                ideal.flush().unwrap();
+
+                black_box((sender_out, receiver_out))
+            })
+        });
+
+        // Benchmark separate sender/receiver with explicit message passing
+        group.bench_with_input(BenchmarkId::new("msg_based", n), &n, |b, &n| {
+            let mut rng = ChaCha12Rng::seed_from_u64(0);
+            let choices: Vec<bool> = (0..n).map(|_| rng.random()).collect();
+            let msgs: Vec<[Block; 2]> = (0..n).map(|_| [rng.random(), rng.random()]).collect();
+
+            b.iter(|| {
+                let (mut sender, mut receiver) = ideal_ot();
+
+                let sender_out = sender.queue_send_ot(&msgs).unwrap();
+                let receiver_out = receiver.queue_recv_ot(&choices).unwrap();
+
+                let flush_msg = sender.flush().unwrap();
+                receiver.flush(flush_msg).unwrap();
+
+                black_box((sender_out, receiver_out))
+            })
+        });
+    }
+
+    group.finish();
+}
+
+// TODO: This benchmark is temporary. Can be removed once transition to msg-based ROT
+// is complete and all dependent crates have been updated.
+fn ideal_rot_cmp(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ideal_rot_cmp");
+
+    for n in [100, 1000, 10000, 1_000_000] {
+        group.throughput(Throughput::Elements(n as u64));
+
+        // Benchmark IdealROT wrapper (message-based internally)
+        group.bench_with_input(BenchmarkId::new("wrapper", n), &n, |b, &n| {
+            let mut rng = ChaCha12Rng::seed_from_u64(0);
+            let seed = Block::random(&mut rng);
+
+            b.iter(|| {
+                let mut ideal = IdealROT::new(seed);
+
+                ROTSender::alloc(&mut ideal, n).unwrap();
+                ROTReceiver::alloc(&mut ideal, n).unwrap();
+                ideal.flush().unwrap();
+
+                let sender_out = ideal.try_send_rot(n).unwrap();
+                let receiver_out = ideal.try_recv_rot(n).unwrap();
+
+                black_box((sender_out, receiver_out))
+            })
+        });
+
+        // Benchmark separate sender/receiver with explicit message passing
+        group.bench_with_input(BenchmarkId::new("msg_based", n), &n, |b, &n| {
+            let mut rng = ChaCha12Rng::seed_from_u64(0);
+            let seed = Block::random(&mut rng);
+
+            b.iter(|| {
+                let (mut sender, mut receiver) = ideal_rot(seed);
+
+                ROTSender::alloc(&mut sender, n).unwrap();
+                ROTReceiver::alloc(&mut receiver, n).unwrap();
+
+                let flush_msg = sender.flush().unwrap();
+                receiver.flush(flush_msg).unwrap();
+
+                let sender_out = sender.try_send_rot(n).unwrap();
+                let receiver_out = receiver.try_recv_rot(n).unwrap();
+
+                black_box((sender_out, receiver_out))
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group! {
     name = chou_orlandi_benches;
     config = Criterion::default().sample_size(50);
@@ -150,4 +307,22 @@ criterion_group! {
     targets = ferret
 }
 
-criterion_main!(chou_orlandi_benches, kos_benches, ferret_benches);
+criterion_group! {
+    name = ideal_cot_benches;
+    config = Criterion::default().sample_size(50);
+    targets = ideal_cot_cmp
+}
+
+criterion_group! {
+    name = ideal_ot_benches;
+    config = Criterion::default().sample_size(50);
+    targets = ideal_ot_cmp
+}
+
+criterion_group! {
+    name = ideal_rot_benches;
+    config = Criterion::default().sample_size(50);
+    targets = ideal_rot_cmp
+}
+
+criterion_main!(chou_orlandi_benches, kos_benches, ferret_benches, ideal_cot_benches, ideal_ot_benches, ideal_rot_benches);
