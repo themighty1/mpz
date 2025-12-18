@@ -8,6 +8,8 @@
 //! - `zk`: QuickSilver ZK benchmarks (core + protocol + prover/verifier)
 //! - `ot`: Oblivious transfer benchmarks (Ferret)
 
+use wasm_bindgen::prelude::*;
+
 mod garble;
 mod zk;
 mod ot;
@@ -17,9 +19,12 @@ pub use garble::*;
 pub use zk::*;
 pub use ot::*;
 
-// Initialize web_spawn and rayon for MT benchmarks
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
+/// Common benchmark result containing timing and work done.
+#[wasm_bindgen(getter_with_clone)]
+pub struct BenchResult {
+    pub elapsed_ms: f64,
+    pub and_gates: u64,
+}
 
 /// Initialize the web_spawn spawner and rayon thread pool for MT benchmarks.
 /// Must be called before running any MT benchmarks.

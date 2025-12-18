@@ -33,9 +33,7 @@ Single-threaded benchmarks measuring raw garbling/evaluation speed without proto
 | Benchmark | Description |
 |-----------|-------------|
 | `garble_core/half_gates_garble` | Half-gates garbling of AES-128 circuit |
-| `garble_core/three_halves_garble` | Three-halves garbling of AES-128 circuit |
 | `garble_core/half_gates_evaluate` | Half-gates evaluation of AES-128 circuit |
-| `garble_core/three_halves_evaluate` | Three-halves evaluation of AES-128 circuit |
 
 ### zk_core (QuickSilver ZK core)
 
@@ -160,7 +158,6 @@ Example output:
 Name                                     Median (ms)   Per-iter (us)   AND gates/s
 ----------------------------------------------------------------------------------
 garble_core/half_gates_garble                  45.23          452.30       14.52M
-garble_core/three_halves_garble                38.91          389.10       16.89M
 ```
 
 ## Architecture Notes

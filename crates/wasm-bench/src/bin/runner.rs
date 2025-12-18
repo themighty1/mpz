@@ -31,14 +31,12 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 
 /// All available benchmark groups
-const ALL_GROUPS: &[&str] = &["garble_core", "zk_core", "zk", "zk_prover", "zk_verifier", "garble", "garble_isolated", "ferret", "test"];
+const ALL_GROUPS: &[&str] = &["garble_core", "zk_core", "zk", "zk_prover", "zk_verifier", "garble", "ferret", "test"];
 
 /// All available benchmarks
 const ALL_BENCHMARKS: &[&str] = &[
     "garble_core/half_gates_garble",
-    "garble_core/three_halves_garble",
     "garble_core/half_gates_evaluate",
-    "garble_core/three_halves_evaluate",
     "zk_core/prover_execute",
     "zk_core/verifier_execute",
     "zk_core/full_protocol",
@@ -67,9 +65,12 @@ const ALL_BENCHMARKS: &[&str] = &[
     "zk_verifier/mt_batch_600k",
     "zk_verifier/mt_batch_800k",
     "zk_verifier/mt_batch_1000k",
-    "garble/garble_st",
-    "garble/garble_mt",
-    "garble_isolated/garbler_mt",
+    "garble/garbler_100k",
+    "garble/garbler_1m",
+    "garble/garbler_10m",
+    "garble/evaluator_100k",
+    "garble/evaluator_1m",
+    "garble/evaluator_10m",
     "ferret/sender_st",
     "ferret/sender_mt",
     "test/mt_context_only",
