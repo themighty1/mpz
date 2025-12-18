@@ -40,11 +40,13 @@ const ALL_BENCHMARKS: &[&str] = &[
     "garble_core/half_gates_evaluate_batched",
     "garble_core/half_gates_evaluate_parallel",
     "zk_core/prover_execute",
-    "zk_core/prover_check",
+    "zk_core/prover_check_200k",
+    "zk_core/prover_check_400k",
+    "zk_core/prover_check_600k",
     "zk_core/verifier_execute",
-    "zk_core/verifier_check",
-    "zk_core/full_protocol",
-    "zk_core/check_only",
+    "zk_core/verifier_check_200k",
+    "zk_core/verifier_check_400k",
+    "zk_core/verifier_check_600k",
     "zk/zk_st_batched",
     "zk/zk_mt_batched",
     "zk_overhead/baseline_100k",
@@ -106,10 +108,8 @@ fn is_mt_benchmark(name: &str) -> bool {
         "zk/zk_mt_batched"
             | "ferret/sender_mt"
             | "test/mt_context_only"
-            | "zk_core/prover_check"
-            | "zk_core/verifier_check"
             | "garble_core/half_gates_evaluate_parallel"
-    )
+    ) || name.starts_with("zk_core/prover_check_") || name.starts_with("zk_core/verifier_check_")
 }
 
 #[derive(Debug, Deserialize)]
@@ -461,9 +461,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start HTTP server
     let server_addr = start_server(crate_dir).await?;
-    println!("Started HTTP server at http://{}", server_addr);
-
-    println!("Launching browser (headless: {})...", headless);
 
     // Configure browser
     let mut builder = BrowserConfig::builder()
@@ -483,7 +480,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder = builder.window_size(1200, 800);
 
     let config = builder.build()?;
-    println!("Browser config: {:?}", config);
 
     let (browser, mut handler) = Browser::launch(config).await?;
 
