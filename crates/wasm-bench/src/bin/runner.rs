@@ -162,16 +162,10 @@ async fn run_benchmarks_with_concurrency(
     if let Some(c) = concurrency {
         println!("\n=== Running with {} threads ===", c);
     }
-    println!("Loading {}...", url);
     page.goto(NavigateParams::builder().url(&url).build()?)
         .await?;
 
     page.wait_for_navigation().await?;
-    println!("Page loaded, waiting for benchmarks...");
-    println!(
-        "Running benchmarks ({} iterations, {} samples)...\n",
-        iterations, samples
-    );
 
     let timeout = Duration::from_secs(300);
     let start = std::time::Instant::now();
