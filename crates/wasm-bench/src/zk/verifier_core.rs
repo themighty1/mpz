@@ -144,7 +144,10 @@ pub async fn zk_core_verifier_check(n: u32, concurrency: u32) -> BenchResult {
     let result_clone = result.clone();
 
     let _handle = web_spawn::spawn(move || {
-        // Initialize rayon thread pool
+        // Initialize web_spawn spawner inside the worker first
+        pollster::block_on(wasm_bindgen_futures::JsFuture::from(web_spawn::start_spawner())).ok();
+
+        // Then initialize rayon thread pool
         rayon::ThreadPoolBuilder::new()
             .num_threads(concurrency as usize)
             .build_global()

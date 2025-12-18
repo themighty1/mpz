@@ -133,7 +133,10 @@ pub async fn garble_core_half_gates_evaluate_parallel(n: u32, concurrency: u32) 
     let result_clone = result.clone();
 
     let _handle = web_spawn::spawn(move || {
-        // Initialize rayon thread pool
+        // Initialize web_spawn spawner inside the worker first
+        pollster::block_on(wasm_bindgen_futures::JsFuture::from(web_spawn::start_spawner())).ok();
+
+        // Then initialize rayon thread pool
         rayon::ThreadPoolBuilder::new()
             .num_threads(concurrency as usize)
             .build_global()
