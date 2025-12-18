@@ -14,9 +14,13 @@ use mpz_zk_core::{Prover, Verifier};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::sync::Arc;
 
-// Gate count thresholds
+// Gate count thresholds for execute
 const THRESHOLDS: &[(u64, &str)] = &[(100_000, "100K"), (1_000_000, "1M"), (10_000_000, "10M")];
 
+// Gate count thresholds for check
+const CHECK_THRESHOLDS: &[(u64, &str)] = &[(200_000, "200K"), (400_000, "400K"), (600_000, "600K")];
+
+/// Benchmarks only the execute phase (no check).
 fn bench_verifier_execute(c: &mut Criterion) {
     let mut group = c.benchmark_group("verifier");
     group.sample_size(10);
@@ -132,6 +136,7 @@ fn bench_verifier_execute(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmarks only the check phase (execute in untimed setup).
 fn bench_verifier_check(c: &mut Criterion) {
     let mut group = c.benchmark_group("verifier");
     group.sample_size(10);
@@ -141,7 +146,7 @@ fn bench_verifier_check(c: &mut Criterion) {
     let inputs_per_circuit = circuit.inputs().len();
     let gates_per_circuit = and_count as u64;
 
-    for &(threshold, name) in THRESHOLDS {
+    for &(threshold, name) in CHECK_THRESHOLDS {
         let circuit_count = threshold.div_ceil(gates_per_circuit) as usize;
         let actual_gates = circuit_count as u64 * gates_per_circuit;
 

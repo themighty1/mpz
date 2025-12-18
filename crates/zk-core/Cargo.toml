@@ -40,7 +40,3 @@ harness = false
 [[bench]]
 name = "verifier"
 harness = false
-
-[[bench]]
-name = "chi"
-harness = false
