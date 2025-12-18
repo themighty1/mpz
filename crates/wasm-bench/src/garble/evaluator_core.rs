@@ -114,6 +114,7 @@ pub fn garble_core_half_gates_evaluate_batched(n: u32) -> BenchResult {
 }
 
 // Circuit count thresholds for parallel evaluation (matches approximate gate counts)
+#[cfg(target_arch = "wasm32")]
 const PARALLEL_THRESHOLDS: &[usize] = &[100, 200, 400];
 
 /// Benchmark parallel circuit evaluation using rayon.
@@ -122,6 +123,7 @@ const PARALLEL_THRESHOLDS: &[usize] = &[100, 200, 400];
 /// Timed: only the parallel evaluation phase.
 ///
 /// Runs on a Web Worker because rayon's Atomics.wait is forbidden on main thread.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn garble_core_half_gates_evaluate_parallel(n: u32, concurrency: u32) -> BenchResult {
     use std::sync::Mutex;

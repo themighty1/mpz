@@ -131,6 +131,7 @@ pub fn zk_core_prover_execute(n: u32) -> BenchResult {
 }
 
 // Gate count thresholds for check (matches native bench)
+#[cfg(target_arch = "wasm32")]
 const CHECK_THRESHOLDS: &[usize] = &[200_000, 400_000, 600_000];
 
 /// Benchmark ZK prover check phase: run check n times for each threshold.
@@ -138,6 +139,7 @@ const CHECK_THRESHOLDS: &[usize] = &[200_000, 400_000, 600_000];
 /// Timed: only the prover check phase (uses rayon internally).
 ///
 /// Runs on a Web Worker because rayon's Atomics.wait is forbidden on main thread.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn zk_core_prover_check(n: u32, concurrency: u32) -> BenchResult {
     use std::sync::Mutex;
