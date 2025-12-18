@@ -18,7 +18,7 @@ use mpz_garble::protocol::semihonest::{Evaluator, Garbler};
 #[cfg(target_arch = "wasm32")]
 use mpz_memory_core::{Array, binary::*, correlated::Delta};
 #[cfg(target_arch = "wasm32")]
-use mpz_ot::ideal::msg_cot::{MsgIdealCOTSender, msg_ideal_cot};
+use mpz_ot::ideal::cot::ideal_cot;
 #[cfg(target_arch = "wasm32")]
 use mpz_vm_core::{Call, prelude::*};
 #[cfg(target_arch = "wasm32")]
@@ -52,7 +52,7 @@ async fn run_protocol_record_evaluator(
     let mut rng = StdRng::seed_from_u64(seed);
     let delta = Delta::random(&mut rng);
 
-    let (cot_send, cot_recv) = msg_ideal_cot(delta.into_inner());
+    let (cot_send, cot_recv) = ideal_cot(delta.into_inner());
 
     let mut gb = Garbler::new(cot_send, [0u8; 16], delta);
     let mut ev = Evaluator::new(cot_recv);
@@ -137,7 +137,7 @@ async fn record_for_garbler(circuit_count: usize, seed: u64, concurrency: usize)
 
 #[cfg(target_arch = "wasm32")]
 async fn run_garbler_with_replay(exec: &mut Multithread, circuit_count: usize, delta: Delta) {
-    let cot_send = MsgIdealCOTSender::new(delta.into_inner());
+    let (cot_send, _) = ideal_cot(delta.into_inner());
     let mut gb = Garbler::new(cot_send, [0u8; 16], delta);
 
     let mut ctx = exec.new_context().await.unwrap();
