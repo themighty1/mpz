@@ -27,13 +27,6 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use crate::BenchResult;
 
 #[cfg(target_arch = "wasm32")]
-async fn yield_to_browser() {
-    use wasm_bindgen_futures::JsFuture;
-    let promise = js_sys::Promise::resolve(&JsValue::NULL);
-    let _ = JsFuture::from(promise).await;
-}
-
-#[cfg(target_arch = "wasm32")]
 fn max_frame_length(circuit: &mpz_circuits::Circuit, circuit_count: usize) -> usize {
     let bytes_per_correlation = 1 + 16;
     let overhead = 1.2;
@@ -123,6 +116,12 @@ async fn run_full_protocol(
 
 /// Benchmark baseline MT context (no recording).
 ///
+/// This benchmark runs on a Web Worker (via `web_spawn::spawn`) rather than
+/// the main browser thread. This is required because mpz-zk-core's consistency
+/// check (`prover.check()`) uses rayon parallel iterators internally, which call
+/// `Atomics.wait` to synchronize worker threads. `Atomics.wait` is forbidden on
+/// the main browser thread but allowed in Web Workers.
+///
 /// # Arguments
 /// * `n` - Number of benchmark iterations
 /// * `batch_size` - Number of AND gates per iteration
@@ -130,35 +129,76 @@ async fn run_full_protocol(
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn zk_overhead_baseline(n: u32, batch_size: u32, concurrency: u32) -> BenchResult {
+    use std::sync::{Arc, Mutex};
+    use wasm_bindgen_futures::JsFuture;
+
     let and_gates_per_circuit = AES128.and_count() as u64;
     let circuit_count = (batch_size as u64).div_ceil(and_gates_per_circuit) as usize;
     let actual_gates = circuit_count as u64 * and_gates_per_circuit;
 
-    let performance = web_sys::window().unwrap().performance().unwrap();
+    let result: Arc<Mutex<Option<BenchResult>>> = Arc::new(Mutex::new(None));
+    let result_clone = result.clone();
 
-    yield_to_browser().await;
+    let _handle = web_spawn::spawn(move || {
+        let bench_result = pollster::block_on(async {
+            let global = js_sys::global();
+            let performance: web_sys::Performance =
+                js_sys::Reflect::get(&global, &"performance".into())
+                    .expect("performance should exist")
+                    .unchecked_into();
 
-    let mut total_elapsed_ms = 0.0;
+            let mut total_elapsed_ms = 0.0;
 
-    for _ in 0..n {
-        let start = performance.now();
+            for _ in 0..n {
+                let start = performance.now();
 
-        let (mut exec_p, mut exec_v) = test_mt_context_with_spawn(concurrency as usize, |f| {
-            let _ = web_spawn::spawn(f);
-            Ok(())
+                let (mut exec_p, mut exec_v) =
+                    test_mt_context_with_spawn(concurrency as usize, |f| {
+                        let _ = web_spawn::spawn(f);
+                        Ok(())
+                    });
+                run_full_protocol(&mut exec_p, &mut exec_v, circuit_count, 0).await;
+
+                total_elapsed_ms += performance.now() - start;
+            }
+
+            BenchResult {
+                elapsed_ms: total_elapsed_ms,
+                and_gates: n as u64 * actual_gates,
+            }
         });
-        run_full_protocol(&mut exec_p, &mut exec_v, circuit_count, 0).await;
+        *result_clone.lock().unwrap() = Some(bench_result);
+    });
 
-        total_elapsed_ms += performance.now() - start;
-    }
+    // Initial yield to let the worker start
+    JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL))
+        .await
+        .unwrap();
 
-    BenchResult {
-        elapsed_ms: total_elapsed_ms,
-        and_gates: n as u64 * actual_gates,
+    // Poll for result on main thread (non-blocking)
+    loop {
+        if let Some(r) = result.lock().unwrap().take() {
+            return r;
+        }
+        // Yield with 10ms delay to avoid busy-spinning
+        JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 10)
+                .unwrap();
+        }))
+        .await
+        .unwrap();
     }
 }
 
 /// Benchmark recording MT context.
+///
+/// This benchmark runs on a Web Worker (via `web_spawn::spawn`) rather than
+/// the main browser thread. This is required because mpz-zk-core's consistency
+/// check (`prover.check()`) uses rayon parallel iterators internally, which call
+/// `Atomics.wait` to synchronize worker threads. `Atomics.wait` is forbidden on
+/// the main browser thread but allowed in Web Workers.
 ///
 /// # Arguments
 /// * `n` - Number of benchmark iterations
@@ -167,35 +207,70 @@ pub async fn zk_overhead_baseline(n: u32, batch_size: u32, concurrency: u32) -> 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn zk_overhead_recording(n: u32, batch_size: u32, concurrency: u32) -> BenchResult {
+    use std::sync::{Arc, Mutex};
+    use wasm_bindgen_futures::JsFuture;
+
     let and_gates_per_circuit = AES128.and_count() as u64;
     let circuit_count = (batch_size as u64).div_ceil(and_gates_per_circuit) as usize;
     let actual_gates = circuit_count as u64 * and_gates_per_circuit;
 
-    let performance = web_sys::window().unwrap().performance().unwrap();
+    let result: Arc<Mutex<Option<BenchResult>>> = Arc::new(Mutex::new(None));
+    let result_clone = result.clone();
 
-    yield_to_browser().await;
+    let _handle = web_spawn::spawn(move || {
+        let bench_result = pollster::block_on(async {
+            let global = js_sys::global();
+            let performance: web_sys::Performance =
+                js_sys::Reflect::get(&global, &"performance".into())
+                    .expect("performance should exist")
+                    .unchecked_into();
 
-    let mut total_elapsed_ms = 0.0;
+            let mut total_elapsed_ms = 0.0;
 
-    for _ in 0..n {
-        let start = performance.now();
+            for _ in 0..n {
+                let start = performance.now();
 
-        let (mut exec_p, mut exec_v, _recorded) = recording_mt_context_with_spawn_and_limit(
-            1024 * 1024,
-            max_frame_length(&AES128, circuit_count),
-            concurrency as usize,
-            |f| {
-                let _ = web_spawn::spawn(f);
-                Ok(())
-            },
-        );
-        run_full_protocol(&mut exec_p, &mut exec_v, circuit_count, 0).await;
+                let (mut exec_p, mut exec_v, _recorded) =
+                    recording_mt_context_with_spawn_and_limit(
+                        1024 * 1024,
+                        max_frame_length(&AES128, circuit_count),
+                        concurrency as usize,
+                        |f| {
+                            let _ = web_spawn::spawn(f);
+                            Ok(())
+                        },
+                    );
+                run_full_protocol(&mut exec_p, &mut exec_v, circuit_count, 0).await;
 
-        total_elapsed_ms += performance.now() - start;
-    }
+                total_elapsed_ms += performance.now() - start;
+            }
 
-    BenchResult {
-        elapsed_ms: total_elapsed_ms,
-        and_gates: n as u64 * actual_gates,
+            BenchResult {
+                elapsed_ms: total_elapsed_ms,
+                and_gates: n as u64 * actual_gates,
+            }
+        });
+        *result_clone.lock().unwrap() = Some(bench_result);
+    });
+
+    // Initial yield to let the worker start
+    JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL))
+        .await
+        .unwrap();
+
+    // Poll for result on main thread (non-blocking)
+    loop {
+        if let Some(r) = result.lock().unwrap().take() {
+            return r;
+        }
+        // Yield with 10ms delay to avoid busy-spinning
+        JsFuture::from(js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 10)
+                .unwrap();
+        }))
+        .await
+        .unwrap();
     }
 }
