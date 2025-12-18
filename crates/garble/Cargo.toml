@@ -51,10 +51,6 @@ tokio = { workspace = true, features = [
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [[bench]]
-name = "full"
-harness = false
-
-[[bench]]
 name = "garbler"
 harness = false
 

@@ -34,7 +34,11 @@ aes = { workspace = true }
 rstest = { workspace = true }
 
 [[bench]]
-name = "zk"
+name = "prover"
+harness = false
+
+[[bench]]
+name = "verifier"
 harness = false
 
 [[bench]]
