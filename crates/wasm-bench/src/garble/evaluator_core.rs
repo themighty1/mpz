@@ -4,15 +4,21 @@
 
 use wasm_bindgen::prelude::*;
 
-use mpz_circuits::AES128;
-use mpz_garble_core::{half_gates, EncryptedGate, Key};
+use std::sync::Arc;
+use mpz_circuits::{Circuit, AES128};
+use mpz_garble_core::{half_gates, evaluate_garbled_circuits, EncryptedGate, GarbledCircuit, Key};
 use mpz_memory_core::correlated::{Delta, Mac};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
+use crate::BenchResult;
+
 /// Shared benchmark state, initialized once.
 struct BenchState {
+    delta: Delta,
+    inputs: Vec<Key>,
     eval_inputs: Vec<Mac>,
     gates: Vec<EncryptedGate>,
+    // Note: batches are regenerated per iteration since EncryptedGateBatch doesn't impl Clone
 }
 
 impl BenchState {
@@ -29,13 +35,13 @@ impl BenchState {
             .map(|(k, &c)| k.auth(c, &delta))
             .collect();
 
-        // Pre-garble circuit for evaluation benchmarks
+        // Pre-garble circuit for evaluation benchmarks (single gates)
         let mut gb = half_gates::Garbler::default();
         let mut iter = gb.generate(&AES128, delta, &inputs).unwrap();
         let gates: Vec<_> = iter.by_ref().collect();
         let _ = iter.finish().unwrap();
 
-        Self { eval_inputs, gates }
+        Self { delta, inputs, eval_inputs, gates }
     }
 }
 
@@ -43,23 +49,168 @@ thread_local! {
     static STATE: BenchState = BenchState::new();
 }
 
-/// Benchmark half-gates evaluation: evaluate AES circuit n times.
-/// Returns a checksum to prevent optimization.
+/// Benchmark half-gates evaluation (iterator): evaluate AES circuit n times.
+/// Uses single-gate iterator interface.
+/// Returns elapsed time and AND gates processed.
 #[wasm_bindgen]
-pub fn garble_core_half_gates_evaluate(n: u32) -> u32 {
-    STATE.with(|state| {
-        let mut ev = half_gates::Evaluator::default();
-        let mut checksum = 0u32;
+pub fn garble_core_half_gates_evaluate(n: u32) -> BenchResult {
+    let performance = web_sys::window().unwrap().performance().unwrap();
+    let and_count = AES128.and_count() as u64;
 
+    STATE.with(|state| {
+        let start = performance.now();
+
+        let mut ev = half_gates::Evaluator::default();
         for _ in 0..n {
             let mut consumer = ev.evaluate(&AES128, &state.eval_inputs).unwrap();
             for gate in &state.gates {
                 consumer.next(*gate);
             }
-            let output = consumer.finish().unwrap();
-            checksum = checksum.wrapping_add(output.outputs.len() as u32);
+            let _ = consumer.finish().unwrap();
         }
 
-        checksum
+        BenchResult {
+            elapsed_ms: performance.now() - start,
+            and_gates: n as u64 * and_count,
+        }
     })
+}
+
+/// Benchmark half-gates evaluation (batched): evaluate AES circuit n times.
+/// Uses batched gate interface for better throughput.
+/// Returns elapsed time and AND gates processed.
+#[wasm_bindgen]
+pub fn garble_core_half_gates_evaluate_batched(n: u32) -> BenchResult {
+    let performance = web_sys::window().unwrap().performance().unwrap();
+    let and_count = AES128.and_count() as u64;
+
+    STATE.with(|state| {
+        let mut total_elapsed = 0.0;
+        let mut ev = half_gates::Evaluator::default();
+
+        for _ in 0..n {
+            // Regenerate batches for this iteration (untimed)
+            // EncryptedGateBatch doesn't implement Clone, so we must regenerate
+            let mut gb = half_gates::Garbler::default();
+            let mut iter = gb.generate_batched(&AES128, state.delta, &state.inputs).unwrap();
+            let batches: Vec<_> = iter.by_ref().collect();
+            let _ = iter.finish().unwrap();
+
+            // Time only the evaluation
+            let start = performance.now();
+            let mut consumer = ev.evaluate_batched(&AES128, &state.eval_inputs).unwrap();
+            for batch in batches {
+                consumer.next(batch);
+            }
+            let _ = consumer.finish().unwrap();
+            total_elapsed += performance.now() - start;
+        }
+
+        BenchResult {
+            elapsed_ms: total_elapsed,
+            and_gates: n as u64 * and_count,
+        }
+    })
+}
+
+// Circuit count thresholds for parallel evaluation (matches approximate gate counts)
+const PARALLEL_THRESHOLDS: &[usize] = &[100, 200, 400];
+
+/// Benchmark parallel circuit evaluation using rayon.
+/// Evaluates multiple AES circuits in parallel.
+/// Setup (untimed): garble circuits.
+/// Timed: only the parallel evaluation phase.
+///
+/// Runs on a Web Worker because rayon's Atomics.wait is forbidden on main thread.
+#[wasm_bindgen]
+pub async fn garble_core_half_gates_evaluate_parallel(n: u32, concurrency: u32) -> BenchResult {
+    use std::sync::Mutex;
+    use wasm_bindgen_futures::JsFuture;
+
+    let result: Arc<Mutex<Option<BenchResult>>> = Arc::new(Mutex::new(None));
+    let result_clone = result.clone();
+
+    let _handle = web_spawn::spawn(move || {
+        // Initialize rayon thread pool
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrency as usize)
+            .build_global()
+            .ok();
+
+        let bench_result = {
+            let global = js_sys::global();
+            let performance: web_sys::Performance =
+                js_sys::Reflect::get(&global, &"performance".into())
+                    .expect("performance should exist")
+                    .unchecked_into();
+
+            let circuit: Arc<Circuit> = AES128.clone().into();
+            let and_count = circuit.and_count();
+
+            let mut total_eval_time = 0.0;
+            let mut total_gates = 0u64;
+
+            // Setup: generate keys and macs once
+            let mut rng = StdRng::seed_from_u64(0);
+            let delta = Delta::random(&mut rng);
+            let inputs: Vec<Key> = (0..256).map(|_| rng.random()).collect();
+            let choices: Vec<bool> = (0..256).map(|_| rng.random()).collect();
+            let eval_inputs: Vec<Mac> = inputs
+                .iter()
+                .zip(&choices)
+                .map(|(k, &c)| k.auth(c, &delta))
+                .collect();
+
+            for &circuit_count in PARALLEL_THRESHOLDS {
+                // Pre-garble circuits for this threshold (untimed)
+                let mut garbled_circuits = Vec::with_capacity(circuit_count);
+                for _ in 0..circuit_count {
+                    let mut gb = half_gates::Garbler::default();
+                    let mut iter = gb.generate(&AES128, delta, &inputs).unwrap();
+                    let gates: Vec<_> = iter.by_ref().collect();
+                    let _ = iter.finish().unwrap();
+                    garbled_circuits.push(GarbledCircuit { gates });
+                }
+
+                for _ in 0..n {
+                    // Build input for evaluate_garbled_circuits
+                    let circs: Vec<_> = garbled_circuits
+                        .iter()
+                        .map(|gc| (circuit.clone(), eval_inputs.clone(), gc.clone()))
+                        .collect();
+
+                    // Timed: only the parallel evaluation
+                    let start = performance.now();
+                    let _outputs = evaluate_garbled_circuits(circs).unwrap();
+                    total_eval_time += performance.now() - start;
+                }
+
+                total_gates += n as u64 * circuit_count as u64 * and_count as u64;
+            }
+
+            BenchResult {
+                elapsed_ms: total_eval_time,
+                and_gates: total_gates,
+            }
+        };
+        *result_clone.lock().unwrap() = Some(bench_result);
+    });
+
+    // Poll for result from main thread
+    loop {
+        JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL))
+            .await
+            .unwrap();
+        if let Some(r) = result.lock().unwrap().take() {
+            return r;
+        }
+        // Small delay before next poll
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 10)
+                .unwrap();
+        });
+        JsFuture::from(promise).await.unwrap();
+    }
 }

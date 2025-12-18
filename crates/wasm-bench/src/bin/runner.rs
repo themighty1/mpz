@@ -37,6 +37,8 @@ const ALL_GROUPS: &[&str] = &["garble_core", "zk_core", "zk", "zk_overhead", "zk
 const ALL_BENCHMARKS: &[&str] = &[
     "garble_core/half_gates_garble",
     "garble_core/half_gates_evaluate",
+    "garble_core/half_gates_evaluate_batched",
+    "garble_core/half_gates_evaluate_parallel",
     "zk_core/prover_execute",
     "zk_core/prover_check",
     "zk_core/verifier_execute",
@@ -98,8 +100,16 @@ fn is_mt_benchmark(name: &str) -> bool {
             return true;
         }
     }
-    // Individual MT benchmarks
-    matches!(name, "zk/zk_mt_batched" | "ferret/sender_mt" | "test/mt_context_only")
+    // Individual MT benchmarks (including zk_core check which uses rayon internally)
+    matches!(
+        name,
+        "zk/zk_mt_batched"
+            | "ferret/sender_mt"
+            | "test/mt_context_only"
+            | "zk_core/prover_check"
+            | "zk_core/verifier_check"
+            | "garble_core/half_gates_evaluate_parallel"
+    )
 }
 
 #[derive(Debug, Deserialize)]

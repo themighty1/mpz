@@ -169,12 +169,14 @@ function getAllBenchmarkDefs(concurrency = 8) {
     return [
         // garble-core benchmarks (raw garbling primitives)
         { category: "garble_core", name: "garble_core/half_gates_garble", fn: (n) => wasm.garble_core_half_gates_garble(n), async: false },
-        { category: "garble_core", name: "garble_core/half_gates_evaluate", fn: (n) => wasm.garble_core_half_gates_evaluate(n), async: false },
+        { category: "garble_core", name: "garble_core/half_gates_evaluate", fn: (n) => wasm.garble_core_half_gates_evaluate(n), async: false, returnsBenchResult: true },
+        { category: "garble_core", name: "garble_core/half_gates_evaluate_batched", fn: (n) => wasm.garble_core_half_gates_evaluate_batched(n), async: false, returnsBenchResult: true },
+        { category: "garble_core", name: "garble_core/half_gates_evaluate_parallel", fn: (n) => wasm.garble_core_half_gates_evaluate_parallel(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         // zk-core benchmarks (QuickSilver ZK protocol) - return BenchResult
         { category: "zk_core", name: "zk_core/prover_execute", fn: (n) => wasm.zk_core_prover_execute(n), async: false, returnsBenchResult: true },
-        { category: "zk_core", name: "zk_core/prover_check", fn: (n) => wasm.zk_core_prover_check(n), async: false, returnsBenchResult: true },
+        { category: "zk_core", name: "zk_core/prover_check", fn: (n) => wasm.zk_core_prover_check(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         { category: "zk_core", name: "zk_core/verifier_execute", fn: (n) => wasm.zk_core_verifier_execute(n), async: false, returnsBenchResult: true },
-        { category: "zk_core", name: "zk_core/verifier_check", fn: (n) => wasm.zk_core_verifier_check(n), async: false, returnsBenchResult: true },
+        { category: "zk_core", name: "zk_core/verifier_check", fn: (n) => wasm.zk_core_verifier_check(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         { category: "zk_core", name: "zk_core/full_protocol", fn: (n) => wasm.zk_core_full_protocol(n), async: false, returnsBenchResult: true },
         { category: "zk_core", name: "zk_core/check_only", fn: (n) => wasm.zk_core_check_only(n), async: false, returnsBenchResult: true },
         // zk benchmarks (full ZK protocol with VM)
