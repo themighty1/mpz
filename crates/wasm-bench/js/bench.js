@@ -48,7 +48,7 @@ let wasmMemoryRef = null; // Reference to shared WASM memory
 //   Int32[4]: result_ptr (where to write 32-byte result)
 //   Int32[5..7]: reserved
 const TERMS_SIGNAL_OFFSET = 1572864; // 1.5MB offset
-const TERMS_WORKER_COUNT = 8;
+const TERMS_WORKER_COUNT = 16;
 let termsMonitorRunning = false;
 
 // Set reference to shared WASM memory (must be called before monitor can write results)
@@ -135,7 +135,7 @@ export async function startChiRequestMonitor() {
                 })();
             }
         }
-    }, 50); // Check every 50ms
+    }, 1); // Check every 1ms
 
     // Return cleanup function
     return () => {
@@ -658,7 +658,7 @@ export async function startTermsRequestMonitor() {
                 })();
             }
         }
-    }, 50); // Check every 50ms
+    }, 1); // Check every 1ms
 
     // Return cleanup function
     return () => {
