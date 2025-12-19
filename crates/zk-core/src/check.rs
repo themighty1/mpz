@@ -11,7 +11,20 @@ use mpz_core::{
 use serde::{Deserialize, Serialize};
 use zerocopy::IntoBytes;
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
 use crate::vole::{vole_receiver, vole_sender};
+
+/// Extern declaration for JS worker pool chi computation.
+/// JS must provide this function when the WASM module is loaded.
+/// Input: starting chi (16 bytes), count of chis to compute
+/// Returns: Vec<u8> containing count × 16 bytes of computed chis
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    fn compute_chis_parallel(chi: &[u8], count: u32) -> Vec<u8>;
+}
 
 type Result<T> = core::result::Result<T, CheckError>;
 
@@ -56,17 +69,104 @@ impl Check {
         !self.triples.is_empty()
     }
 
-    fn compute_chis(&self, mut chi: Block) -> Vec<Block> {
-        // TODO: Consider using a PRG instead so computing the coefficients
-        // can be done in parallel.
-        let mut chis = Vec::with_capacity(self.triples.len());
-        chis.push(chi);
-        for _ in 1..self.triples.len() {
-            chi = chi.gfmul(chi);
-            chis.push(chi);
+    fn compute_chis(&self, chi: Block) -> Vec<Block> {
+        cfg_if! {
+            if #[cfg(target_arch = "wasm32")] {
+                // WASM: use JS private-memory worker pool
+                let result = compute_chis_parallel(&chi.to_bytes(), self.triples.len() as u32);
+                result
+                    .chunks_exact(16)
+                    .map(|chunk| Block::try_from(chunk).expect("chunk should be 16 bytes"))
+                    .collect()
+            } else if #[cfg(feature = "rayon")] {
+                // Native with rayon: parallel computation using segments
+                use rayon::prelude::*;
+
+                const PARALLELISM: usize = 16;
+                let n = self.triples.len();
+                if n == 0 {
+                    return Vec::new();
+                }
+
+                let segment_size = n.div_ceil(PARALLELISM);
+                let starts = Self::compute_chi_starts(chi, segment_size);
+
+                let segments: Vec<Vec<Block>> = starts
+                    .into_par_iter()
+                    .enumerate()
+                    .map(|(i, start)| {
+                        let seg_start = i * segment_size;
+                        let seg_end = ((i + 1) * segment_size).min(n);
+                        let seg_len = seg_end - seg_start;
+                        if seg_len == 0 {
+                            return Vec::new();
+                        }
+                        let mut segment = Vec::with_capacity(seg_len);
+                        let mut current = start;
+                        segment.push(current);
+                        for _ in 1..seg_len {
+                            current = current.gfmul(current);
+                            segment.push(current);
+                        }
+                        segment
+                    })
+                    .collect();
+
+                segments.into_iter().flatten().collect()
+            } else {
+                // Sequential fallback (native without rayon)
+                let n = self.triples.len();
+                if n == 0 {
+                    return Vec::new();
+                }
+
+                const PARALLELISM: usize = 16;
+                let segment_size = n.div_ceil(PARALLELISM);
+                let starts = Self::compute_chi_starts(chi, segment_size);
+
+                let mut chis = Vec::with_capacity(n);
+                for (i, start) in starts.into_iter().enumerate() {
+                    let seg_start = i * segment_size;
+                    let seg_end = ((i + 1) * segment_size).min(n);
+                    let mut current = start;
+                    for _ in seg_start..seg_end {
+                        chis.push(current);
+                        current = current.gfmul(current);
+                    }
+                }
+                chis.truncate(n);
+                chis
+            }
+        }
+    }
+
+    /// Computes independent starting points for parallel chi computation.
+    /// Bootstrap 16 values via squaring, hash each to get independent starts.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compute_chi_starts(chi: Block, segment_size: usize) -> [Block; 16] {
+        use blake3::Hasher;
+
+        // Bootstrap 16 values via squaring
+        let mut bootstrapped = [Block::ZERO; 16];
+        let mut current = chi;
+        for b in &mut bootstrapped {
+            *b = current;
+            current = current.gfmul(current);
         }
 
-        chis
+        // Hash each to get independent starting points
+        let mut starts = [Block::ZERO; 16];
+        for (i, boot) in bootstrapped.iter().enumerate() {
+            let mut hasher = Hasher::new();
+            hasher.update(&boot.to_bytes());
+            hasher.update(&(i as u64).to_le_bytes());
+            hasher.update(&(segment_size as u64).to_le_bytes());
+            let hash = hasher.finalize();
+            starts[i] = Block::try_from(&hash.as_bytes()[..16])
+                .expect("hash should be at least 16 bytes");
+        }
+
+        starts
     }
 
     /// Executes the prover check, returning `U` and `V` defined in Figure 5,
