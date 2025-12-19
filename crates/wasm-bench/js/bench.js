@@ -118,7 +118,7 @@ export async function startChiRequestMonitor() {
                 })();
             }
         }
-    }, 10); // Check every 10ms
+    }, 50); // Check every 50ms
 
     // Return cleanup function
     return () => {
