@@ -24,11 +24,17 @@ members = [
     "crates/vm-core",
     "crates/zk-core",
     "crates/zk",
+    "crates/wasm-bench",
 ]
 exclude = ["crates/lpn-estimator"]
 resolver = "2"
 
 [profile.release]
+lto = true
+
+[profile.wasm]
+inherits = "release"
+opt-level = 3
 lto = true
 
 [workspace.lints.rust]
@@ -146,3 +152,6 @@ enum-try-as-inner = "0.1.0"
 bitvec = "1.0"
 hashbrown = "0.14.5"
 crossbeam-channel = "0.5"
+
+# wasm
+wasm-bindgen = "0.2"
