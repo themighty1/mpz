@@ -648,6 +648,7 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "ferret_sender", name: "ferret_sender/10m", fn: (n) => wasm.ferret_sender(n, 10000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         // chi_pool benchmarks (private memory worker pool for compute_chis)
         { category: "chi_pool", name: "chi_pool/async_100k", fn: () => benchChiWorkerPool(100000), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "chi_pool", name: "chi_pool/async_400k", fn: () => benchChiWorkerPool(400000), async: true, returnsBenchResult: true, warmup: 1 },
         { category: "chi_pool", name: "chi_pool/async_1m", fn: () => benchChiWorkerPool(1000000), async: true, returnsBenchResult: true, warmup: 1 },
         { category: "chi_pool", name: "chi_pool/async_10m", fn: () => benchChiWorkerPool(10000000), async: true, returnsBenchResult: true, warmup: 1 },
         { category: "chi_pool", name: "chi_pool/sync_100k", fn: () => benchChiSync(100000), async: false, returnsBenchResult: true, warmup: 1 },

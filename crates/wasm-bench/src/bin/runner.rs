@@ -74,6 +74,7 @@ const ALL_BENCHMARKS: &[&str] = &[
     "ferret_sender/1m",
     "ferret_sender/10m",
     "chi_pool/async_100k",
+    "chi_pool/async_400k",
     "chi_pool/async_1m",
     "chi_pool/async_10m",
     "chi_pool/sync_100k",

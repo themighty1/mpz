@@ -63,7 +63,8 @@ pub struct UV {
     v: Block,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub(crate) struct Triple {
     pub(crate) x: Block,
     pub(crate) y: Block,
@@ -327,17 +328,12 @@ impl Check {
         let chis_array: Uint8Array = chis_js.unchecked_into();
         let chis_bytes = chis_array.to_vec();
 
-        // 2. Serialize triples for workers (48 bytes per triple: x, y, z)
+        // 2. Zero-copy cast triples to bytes (48 bytes per triple: x, y, z)
         let macs = mem::take(&mut self.triples);
-        let mut triples_bytes = Vec::with_capacity(macs.len() * 48);
-        for triple in &macs {
-            triples_bytes.extend_from_slice(&triple.x.to_bytes());
-            triples_bytes.extend_from_slice(&triple.y.to_bytes());
-            triples_bytes.extend_from_slice(&triple.z.to_bytes());
-        }
+        let triples_bytes: &[u8] = bytemuck::cast_slice(&macs);
 
         // 3. Compute terms via worker pool (async, no blocking)
-        let uv_js = compute_terms_async(&triples_bytes, &chis_bytes).await;
+        let uv_js = compute_terms_async(triples_bytes, &chis_bytes).await;
         let uv_array: Uint8Array = uv_js.unchecked_into();
         let uv_bytes = uv_array.to_vec();
 
