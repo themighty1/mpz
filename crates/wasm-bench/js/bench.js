@@ -130,15 +130,8 @@ async function computeChisWithWorkerPool(chi, count) {
 }
 
 // Global function called by wasm-bindgen extern
-// This must be in global scope for wasm-bindgen to find it
 globalThis.compute_chis_parallel = function(chi, count) {
-    // Note: wasm-bindgen extern calls are synchronous, but our worker pool is async.
-    // This is a fundamental mismatch. For now, we'll need to use a different approach.
-    // Option 1: Use Atomics.wait (requires SharedArrayBuffer in workers too)
-    // Option 2: Restructure the Rust code to be async
-    // Option 3: Use synchronous fallback for now
-
-    // Synchronous fallback using main thread (no parallelism but correct)
+    // Synchronous fallback using main thread (wasm-bindgen extern is sync)
     const PARALLELISM = 16;
     const n = count;
     if (n === 0) return new Uint8Array(0);
@@ -155,8 +148,6 @@ globalThis.compute_chis_parallel = function(chi, count) {
 
     // Hash each (using sync hash - simplified)
     const starts = bootstrapped.map((boot, i) => {
-        // Simplified hash - XOR with index for now
-        // TODO: Use proper blake3 sync implementation
         const start = new Uint8Array(16);
         for (let j = 0; j < 16; j++) {
             start[j] = boot[j] ^ (i & 0xFF) ^ ((segmentSize >> (j * 2)) & 0xFF);
@@ -180,7 +171,7 @@ globalThis.compute_chis_parallel = function(chi, count) {
     return result;
 };
 
-// Synchronous GF(2^128) multiplication (same as worker version)
+// Synchronous GF(2^128) multiplication
 function gf128_mul_sync(a, b) {
     const a0 = readU64LE(a, 0);
     const a1 = readU64LE(a, 8);
@@ -239,6 +230,42 @@ function writeU64LE(arr, offset, val) {
     }
 }
 
+// Benchmark: chi computation with private memory worker pool
+async function benchChiWorkerPool(gateCount) {
+    if (!chiWorkersReady) {
+        await initChiWorkerPool();
+    }
+
+    const chi = new Uint8Array(16);
+    crypto.getRandomValues(chi);
+
+    const start = performance.now();
+    const result = await computeChisWithWorkerPool(chi, gateCount);
+    const elapsed = performance.now() - start;
+
+    return {
+        elapsed_ms: elapsed,
+        and_gates: BigInt(gateCount),
+        result_bytes: result.length
+    };
+}
+
+// Benchmark: chi computation synchronous (main thread)
+function benchChiSync(gateCount) {
+    const chi = new Uint8Array(16);
+    crypto.getRandomValues(chi);
+
+    const start = performance.now();
+    const result = globalThis.compute_chis_parallel(chi, gateCount);
+    const elapsed = performance.now() - start;
+
+    return {
+        elapsed_ms: elapsed,
+        and_gates: BigInt(gateCount),
+        result_bytes: result.length
+    };
+}
+
 // ============================================================================
 // End Worker Pool Section
 // ============================================================================
@@ -247,8 +274,6 @@ function writeU64LE(arr, offset, val) {
 export async function init(wasmModule) {
     wasm = wasmModule;
     andGateCount = wasm.garble_core_aes128_and_count();
-    // Optionally pre-initialize worker pool
-    // await initChiWorkerPool();
 }
 
 // Progress callback (set by runner)
@@ -400,45 +425,6 @@ function calcStats(name, iterations, samples, times, circuitsPerIter = 1) {
         per_iter_ms: perIter,
         per_iter_us: perIter * 1000,
         throughput: andGatesPerSec, // AND gates per second
-    };
-}
-
-// Benchmark: chi computation with private memory worker pool
-async function benchChiWorkerPool(gateCount) {
-    // Initialize worker pool if needed
-    if (!chiWorkersReady) {
-        await initChiWorkerPool();
-    }
-
-    // Generate a random chi value
-    const chi = new Uint8Array(16);
-    crypto.getRandomValues(chi);
-
-    const start = performance.now();
-    const result = await computeChisWithWorkerPool(chi, gateCount);
-    const elapsed = performance.now() - start;
-
-    return {
-        elapsed_ms: elapsed,
-        and_gates: BigInt(gateCount),
-        result_bytes: result.length
-    };
-}
-
-// Benchmark: chi computation synchronous (main thread)
-function benchChiSync(gateCount) {
-    // Generate a random chi value
-    const chi = new Uint8Array(16);
-    crypto.getRandomValues(chi);
-
-    const start = performance.now();
-    const result = globalThis.compute_chis_parallel(chi, gateCount);
-    const elapsed = performance.now() - start;
-
-    return {
-        elapsed_ms: elapsed,
-        and_gates: BigInt(gateCount),
-        result_bytes: result.length
     };
 }
 
