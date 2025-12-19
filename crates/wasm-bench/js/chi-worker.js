@@ -3,31 +3,21 @@
 
 let wasmModule = null;
 
-// Forward logs to main thread
+// Forward logs to main thread (only used for errors)
 function log(...args) {
     const msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
     self.postMessage({ type: 'log', message: msg });
 }
 
-log('[chi-worker] Script loaded');
-
 // Initialize WASM module
 async function initWasm(wasmUrl) {
     if (wasmModule) return;
 
-    log('[chi-worker] initWasm called with:', wasmUrl);
-
     try {
-        log('[chi-worker] Calling import()...');
         wasmModule = await import(wasmUrl);
-        log('[chi-worker] Module imported, keys:', Object.keys(wasmModule));
-
-        // Initialize - this calls default() to set up the WASM instance
-        log('[chi-worker] Calling default()...');
         await wasmModule.default();
-        log('[chi-worker] WASM initialized, gfmul:', typeof wasmModule.gfmul, 'compute_chi_segment:', typeof wasmModule.compute_chi_segment);
     } catch (err) {
-        log('[chi-worker] Failed to init WASM:', err.message, err.stack);
+        log('[chi-worker] Failed to init WASM:', err.message);
         throw err;
     }
 }
@@ -36,7 +26,6 @@ async function initWasm(wasmUrl) {
 // Segment k starts at chi[k * segmentSize] = seed^(2^(k * segmentSize))
 // To compute seed^(2^N), do N squarings: seed -> seed^2 -> seed^4 -> ... -> seed^(2^N)
 async function computeChiStarts(chi, segmentSize) {
-    log('[chi-worker] computeChiStarts called, chi type:', chi?.constructor?.name, 'len:', chi?.length, 'segmentSize:', segmentSize);
     const PARALLELISM = 16;
 
     const starts = [];
@@ -49,16 +38,10 @@ async function computeChiStarts(chi, segmentSize) {
         // Advance to next segment start by doing segmentSize squarings
         // chi[(seg+1) * segmentSize] = chi[seg * segmentSize]^(2^segmentSize)
         for (let i = 0; i < segmentSize; i++) {
-            try {
-                current = wasmModule.gfmul(current, current);
-            } catch (err) {
-                log(`[chi-worker] gfmul failed at seg=${seg}, i=${i}:`, err.message);
-                throw err;
-            }
+            current = wasmModule.gfmul(current, current);
         }
     }
 
-    log('[chi-worker] computeChiStarts done, computed', starts.length, 'starting points');
     return starts;
 }
 
@@ -80,7 +63,6 @@ self.onmessage = async (e) => {
             const { segmentIndex, start, count, requestId } = data;
             try {
                 const startArr = new Uint8Array(start);
-                // Use WASM compute_chi_segment for fast computation
                 const segment = wasmModule.compute_chi_segment(startArr, count);
                 self.postMessage({
                     type: 'segment_result',
@@ -89,7 +71,7 @@ self.onmessage = async (e) => {
                     requestId
                 });
             } catch (err) {
-                log(`[chi-worker] compute_segment failed:`, err.message);
+                log('[chi-worker] compute_segment failed:', err.message);
                 self.postMessage({ type: 'error', error: err.toString(), requestId });
             }
             break;
