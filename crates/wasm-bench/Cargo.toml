@@ -6,10 +6,17 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["wasm_workers"]
+# Enable async worker pools for check (no rayon/SharedArrayBuffer)
+wasm_workers = ["mpz-zk-core/wasm_workers"]
+# Enable chi_pool for signal buffer approach (for comparison)
+chi_pool = ["mpz-zk-core/chi_pool"]
+
 [dependencies]
 mpz-garble-core = { workspace = true }
 mpz-garble = { workspace = true }
-mpz-zk-core = { workspace = true, features = ["rayon", "chi_pool"] }
+mpz-zk-core = { workspace = true, features = ["rayon"] }
 mpz-zk = { workspace = true, features = ["rayon"] }
 pollster = { workspace = true }
 mpz-circuits = { workspace = true, features = ["aes"] }

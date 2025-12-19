@@ -13,7 +13,7 @@ use zerocopy::IntoBytes;
 
 use crate::vole::{vole_receiver, vole_sender};
 
-// Chi-bridge import for chi_pool feature on wasm32
+// Chi-bridge import for chi_pool feature on wasm32 (blocking version for rayon workers)
 #[cfg(all(target_arch = "wasm32", feature = "chi_pool"))]
 #[wasm_bindgen::prelude::wasm_bindgen(raw_module = "./chi-bridge.js")]
 extern "C" {
@@ -29,6 +29,29 @@ extern "C" {
         count: u32,
         result_ptr: u32,
     );
+}
+
+// Async worker-based imports for wasm32 (no rayon, main thread orchestration)
+#[cfg(all(target_arch = "wasm32", feature = "wasm_workers"))]
+#[wasm_bindgen::prelude::wasm_bindgen(raw_module = "./check-workers.js")]
+extern "C" {
+    /// Request chi computation from JS worker pool (async, returns Promise).
+    ///
+    /// Parameters:
+    ///   chi - 16 byte chi seed
+    ///   count - number of chi values to compute
+    /// Returns: Uint8Array of count * 16 bytes
+    #[wasm_bindgen(js_name = "computeChisAsync")]
+    async fn compute_chis_async(chi: &[u8], count: u32) -> wasm_bindgen::JsValue;
+
+    /// Request compute_terms from JS worker pool (async, returns Promise).
+    ///
+    /// Parameters:
+    ///   triples - flattened triples as bytes (48 bytes per triple: x, y, z each 16 bytes)
+    ///   chis - chi values as bytes (16 bytes each)
+    /// Returns: Uint8Array of 32 bytes (u: 16 bytes, v: 16 bytes)
+    #[wasm_bindgen(js_name = "computeTermsAsync")]
+    async fn compute_terms_async(triples: &[u8], chis: &[u8]) -> wasm_bindgen::JsValue;
 }
 
 type Result<T> = core::result::Result<T, CheckError>;
@@ -251,6 +274,78 @@ impl Check {
             }
         }
 
+        let (a_0, a_1) = vole_receiver(
+            svole_choices.try_into().map_err(|_| CheckError::SVole)?,
+            svole_ev.try_into().map_err(|_| CheckError::SVole)?,
+        );
+
+        u ^= a_0;
+        v ^= a_1;
+
+        transcript.update(&u.to_bytes());
+        transcript.update(&v.to_bytes());
+
+        self.adjust.clear();
+
+        Ok(UV { u, v })
+    }
+
+    /// Async version of check_prover for WASM using worker pools.
+    /// Uses private memory workers for both chi computation and compute_terms.
+    /// No rayon/SharedArrayBuffer contention.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm_workers"))]
+    pub(crate) async fn check_prover_async(
+        &mut self,
+        transcript: &mut Hasher,
+        svole_choices: &[bool],
+        svole_ev: &[Block],
+    ) -> Result<UV> {
+        use js_sys::Uint8Array;
+        use wasm_bindgen::JsCast;
+
+        let adjust_len = self.adjust.len();
+        transcript.update(&self.adjust.as_raw_slice().as_bytes()[..adjust_len.div_ceil(8)]);
+
+        let chi = Block::try_from(&transcript.finalize().as_bytes()[..16])
+            .expect("block should be 16 bytes");
+
+        let n = self.triples.len();
+        if n == 0 {
+            let (a_0, a_1) = vole_receiver(
+                svole_choices.try_into().map_err(|_| CheckError::SVole)?,
+                svole_ev.try_into().map_err(|_| CheckError::SVole)?,
+            );
+            transcript.update(&a_0.to_bytes());
+            transcript.update(&a_1.to_bytes());
+            self.adjust.clear();
+            return Ok(UV { u: a_0, v: a_1 });
+        }
+
+        // 1. Compute chis via worker pool (async, no blocking)
+        let chi_bytes = chi.to_bytes();
+        let chis_js = compute_chis_async(&chi_bytes, n as u32).await;
+        let chis_array: Uint8Array = chis_js.unchecked_into();
+        let chis_bytes = chis_array.to_vec();
+
+        // 2. Serialize triples for workers (48 bytes per triple: x, y, z)
+        let macs = mem::take(&mut self.triples);
+        let mut triples_bytes = Vec::with_capacity(macs.len() * 48);
+        for triple in &macs {
+            triples_bytes.extend_from_slice(&triple.x.to_bytes());
+            triples_bytes.extend_from_slice(&triple.y.to_bytes());
+            triples_bytes.extend_from_slice(&triple.z.to_bytes());
+        }
+
+        // 3. Compute terms via worker pool (async, no blocking)
+        let uv_js = compute_terms_async(&triples_bytes, &chis_bytes).await;
+        let uv_array: Uint8Array = uv_js.unchecked_into();
+        let uv_bytes = uv_array.to_vec();
+
+        // 4. Parse result (u: 16 bytes, v: 16 bytes)
+        let mut u = Block::try_from(&uv_bytes[0..16]).expect("u should be 16 bytes");
+        let mut v = Block::try_from(&uv_bytes[16..32]).expect("v should be 16 bytes");
+
+        // 5. Apply sVOLE (cheap, main thread)
         let (a_0, a_1) = vole_receiver(
             svole_choices.try_into().map_err(|_| CheckError::SVole)?,
             svole_ev.try_into().map_err(|_| CheckError::SVole)?,

@@ -64,12 +64,14 @@ self.onmessage = async (e) => {
             try {
                 const startArr = new Uint8Array(start);
                 const segment = wasmModule.compute_chi_segment(startArr, count);
+                // Transfer the buffer back (zero-copy)
+                const buffer = segment.buffer;
                 self.postMessage({
                     type: 'segment_result',
                     segmentIndex,
-                    data: segment,
+                    data: buffer,
                     requestId
-                });
+                }, [buffer]);
             } catch (err) {
                 log('[chi-worker] compute_segment failed:', err.message);
                 self.postMessage({ type: 'error', error: err.toString(), requestId });

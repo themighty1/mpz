@@ -11,6 +11,8 @@ default = []
 rayon = ["dep:rayon", "mpz-core/rayon", "blake3/rayon", "itybity/rayon"]
 # Use chi worker pool (via JS chi-bridge) instead of rayon for chi computation
 chi_pool = []
+# Use async JS worker pools for entire check (no rayon/SharedArrayBuffer)
+wasm_workers = ["dep:js-sys", "dep:wasm-bindgen-futures"]
 
 [dependencies]
 mpz-core = { workspace = true }
@@ -29,6 +31,8 @@ zerocopy = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { workspace = true }
+js-sys = { version = "0.3", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
 
 [dev-dependencies]
 mpz-circuits = { workspace = true, features = ["aes"] }

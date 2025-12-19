@@ -15,9 +15,11 @@ rustup run nightly \
         --out-dir pkg \
         -- -Zbuild-std=panic_abort,std
 
-# Copy chi-bridge.js to pkg/ (imported by WASM via raw_module)
-echo "Copying chi-bridge.js to pkg/..."
+# Copy JS bridge files to pkg/ (imported by WASM via raw_module)
+echo "Copying JS bridge files to pkg/..."
 cp js/chi-bridge.js pkg/
+cp js/check-workers.js pkg/
+cp js/terms-worker.js pkg/
 
 echo "Done. WASM output in pkg/"
 
@@ -28,3 +30,11 @@ cd ../chi-wasm
 wasm-pack build --target web --release --out-dir ../wasm-bench/pkg-chi
 
 echo "Done. Chi WASM output in pkg-chi/"
+
+# Build terms-wasm (no atomics) for private memory workers
+echo ""
+echo "Building terms-wasm (no atomics) for terms workers..."
+cd ../terms-wasm
+wasm-pack build --target web --release --out-dir ../wasm-bench/pkg-terms
+
+echo "Done. Terms WASM output in pkg-terms/"

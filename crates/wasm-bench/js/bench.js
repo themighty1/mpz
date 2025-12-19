@@ -359,13 +359,16 @@ export async function computeChisWithWorkerPool(chi, count) {
 
     const segments = await segmentPromise;
 
-    // Concatenate segments
+    // Concatenate segments (segments are ArrayBuffers from transfer)
     const result = new Uint8Array(count * 16);
     let offset = 0;
     for (let i = 0; i < PARALLELISM; i++) {
-        if (segments[i] && segments[i].length > 0) {
-            result.set(new Uint8Array(segments[i]), offset);
-            offset += segments[i].length;
+        if (segments[i]) {
+            const segArr = new Uint8Array(segments[i]);
+            if (segArr.length > 0) {
+                result.set(segArr, offset);
+                offset += segArr.length;
+            }
         }
     }
 
@@ -612,6 +615,12 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "zk_prover_core", name: "zk_prover_core/check_200k", fn: (n) => wasm.zk_core_prover_check_200k(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         { category: "zk_prover_core", name: "zk_prover_core/check_400k", fn: (n) => wasm.zk_core_prover_check_400k(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         { category: "zk_prover_core", name: "zk_prover_core/check_600k", fn: (n) => wasm.zk_core_prover_check_600k(n, concurrency), async: true, returnsBenchResult: true, mt: true },
+        { category: "zk_prover_core", name: "zk_prover_core/check_1m", fn: (n) => wasm.zk_core_prover_check_1m(n, concurrency), async: true, returnsBenchResult: true, mt: true },
+        { category: "zk_prover_core", name: "zk_prover_core/check_10m", fn: (n) => wasm.zk_core_prover_check_10m(n, concurrency), async: true, returnsBenchResult: true, mt: true },
+        // Async worker pool benchmarks (wasm_workers feature - no rayon/SharedArrayBuffer)
+        { category: "zk_prover_core", name: "zk_prover_core/check_async_400k", fn: (n) => wasm.zk_core_prover_check_async_400k?.(n), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_prover_core", name: "zk_prover_core/check_async_1m", fn: (n) => wasm.zk_core_prover_check_async_1m?.(n), async: true, returnsBenchResult: true, warmup: 1 },
+        { category: "zk_prover_core", name: "zk_prover_core/check_async_10m", fn: (n) => wasm.zk_core_prover_check_async_10m?.(n), async: true, returnsBenchResult: true, warmup: 1 },
         // zk_verifier_core benchmarks (QuickSilver ZK verifier primitives)
         { category: "zk_verifier_core", name: "zk_verifier_core/execute", fn: (n) => wasm.zk_core_verifier_execute(n), async: false, returnsBenchResult: true },
         { category: "zk_verifier_core", name: "zk_verifier_core/check_200k", fn: (n) => wasm.zk_core_verifier_check_200k(n, concurrency), async: true, returnsBenchResult: true, mt: true },
@@ -619,6 +628,7 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "zk_verifier_core", name: "zk_verifier_core/check_600k", fn: (n) => wasm.zk_core_verifier_check_600k(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         // zk_prover benchmarks
         { category: "zk_prover", name: "zk_prover/100k", fn: (n) => wasm.zk_prover(n, 100000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "zk_prover", name: "zk_prover/400k", fn: (n) => wasm.zk_prover(n, 400000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         { category: "zk_prover", name: "zk_prover/1m", fn: (n) => wasm.zk_prover(n, 1000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         { category: "zk_prover", name: "zk_prover/10m", fn: (n) => wasm.zk_prover(n, 10000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         // zk_verifier benchmarks

@@ -80,6 +80,34 @@ impl Prover {
             .map_err(From::from)
     }
 
+    /// Async version of consistency check for WASM using worker pools.
+    /// Uses private memory workers for both chi and terms computation.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm_workers"))]
+    pub async fn check_async(
+        &mut self,
+        transcript: &mut Hasher,
+        svole_choices: &[bool],
+        svole_ev: &[Block],
+    ) -> Result<UV> {
+        if Arc::strong_count(&self.check) > 1 {
+            return Err(ErrorRepr::Inprogress.into());
+        }
+
+        // Take ownership of Check to avoid holding mutex across await
+        let mut check = std::mem::take(&mut *self.check.lock().unwrap());
+        // Mutex is now released
+
+        // Await without holding any lock
+        let result = check
+            .check_prover_async(transcript, svole_choices, svole_ev)
+            .await;
+
+        // Put the (now empty) Check back
+        *self.check.lock().unwrap() = check;
+
+        result.map_err(From::from)
+    }
+
     /// Returns the number of pending gates that need to be checked.
     pub fn pending(&self) -> usize {
         self.check.lock().unwrap().total()

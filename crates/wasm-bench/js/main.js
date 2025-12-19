@@ -2,6 +2,7 @@
 
 import init, * as wasm from '../pkg/mpz_wasm_bench.js';
 import * as bench from './bench.js';
+import * as checkWorkers from './check-workers.js';
 
 // Capture console logs for headless runner
 window.__consoleLogs = [];
@@ -123,6 +124,11 @@ async function main() {
                     await bench.initChiWorkerPool();
                     await bench.startChiRequestMonitor();
                     console.log('Chi infrastructure ready');
+
+                    // Initialize terms worker pool for wasm_workers mode
+                    console.log('Initializing terms worker pool...');
+                    await checkWorkers.initTermsWorkerPool();
+                    console.log('Terms worker pool ready');
                 }
             } else {
                 console.log('Skipping thread pool init (no MT benchmarks selected)');

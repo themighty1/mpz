@@ -275,6 +275,133 @@ async fn prover_check_impl(n: u32, concurrency: u32, threshold: usize) -> BenchR
     }
 }
 
+/// Internal: benchmark prover check using async worker pools (no rayon).
+/// Uses wasm_workers feature for chi and terms computation.
+#[cfg(all(target_arch = "wasm32", feature = "wasm_workers"))]
+async fn prover_check_impl_async(n: u32, threshold: usize) -> BenchResult {
+    let global = js_sys::global();
+    let performance: web_sys::Performance = js_sys::Reflect::get(&global, &"performance".into())
+        .expect("performance should exist")
+        .unchecked_into();
+
+    let circuit: Arc<Circuit> = AES128.clone();
+    let and_count = circuit.and_count();
+    let inputs_per_circuit = circuit.inputs().len();
+
+    let circuit_count = threshold.div_ceil(and_count);
+    let actual_gates = circuit_count * and_count;
+
+    // Setup correlations
+    let mut rng = StdRng::seed_from_u64(0);
+    let delta = Delta::random(&mut rng);
+    let mut rcot = IdealRCOT::new(rng.random(), delta.into_inner());
+
+    // Input correlations
+    let total_inputs = inputs_per_circuit * circuit_count;
+    rcot.alloc(total_inputs);
+    rcot.flush().unwrap();
+    let (
+        RCOTSenderOutput { .. },
+        RCOTReceiverOutput {
+            msgs: mut macs,
+            choices,
+            ..
+        },
+    ) = rcot.transfer(total_inputs).unwrap();
+    macs.iter_mut()
+        .zip(&choices)
+        .for_each(|(mac, &choice)| mac.set_lsb(choice));
+    let input_macs = Mac::from_blocks(macs);
+
+    // Gate correlations
+    let total_and_gates = and_count * circuit_count;
+    rcot.alloc(total_and_gates);
+    rcot.flush().unwrap();
+    let (
+        RCOTSenderOutput { .. },
+        RCOTReceiverOutput {
+            choices: gate_masks,
+            msgs: macs,
+            ..
+        },
+    ) = rcot.transfer(total_and_gates).unwrap();
+    let gate_macs = Mac::from_blocks(macs);
+
+    // SVOLE for check phase
+    rcot.alloc(128);
+    rcot.flush().unwrap();
+    let (
+        RCOTSenderOutput { .. },
+        RCOTReceiverOutput {
+            choices: svole_choices,
+            msgs: svole_ev,
+            ..
+        },
+    ) = rcot.transfer(128).unwrap();
+
+    let mut total_check_time = 0.0;
+
+    for _ in 0..n {
+        // Setup (untimed): run execute for all circuits
+        let mut prover = Prover::default();
+
+        for i in 0..circuit_count {
+            let input_start = i * inputs_per_circuit;
+            let input_end = input_start + inputs_per_circuit;
+            let gate_start = i * and_count;
+            let gate_end = gate_start + and_count;
+
+            let mut prover_exec = prover
+                .execute(
+                    circuit.clone(),
+                    &input_macs[input_start..input_end],
+                    &gate_masks[gate_start..gate_end],
+                    &gate_macs[gate_start..gate_end],
+                )
+                .unwrap();
+
+            // Consume adjustments (not timed)
+            for _ in prover_exec.iter() {}
+            let _ = prover_exec.finish().unwrap();
+        }
+
+        // Timed: only check phase (uses async worker pools)
+        let mut prover_transcript = Hasher::default();
+        let check_start = performance.now();
+        let _uv = prover
+            .check_async(&mut prover_transcript, &svole_choices, &svole_ev)
+            .await
+            .unwrap();
+        total_check_time += performance.now() - check_start;
+    }
+
+    BenchResult {
+        elapsed_ms: total_check_time,
+        and_gates: n as u64 * actual_gates as u64,
+    }
+}
+
+/// Benchmark ZK prover check phase with async workers (400K gates).
+#[cfg(all(target_arch = "wasm32", feature = "wasm_workers"))]
+#[wasm_bindgen]
+pub async fn zk_core_prover_check_async_400k(n: u32) -> BenchResult {
+    prover_check_impl_async(n, 400_000).await
+}
+
+/// Benchmark ZK prover check phase with async workers (1M gates).
+#[cfg(all(target_arch = "wasm32", feature = "wasm_workers"))]
+#[wasm_bindgen]
+pub async fn zk_core_prover_check_async_1m(n: u32) -> BenchResult {
+    prover_check_impl_async(n, 1_000_000).await
+}
+
+/// Benchmark ZK prover check phase with async workers (10M gates).
+#[cfg(all(target_arch = "wasm32", feature = "wasm_workers"))]
+#[wasm_bindgen]
+pub async fn zk_core_prover_check_async_10m(n: u32) -> BenchResult {
+    prover_check_impl_async(n, 10_000_000).await
+}
+
 /// Benchmark ZK prover check phase with 200K gates.
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
@@ -294,4 +421,18 @@ pub async fn zk_core_prover_check_400k(n: u32, concurrency: u32) -> BenchResult 
 #[wasm_bindgen]
 pub async fn zk_core_prover_check_600k(n: u32, concurrency: u32) -> BenchResult {
     prover_check_impl(n, concurrency, 600_000).await
+}
+
+/// Benchmark ZK prover check phase with 1M gates (rayon + chi_pool).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn zk_core_prover_check_1m(n: u32, concurrency: u32) -> BenchResult {
+    prover_check_impl(n, concurrency, 1_000_000).await
+}
+
+/// Benchmark ZK prover check phase with 10M gates (rayon + chi_pool).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn zk_core_prover_check_10m(n: u32, concurrency: u32) -> BenchResult {
+    prover_check_impl(n, concurrency, 10_000_000).await
 }
