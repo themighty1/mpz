@@ -41,18 +41,24 @@ self.onmessage = async (e) => {
             // Compute terms for a batch of triples
             // Input: triples (ArrayBuffer, 48 bytes each), chis (ArrayBuffer, 16 bytes each)
             // Output: partial (u, v) as 32 bytes
-            const { triples, chis, requestId } = data;
+            const { triples, chis, requestId, workerIndex, dispatchTime } = data;
             try {
                 // Wrap transferred ArrayBuffers as Uint8Array views
                 const triplesArr = new Uint8Array(triples);
                 const chisArr = new Uint8Array(chis);
 
+                const startTime = performance.now();
                 const result = wasmModule.compute_terms_batch(triplesArr, chisArr);
+                const elapsedMs = performance.now() - startTime;
 
                 self.postMessage({
                     type: 'terms_result',
                     data: result,
-                    requestId
+                    requestId,
+                    elapsedMs,
+                    tripleCount: triplesArr.length / 48,
+                    workerIndex,
+                    dispatchTime
                 });
             } catch (err) {
                 log('[terms-worker] compute_terms failed:', err.message);

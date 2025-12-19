@@ -48,7 +48,7 @@ let wasmMemoryRef = null; // Reference to shared WASM memory
 //   Int32[4]: result_ptr (where to write 32-byte result)
 //   Int32[5..7]: reserved
 const TERMS_SIGNAL_OFFSET = 1572864; // 1.5MB offset
-const TERMS_WORKER_COUNT = 16;
+const TERMS_WORKER_COUNT = 4;
 let termsMonitorRunning = false;
 
 // Set reference to shared WASM memory (must be called before monitor can write results)
@@ -483,13 +483,22 @@ export async function initTermsWorkerPool(customWasmUrl = null) {
                         reject(new Error(e.data.error));
                     }
                 } else if (e.data.type === 'terms_result') {
+                    const receiveTime = performance.now();
                     const pending = pendingTermsRequests.get(e.data.requestId);
                     if (pending) {
                         pending.results.push(e.data.data);
+                        const roundTrip = receiveTime - e.data.dispatchTime;
+                        pending.workerTimes.push({
+                            workerId: e.data.workerIndex,
+                            elapsedMs: e.data.elapsedMs,
+                            tripleCount: e.data.tripleCount,
+                            roundTripMs: roundTrip,
+                            overheadMs: roundTrip - e.data.elapsedMs
+                        });
                         pending.completed++;
                         if (pending.completed === pending.total) {
                             pendingTermsRequests.delete(e.data.requestId);
-                            pending.resolve(pending.results);
+                            pending.resolve({ results: pending.results, workerTimes: pending.workerTimes });
                         }
                     }
                 }
@@ -532,16 +541,20 @@ async function computeTermsWithWorkerPool(triples, chis, count) {
     const remainder = count % workersToUse;
 
     const requestId = termsRequestId++;
+    const dispatchStartTime = performance.now();
     const resultPromise = new Promise((resolve, reject) => {
         pendingTermsRequests.set(requestId, {
             resolve,
             reject,
             results: [],
+            workerTimes: [],
+            dispatchTimes: [],
             completed: 0,
             total: workersToUse
         });
     });
 
+    let totalSliceTime = 0;
     let offset = 0;
     for (let i = 0; i < workersToUse; i++) {
         // Distribute remainder evenly
@@ -554,15 +567,20 @@ async function computeTermsWithWorkerPool(triples, chis, count) {
         const chiStart = offset * 16;
         const chiEnd = (offset + segmentCount) * 16;
 
+        const sliceStart = performance.now();
         const segTriples = triples.slice(tripleStart, tripleEnd);
         const segChis = chis.slice(chiStart, chiEnd);
+        totalSliceTime += performance.now() - sliceStart;
 
+        const workerDispatchTime = performance.now();
         termsWorkers[i].postMessage({
             type: 'compute_terms',
             data: {
                 triples: segTriples.buffer,
                 chis: segChis.buffer,
-                requestId
+                requestId,
+                workerIndex: i,
+                dispatchTime: workerDispatchTime
             }
         }, [segTriples.buffer, segChis.buffer]);
 
@@ -570,7 +588,27 @@ async function computeTermsWithWorkerPool(triples, chis, count) {
     }
 
     // Wait for all workers to complete
-    const results = await resultPromise;
+    const { results, workerTimes } = await resultPromise;
+    const totalWallTime = performance.now() - dispatchStartTime;
+
+    // Print timing stats
+    const totalWorkerTime = workerTimes.reduce((sum, w) => sum + w.elapsedMs, 0);
+    const maxWorkerTime = Math.max(...workerTimes.map(w => w.elapsedMs));
+    const minWorkerTime = Math.min(...workerTimes.map(w => w.elapsedMs));
+    const totalTriples = workerTimes.reduce((sum, w) => sum + w.tripleCount, 0);
+
+    const maxRoundTrip = Math.max(...workerTimes.map(w => w.roundTripMs));
+    const minRoundTrip = Math.min(...workerTimes.map(w => w.roundTripMs));
+    const avgRoundTrip = workerTimes.reduce((sum, w) => sum + w.roundTripMs, 0) / workerTimes.length;
+    const avgOverhead = workerTimes.reduce((sum, w) => sum + w.overheadMs, 0) / workerTimes.length;
+    const maxOverhead = Math.max(...workerTimes.map(w => w.overheadMs));
+
+    console.log(`[terms-pool] ${count} triples, ${workersToUse} workers:`);
+    console.log(`  Wall time: ${totalWallTime.toFixed(2)}ms, Slice time: ${totalSliceTime.toFixed(2)}ms`);
+    console.log(`  Compute: min=${minWorkerTime.toFixed(2)}ms, max=${maxWorkerTime.toFixed(2)}ms`);
+    console.log(`  RoundTrip: min=${minRoundTrip.toFixed(2)}ms, max=${maxRoundTrip.toFixed(2)}ms, avg=${avgRoundTrip.toFixed(2)}ms`);
+    console.log(`  Per-worker overhead (roundtrip - compute): avg=${avgOverhead.toFixed(2)}ms, max=${maxOverhead.toFixed(2)}ms`);
+    console.log(`  Throughput: ${(totalTriples / maxWorkerTime * 1000 / 1e6).toFixed(2)}M triples/s`);
 
     // XOR all partial results together
     const finalResult = new Uint8Array(32);
@@ -637,13 +675,22 @@ export async function startTermsRequestMonitor() {
                 const chisCopy = new Uint8Array(chis);
 
                 // Process asynchronously
+                const monitorSeenTime = performance.now();
                 (async () => {
                     try {
+                        const beforeCompute = performance.now();
                         const result = await computeTermsWithWorkerPool(triplesCopy, chisCopy, count);
+                        const afterCompute = performance.now();
 
                         // Write result to shared WASM memory at resultPtr
                         const wasmView = new Uint8Array(wasmMemoryRef.buffer);
                         wasmView.set(result, resultPtr);
+
+                        const beforeNotify = performance.now();
+                        console.log(`[terms-monitor] Timing breakdown:`);
+                        console.log(`  Copy time: ${(beforeCompute - monitorSeenTime).toFixed(2)}ms`);
+                        console.log(`  computeTermsWithWorkerPool: ${(afterCompute - beforeCompute).toFixed(2)}ms`);
+                        console.log(`  Write result: ${(beforeNotify - afterCompute).toFixed(2)}ms`);
 
                         // Signal completion
                         Atomics.store(slotView, 0, 2); // result_ready
