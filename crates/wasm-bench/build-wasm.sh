@@ -23,18 +23,18 @@ cp js/terms-worker.js pkg/
 
 echo "Done. WASM output in pkg/"
 
-# Build chi-wasm (no atomics) for private memory workers
+# Build chi-wasm (no atomics, with simd128) for private memory workers
 echo ""
-echo "Building chi-wasm (no atomics) for chi workers..."
+echo "Building chi-wasm (simd128, no atomics) for chi workers..."
 cd ../chi-wasm
-wasm-pack build --target web --release --out-dir ../wasm-bench/pkg-chi
+RUSTFLAGS='-Ctarget-feature=+simd128' wasm-pack build --target web --release --out-dir ../wasm-bench/pkg-chi
 
 echo "Done. Chi WASM output in pkg-chi/"
 
-# Build terms-wasm (no atomics) for private memory workers
+# Build terms-wasm (no atomics, with simd128) for private memory workers
 echo ""
-echo "Building terms-wasm (no atomics) for terms workers..."
+echo "Building terms-wasm (simd128, no atomics) for terms workers..."
 cd ../terms-wasm
-wasm-pack build --target web --release --out-dir ../wasm-bench/pkg-terms
+RUSTFLAGS='-Ctarget-feature=+simd128' wasm-pack build --target web --release --out-dir ../wasm-bench/pkg-terms
 
 echo "Done. Terms WASM output in pkg-terms/"

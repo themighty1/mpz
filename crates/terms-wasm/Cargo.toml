@@ -7,7 +7,5 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-mpz-core = { workspace = true }
 wasm-bindgen = { workspace = true }
 getrandom = { version = "0.3", features = ["wasm_js"] }
-bytemuck = { workspace = true }
