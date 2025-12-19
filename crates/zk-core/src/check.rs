@@ -13,7 +13,8 @@ use zerocopy::IntoBytes;
 
 use crate::vole::{vole_receiver, vole_sender};
 
-// Chi-bridge import for chi_pool feature on wasm32 (blocking version for rayon workers)
+// Chi-bridge import for chi_pool feature on wasm32 (blocking version for rayon
+// workers)
 #[cfg(all(target_arch = "wasm32", feature = "chi_pool"))]
 #[wasm_bindgen::prelude::wasm_bindgen(raw_module = "./chi-bridge.js")]
 extern "C" {
@@ -26,6 +27,29 @@ extern "C" {
     fn request_chi_computation(
         memory: wasm_bindgen::JsValue,
         chi_ptr: u32,
+        count: u32,
+        result_ptr: u32,
+    );
+}
+
+// Terms-bridge import for terms_pool feature on wasm32 (blocking version for
+// rayon workers)
+#[cfg(all(target_arch = "wasm32", feature = "terms_pool"))]
+#[wasm_bindgen::prelude::wasm_bindgen(raw_module = "./terms-bridge.js")]
+extern "C" {
+    /// Request terms computation from JS coordinator.
+    /// This function BLOCKS via Atomics.wait() until result is ready.
+    ///
+    /// Parameters:
+    ///   memory - WASM memory object (from wasm_bindgen::memory())
+    ///   triples_ptr - pointer to triples in WASM memory (48 bytes per triple)
+    ///   chis_ptr - pointer to chis in WASM memory (16 bytes per chi)
+    ///   count - number of triples
+    ///   result_ptr - where to write 32-byte result (u: 16 bytes, v: 16 bytes)
+    fn request_terms_computation(
+        memory: wasm_bindgen::JsValue,
+        triples_ptr: u32,
+        chis_ptr: u32,
         count: u32,
         result_ptr: u32,
     );
@@ -47,8 +71,8 @@ extern "C" {
     /// Request compute_terms from JS worker pool (async, returns Promise).
     ///
     /// Parameters:
-    ///   triples - flattened triples as bytes (48 bytes per triple: x, y, z each 16 bytes)
-    ///   chis - chi values as bytes (16 bytes each)
+    ///   triples - flattened triples as bytes (48 bytes per triple: x, y, z
+    /// each 16 bytes)   chis - chi values as bytes (16 bytes each)
     /// Returns: Uint8Array of 32 bytes (u: 16 bytes, v: 16 bytes)
     #[wasm_bindgen(js_name = "computeTermsAsync")]
     async fn compute_terms_async(triples: &[u8], chis: &[u8]) -> wasm_bindgen::JsValue;
@@ -127,13 +151,9 @@ impl Check {
         let result_ptr = result_bytes.as_mut_ptr() as u32;
 
         // Call chi-bridge - blocks until result is ready
-        // Pass wasm_bindgen::memory() so it works in any context (main thread or workers)
-        request_chi_computation(
-            wasm_bindgen::memory(),
-            chi_ptr,
-            n as u32,
-            result_ptr,
-        );
+        // Pass wasm_bindgen::memory() so it works in any context (main thread or
+        // workers)
+        request_chi_computation(wasm_bindgen::memory(), chi_ptr, n as u32, result_ptr);
 
         // Convert result bytes to Vec<Block>
         result_bytes
@@ -222,6 +242,46 @@ impl Check {
         starts
     }
 
+    /// Compute terms via terms worker pool (blocking call via Atomics.wait).
+    /// This offloads the expensive gfmul operations to private memory workers
+    /// using fast polyval soft64 implementation.
+    #[cfg(all(target_arch = "wasm32", feature = "terms_pool"))]
+    fn compute_terms_via_pool(triples: &[Triple], chis: &[Block]) -> (Block, Block) {
+        let n = triples.len();
+        if n == 0 {
+            return (Block::ZERO, Block::ZERO);
+        }
+
+        // Zero-copy cast triples to bytes (48 bytes per triple: x, y, z)
+        let triples_bytes: &[u8] = bytemuck::cast_slice(triples);
+
+        // Convert chis to bytes (16 bytes per chi)
+        let chis_bytes: Vec<u8> = chis.iter().flat_map(|c| c.to_bytes()).collect();
+
+        // Allocate result buffer (32 bytes: u, v)
+        let mut result_bytes = [0u8; 32];
+
+        // Get pointers - these are addresses in WASM linear memory
+        let triples_ptr = triples_bytes.as_ptr() as u32;
+        let chis_ptr = chis_bytes.as_ptr() as u32;
+        let result_ptr = result_bytes.as_mut_ptr() as u32;
+
+        // Call terms-bridge - blocks until result is ready
+        request_terms_computation(
+            wasm_bindgen::memory(),
+            triples_ptr,
+            chis_ptr,
+            n as u32,
+            result_ptr,
+        );
+
+        // Parse result (u: 16 bytes, v: 16 bytes)
+        let u = Block::try_from(&result_bytes[0..16]).expect("u should be 16 bytes");
+        let v = Block::try_from(&result_bytes[16..32]).expect("v should be 16 bytes");
+
+        (u, v)
+    }
+
     /// Executes the prover check, returning `U` and `V` defined in Figure 5,
     /// Step 7.b.
     pub(crate) fn check_prover(
@@ -252,7 +312,12 @@ impl Check {
         let chis = self.compute_chis(chi);
         let macs = mem::take(&mut self.triples);
         cfg_if! {
-            if #[cfg(feature = "rayon")] {
+            if #[cfg(all(target_arch = "wasm32", feature = "terms_pool"))] {
+                // Use terms worker pool via terms-bridge (blocking call)
+                // This offloads the expensive gfmul operations to private memory workers
+                // using fast polyval soft64 implementation
+                let (mut u, mut v) = Self::compute_terms_via_pool(&macs, &chis);
+            } else if #[cfg(feature = "rayon")] {
                 use rayon::prelude::*;
 
                 let (mut u, mut v) = macs

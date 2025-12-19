@@ -12,11 +12,15 @@ default = ["wasm_workers"]
 wasm_workers = ["mpz-zk-core/wasm_workers"]
 # Enable chi_pool for signal buffer approach (for comparison)
 chi_pool = ["mpz-zk-core/chi_pool"]
+# Enable terms_pool for signal buffer approach (offload gfmul to polyval workers)
+terms_pool = ["mpz-zk-core/terms_pool"]
+# Enable both pools together
+pools = ["chi_pool", "terms_pool"]
 
 [dependencies]
 mpz-garble-core = { workspace = true }
 mpz-garble = { workspace = true }
-mpz-zk-core = { workspace = true, features = ["rayon"] }
+mpz-zk-core = { workspace = true, features = ["rayon", "chi_pool", "terms_pool"] }
 mpz-zk = { workspace = true, features = ["rayon"] }
 pollster = { workspace = true }
 mpz-circuits = { workspace = true, features = ["aes"] }

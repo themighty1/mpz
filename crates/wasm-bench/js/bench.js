@@ -34,6 +34,23 @@ const SLOT_SIZE = 32; // bytes per slot
 let chiMonitorRunning = false;
 let wasmMemoryRef = null; // Reference to shared WASM memory
 
+// ============================================================================
+// Terms Signal Region in WASM Shared Memory
+// ============================================================================
+// Similar to chi signal region but for compute_terms requests.
+// Uses different offset (1.5MB) to avoid conflicts with chi region.
+//
+// Multi-slot layout - each slot is 32 bytes:
+//   Int32[0]: status (0=idle, 1=pending, 2=ready, 3=error)
+//   Int32[1]: triples_ptr (pointer to triples in WASM memory)
+//   Int32[2]: chis_ptr (pointer to chis in WASM memory)
+//   Int32[3]: count (number of triples)
+//   Int32[4]: result_ptr (where to write 32-byte result)
+//   Int32[5..7]: reserved
+const TERMS_SIGNAL_OFFSET = 1572864; // 1.5MB offset
+const TERMS_WORKER_COUNT = 8;
+let termsMonitorRunning = false;
+
 // Set reference to shared WASM memory (must be called before monitor can write results)
 export function setWasmMemory(memory) {
     wasmMemoryRef = memory;
@@ -413,6 +430,245 @@ function benchChiSync(gateCount) {
 }
 
 // ============================================================================
+// Private Memory Worker Pool for Terms Computation
+// ============================================================================
+
+let termsWorkers = [];
+let termsWorkersReady = false;
+let pendingTermsRequests = new Map();
+let termsRequestId = 0;
+let termsWasmUrl = null;
+
+// Initialize the terms worker pool
+export async function initTermsWorkerPool(customWasmUrl = null) {
+    if (customWasmUrl) termsWasmUrl = customWasmUrl;
+    if (termsWorkersReady) return;
+    if (!termsWasmUrl) {
+        termsWasmUrl = new URL('../pkg-terms/terms_wasm.js', import.meta.url).href;
+    }
+
+    console.log(`[initTermsWorkerPool] Starting with ${TERMS_WORKER_COUNT} workers`);
+    console.log(`[initTermsWorkerPool] termsWasmUrl: ${termsWasmUrl}`);
+
+    const workerUrl = new URL('./terms-worker.js', import.meta.url);
+    console.log(`[initTermsWorkerPool] workerUrl: ${workerUrl}`);
+
+    const initPromises = [];
+    for (let i = 0; i < TERMS_WORKER_COUNT; i++) {
+        console.log(`[initTermsWorkerPool] Creating worker ${i}`);
+        const worker = new Worker(workerUrl, { type: 'module' });
+
+        const readyPromise = new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                reject(new Error(`Terms worker ${i} timed out after 30s`));
+            }, 30000);
+
+            worker.onmessage = (e) => {
+                if (e.data.type === 'log') {
+                    console.log(`[terms-worker ${i}]`, e.data.message);
+                } else if (e.data.type === 'ready') {
+                    clearTimeout(timeout);
+                    console.log(`[initTermsWorkerPool] Worker ${i} ready`);
+                    resolve();
+                } else if (e.data.type === 'error') {
+                    clearTimeout(timeout);
+                    console.error(`[terms-worker ${i}] Error:`, e.data.error);
+                    if (e.data.requestId !== undefined) {
+                        const pending = pendingTermsRequests.get(e.data.requestId);
+                        if (pending) {
+                            pendingTermsRequests.delete(e.data.requestId);
+                            pending.reject(new Error(e.data.error));
+                        }
+                    } else {
+                        reject(new Error(e.data.error));
+                    }
+                } else if (e.data.type === 'terms_result') {
+                    const pending = pendingTermsRequests.get(e.data.requestId);
+                    if (pending) {
+                        pending.results.push(e.data.data);
+                        pending.completed++;
+                        if (pending.completed === pending.total) {
+                            pendingTermsRequests.delete(e.data.requestId);
+                            pending.resolve(pending.results);
+                        }
+                    }
+                }
+            };
+
+            worker.onerror = (e) => {
+                clearTimeout(timeout);
+                console.error(`[terms-worker ${i}] Worker error:`, e.message);
+                reject(new Error(`Terms worker ${i} error: ${e.message}`));
+            };
+        });
+
+        worker.postMessage({ type: 'init', data: { wasmUrl: termsWasmUrl } });
+        termsWorkers.push(worker);
+        initPromises.push(readyPromise);
+    }
+
+    console.log(`[initTermsWorkerPool] Waiting for all workers...`);
+    await Promise.all(initPromises);
+    termsWorkersReady = true;
+    console.log(`[initTermsWorkerPool] All ${TERMS_WORKER_COUNT} workers ready`);
+}
+
+// Dispatch terms computation to workers and combine results
+// triples: Uint8Array (48 bytes per triple: x, y, z)
+// chis: Uint8Array (16 bytes per chi)
+// Returns: Uint8Array (32 bytes: u, v)
+async function computeTermsWithWorkerPool(triples, chis, count) {
+    if (!termsWorkersReady) {
+        await initTermsWorkerPool();
+    }
+
+    if (count === 0) {
+        return new Uint8Array(32);
+    }
+
+    // Split work across workers
+    const workersToUse = Math.min(TERMS_WORKER_COUNT, count);
+    const baseSegment = Math.floor(count / workersToUse);
+    const remainder = count % workersToUse;
+
+    const requestId = termsRequestId++;
+    const resultPromise = new Promise((resolve, reject) => {
+        pendingTermsRequests.set(requestId, {
+            resolve,
+            reject,
+            results: [],
+            completed: 0,
+            total: workersToUse
+        });
+    });
+
+    let offset = 0;
+    for (let i = 0; i < workersToUse; i++) {
+        // Distribute remainder evenly
+        const segmentCount = baseSegment + (i < remainder ? 1 : 0);
+        if (segmentCount === 0) continue;
+
+        // Extract segment data
+        const tripleStart = offset * 48;
+        const tripleEnd = (offset + segmentCount) * 48;
+        const chiStart = offset * 16;
+        const chiEnd = (offset + segmentCount) * 16;
+
+        const segTriples = triples.slice(tripleStart, tripleEnd);
+        const segChis = chis.slice(chiStart, chiEnd);
+
+        termsWorkers[i].postMessage({
+            type: 'compute_terms',
+            data: {
+                triples: segTriples.buffer,
+                chis: segChis.buffer,
+                requestId
+            }
+        }, [segTriples.buffer, segChis.buffer]);
+
+        offset += segmentCount;
+    }
+
+    // Wait for all workers to complete
+    const results = await resultPromise;
+
+    // XOR all partial results together
+    const finalResult = new Uint8Array(32);
+    for (const partial of results) {
+        const partialArr = new Uint8Array(partial);
+        for (let i = 0; i < 32; i++) {
+            finalResult[i] ^= partialArr[i];
+        }
+    }
+
+    return finalResult;
+}
+
+// Start the terms request monitor (runs in main thread event loop)
+// This watches for requests from web-spawn workers and dispatches to terms pool
+export async function startTermsRequestMonitor() {
+    if (termsMonitorRunning) return;
+
+    if (!wasmMemoryRef) {
+        throw new Error('WASM memory not set. Call setWasmMemory() first.');
+    }
+
+    termsMonitorRunning = true;
+
+    if (!termsWorkersReady) {
+        await initTermsWorkerPool();
+    }
+
+    // Initialize all slots to idle
+    for (let i = 0; i < NUM_SLOTS; i++) {
+        const slotOffset = TERMS_SIGNAL_OFFSET + i * SLOT_SIZE;
+        const slotView = new Int32Array(wasmMemoryRef.buffer, slotOffset, 8);
+        Atomics.store(slotView, 0, 0);
+    }
+
+    console.log(`[bench.js] Terms request monitor started (${NUM_SLOTS} slots at offset ${TERMS_SIGNAL_OFFSET})`);
+
+    // Track in-flight requests per slot to avoid double-processing
+    const processingSlots = new Set();
+
+    // Use setInterval to check for requests (can't block main thread)
+    const checkInterval = setInterval(() => {
+        for (let i = 0; i < NUM_SLOTS; i++) {
+            if (processingSlots.has(i)) continue;
+
+            const slotOffset = TERMS_SIGNAL_OFFSET + i * SLOT_SIZE;
+            const slotView = new Int32Array(wasmMemoryRef.buffer, slotOffset, 8);
+            const status = Atomics.load(slotView, 0);
+
+            if (status === 1) { // request_pending
+                processingSlots.add(i);
+
+                const triplesPtr = Atomics.load(slotView, 1);
+                const chisPtr = Atomics.load(slotView, 2);
+                const count = Atomics.load(slotView, 3);
+                const resultPtr = Atomics.load(slotView, 4);
+
+                // Read triples and chis from WASM memory
+                const triples = new Uint8Array(wasmMemoryRef.buffer, triplesPtr, count * 48);
+                const chis = new Uint8Array(wasmMemoryRef.buffer, chisPtr, count * 16);
+
+                // Copy data since we're passing to workers
+                const triplesCopy = new Uint8Array(triples);
+                const chisCopy = new Uint8Array(chis);
+
+                // Process asynchronously
+                (async () => {
+                    try {
+                        const result = await computeTermsWithWorkerPool(triplesCopy, chisCopy, count);
+
+                        // Write result to shared WASM memory at resultPtr
+                        const wasmView = new Uint8Array(wasmMemoryRef.buffer);
+                        wasmView.set(result, resultPtr);
+
+                        // Signal completion
+                        Atomics.store(slotView, 0, 2); // result_ready
+                        Atomics.notify(slotView, 0);
+                    } catch (err) {
+                        console.error(`[terms-monitor] Slot ${i} error:`, err);
+                        Atomics.store(slotView, 0, 3); // error
+                        Atomics.notify(slotView, 0);
+                    } finally {
+                        processingSlots.delete(i);
+                    }
+                })();
+            }
+        }
+    }, 50); // Check every 50ms
+
+    // Return cleanup function
+    return () => {
+        clearInterval(checkInterval);
+        termsMonitorRunning = false;
+        console.log('[bench.js] Terms request monitor stopped');
+    };
+}
+
+// ============================================================================
 // End Worker Pool Section
 // ============================================================================
 
@@ -444,6 +700,20 @@ export async function init(wasmModule, wasmModuleUrl = null) {
             console.log('[bench.js] Chi infrastructure ready');
         } catch (e) {
             console.warn('[bench.js] Chi bridge not available:', e.message);
+        }
+
+        // Initialize terms-bridge for terms_pool feature
+        try {
+            const termsBridge = await import('./terms-bridge.js');
+            // terms-bridge doesn't need memory set - it receives memory as parameter
+            console.log('[bench.js] Terms bridge module loaded');
+
+            // Start terms request monitor for terms_pool feature
+            // This allows web-spawn workers to request terms computation from terms worker pool
+            await startTermsRequestMonitor();
+            console.log('[bench.js] Terms infrastructure ready');
+        } catch (e) {
+            console.warn('[bench.js] Terms bridge not available:', e.message);
         }
     }
 }

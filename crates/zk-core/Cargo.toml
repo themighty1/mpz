@@ -11,6 +11,8 @@ default = []
 rayon = ["dep:rayon", "mpz-core/rayon", "blake3/rayon", "itybity/rayon"]
 # Use chi worker pool (via JS chi-bridge) instead of rayon for chi computation
 chi_pool = []
+# Use terms worker pool (via JS terms-bridge) instead of rayon for terms computation
+terms_pool = []
 # Use async JS worker pools for entire check (no rayon/SharedArrayBuffer)
 wasm_workers = ["dep:js-sys", "dep:wasm-bindgen-futures"]
 

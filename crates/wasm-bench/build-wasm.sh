@@ -20,6 +20,7 @@ echo "Copying JS bridge files to pkg/..."
 cp js/chi-bridge.js pkg/
 cp js/check-workers.js pkg/
 cp js/terms-worker.js pkg/
+cp js/terms-bridge.js pkg/
 
 echo "Done. WASM output in pkg/"
 
