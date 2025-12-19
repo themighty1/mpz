@@ -15,6 +15,25 @@ use crate::vole::{vole_receiver, vole_sender};
 
 type Result<T> = core::result::Result<T, CheckError>;
 
+/// Bootstrap 16 independent random starting points from a single chi.
+fn compute_chi_starts(chi: Block) -> [Block; 16] {
+    // Bootstrap: compute χ, χ², χ⁴, ..., χ^(2^15)
+    let mut bootstrap = [Block::ZERO; 16];
+    bootstrap[0] = chi;
+    for i in 1..16 {
+        bootstrap[i] = bootstrap[i - 1].gfmul(bootstrap[i - 1]);
+    }
+
+    // Hash each to get independent random starting points
+    std::array::from_fn(|i| {
+        let mut hasher = Hasher::new();
+        hasher.update(&(i as u64).to_le_bytes());
+        hasher.update(&bootstrap[i].to_bytes());
+        Block::try_from(&hasher.finalize().as_bytes()[..16])
+            .expect("block should be 16 bytes")
+    })
+}
+
 /// Values sent from the prover to the verifier for the consistency check.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UV {
@@ -56,16 +75,35 @@ impl Check {
         !self.triples.is_empty()
     }
 
-    fn compute_chis(&self, mut chi: Block) -> Vec<Block> {
-        // TODO: Consider using a PRG instead so computing the coefficients
-        // can be done in parallel.
-        let mut chis = Vec::with_capacity(self.triples.len());
-        chis.push(chi);
-        for _ in 1..self.triples.len() {
-            chi = chi.gfmul(chi);
-            chis.push(chi);
+    fn compute_chis(&self, chi: Block) -> Vec<Block> {
+        let n = self.triples.len();
+        if n == 0 {
+            return Vec::new();
         }
-        chis
+
+        let starts = compute_chi_starts(chi);
+        let segment_size = n / 16;
+        let remainder = n % 16;
+
+        let compute_segment = |i: usize| {
+            let count = segment_size + if i < remainder { 1 } else { 0 };
+            let mut segment = Vec::with_capacity(count);
+            let mut val = starts[i];
+            for _ in 0..count {
+                segment.push(val);
+                val = val.gfmul(val);
+            }
+            segment
+        };
+
+        cfg_if! {
+            if #[cfg(feature = "rayon")] {
+                use rayon::prelude::*;
+                (0..16).into_par_iter().flat_map(compute_segment).collect()
+            } else {
+                (0..16).flat_map(compute_segment).collect()
+            }
+        }
     }
 
     /// Executes the prover check, returning `U` and `V` defined in Figure 5,
