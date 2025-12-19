@@ -6,3 +6,6 @@ rustflags = [
     "link-arg=--max-memory=4294967296",
 ]
 runner = "wasmtime --wasi threads"
+
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
