@@ -65,7 +65,6 @@ impl Check {
             chi = chi.gfmul(chi);
             chis.push(chi);
         }
-
         chis
     }
 
