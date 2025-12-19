@@ -190,21 +190,14 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "zk_overhead", name: "zk_overhead/recording_100k", fn: (n) => wasm.zk_overhead_recording(n, 100000, concurrency), async: true, returnsBenchResult: true, mt: true },
         { category: "zk_overhead", name: "zk_overhead/recording_1m", fn: (n) => wasm.zk_overhead_recording(n, 1000000, concurrency), async: true, returnsBenchResult: true, mt: true },
         { category: "zk_overhead", name: "zk_overhead/recording_10m", fn: (n) => wasm.zk_overhead_recording(n, 10000000, concurrency), async: true, returnsBenchResult: true, mt: true },
-        // zk_prover benchmarks (isolated prover with message replay, MT only)
-        // warmup=1 since recording phase is expensive
-        { category: "zk_prover", name: "zk_prover/batch_200k", fn: (n) => wasm.zk_prover_mt(n, 200000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "zk_prover", name: "zk_prover/batch_400k", fn: (n) => wasm.zk_prover_mt(n, 400000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "zk_prover", name: "zk_prover/batch_600k", fn: (n) => wasm.zk_prover_mt(n, 600000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "zk_prover", name: "zk_prover/batch_800k", fn: (n) => wasm.zk_prover_mt(n, 800000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "zk_prover", name: "zk_prover/batch_1000k", fn: (n) => wasm.zk_prover_mt(n, 1000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        // zk_verifier benchmarks (isolated verifier with message replay, MT only)
-        { category: "zk_verifier", name: "zk_verifier/batch_200k", fn: (n) => wasm.zk_verifier_mt(n, 200000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "zk_verifier", name: "zk_verifier/batch_400k", fn: (n) => wasm.zk_verifier_mt(n, 400000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "zk_verifier", name: "zk_verifier/batch_600k", fn: (n) => wasm.zk_verifier_mt(n, 600000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "zk_verifier", name: "zk_verifier/batch_800k", fn: (n) => wasm.zk_verifier_mt(n, 800000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "zk_verifier", name: "zk_verifier/batch_1000k", fn: (n) => wasm.zk_verifier_mt(n, 1000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "zk_prover", name: "zk_prover/replay_throughput", fn: (n) => wasm.zk_prover_replay_throughput(n), async: true, returnsBenchResult: true, warmup: 1 },
-        { category: "zk_prover", name: "zk_prover/channel_throughput", fn: (n) => wasm.zk_prover_channel_throughput(n), async: true, returnsBenchResult: true },
+        // zk_prover benchmarks (isolated prover with message replay)
+        { category: "zk_prover", name: "zk_prover/100k", fn: (n) => wasm.zk_prover(n, 100000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "zk_prover", name: "zk_prover/1m", fn: (n) => wasm.zk_prover(n, 1000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "zk_prover", name: "zk_prover/10m", fn: (n) => wasm.zk_prover(n, 10000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        // zk_verifier benchmarks (isolated verifier with message replay)
+        { category: "zk_verifier", name: "zk_verifier/100k", fn: (n) => wasm.zk_verifier(n, 100000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "zk_verifier", name: "zk_verifier/1m", fn: (n) => wasm.zk_verifier(n, 1000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "zk_verifier", name: "zk_verifier/10m", fn: (n) => wasm.zk_verifier(n, 10000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         // garble benchmarks (garbler/evaluator with message replay)
         { category: "garble", name: "garble/garbler_100k", fn: (n) => wasm.garble_garbler(n, 100000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         { category: "garble", name: "garble/garbler_1m", fn: (n) => wasm.garble_garbler(n, 1000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
@@ -217,7 +210,6 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "ferret", name: "ferret/sender_mt", fn: (n) => wasm.ferret_sender_mt(n, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         // test/debug benchmarks
         { category: "test", name: "test/mt_context_only", fn: async (n) => { for (let i = 0; i < n; i++) await wasm.test_mt_context_only(); return n; }, async: true, mt: true },
-        { category: "test", name: "test/recording_layer", fn: async (n) => { for (let i = 0; i < n; i++) await wasm.zk_prover_test_recording(); return n; }, async: true },
     ];
 }
 
