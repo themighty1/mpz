@@ -56,7 +56,6 @@ impl Check {
         !self.triples.is_empty()
     }
 
-    #[cfg(not(feature = "rayon"))]
     fn compute_chis(&self, mut chi: Block) -> Vec<Block> {
         let mut chis = Vec::with_capacity(self.triples.len());
         chis.push(chi);
@@ -64,57 +63,6 @@ impl Check {
             chi = chi.gfmul(chi);
             chis.push(chi);
         }
-        chis
-    }
-
-    #[cfg(feature = "rayon")]
-    fn compute_chis(&self, chi: Block) -> Vec<Block> {
-        use rayon::prelude::*;
-
-        const NUM_LANES: usize = 8;
-
-        let n = self.triples.len();
-
-        // Compute 8 starting points: chi^1, chi^2, chi^4, ..., chi^128
-        let mut starts = [Block::ZERO; NUM_LANES];
-        starts[0] = chi;
-        for i in 1..NUM_LANES {
-            starts[i] = starts[i - 1].gfmul(starts[i - 1]);
-        }
-
-        // Compute stride multiplier: chi^256 = (chi^128)^2
-        let stride = starts[NUM_LANES - 1].gfmul(starts[NUM_LANES - 1]);
-
-        // Each lane computes ceil(n / NUM_LANES) values
-        let per_lane = n.div_ceil(NUM_LANES);
-
-        // Parallel: each lane generates its sequence
-        let lane_results: Vec<Vec<Block>> = (0..NUM_LANES)
-            .into_par_iter()
-            .map(|lane| {
-                let mut result = Vec::with_capacity(per_lane);
-                let mut current = starts[lane];
-                for i in 0..per_lane {
-                    let pos = lane + i * NUM_LANES;
-                    if pos >= n {
-                        break;
-                    }
-                    result.push(current);
-                    current = current.gfmul(stride);
-                }
-                result
-            })
-            .collect();
-
-        // Interleave results: position i comes from lane (i % NUM_LANES), index (i / NUM_LANES)
-        let mut chis = vec![Block::ZERO; n];
-        for (lane, lane_chis) in lane_results.into_iter().enumerate() {
-            for (idx, chi_val) in lane_chis.into_iter().enumerate() {
-                let pos = lane + idx * NUM_LANES;
-                chis[pos] = chi_val;
-            }
-        }
-
         chis
     }
 
