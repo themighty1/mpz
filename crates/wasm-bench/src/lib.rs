@@ -19,6 +19,14 @@ pub use garble::*;
 pub use ot::*;
 pub use zk::*;
 
+/// Get WASM memory for chi-bridge integration.
+/// This allows JS to read/write directly to WASM linear memory.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn get_wasm_memory() -> JsValue {
+    wasm_bindgen::memory()
+}
+
 /// Common benchmark result containing timing and work done.
 #[wasm_bindgen(getter_with_clone)]
 pub struct BenchResult {

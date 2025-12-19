@@ -8,12 +8,14 @@
 //   await tests.runAll();
 
 import {
-    getChiSignalBuffer,
     setWasmMemory,
     startChiRequestMonitor,
     initChiWorkerPool,
     computeChisWithWorkerPool
 } from './bench.js';
+
+// Must match CHI_SIGNAL_OFFSET in bench.js and chi-bridge.js
+const CHI_SIGNAL_OFFSET = 1048576;
 
 // ============================================================================
 // Test 1: Verify chi-bridge.js module loads and exports correct functions
@@ -110,40 +112,37 @@ export async function testAtomicsWaitInWorker() {
 export async function testChiBridgeInWorker(count = 1000, wasmUrl = null) {
     console.log(`[test] Testing chi-bridge in Worker context (count=${count})...`);
 
-    // Ensure infrastructure is ready
-    const actualWasmUrl = wasmUrl || new URL('../pkg-chi/chi_wasm.js', import.meta.url).href;
-
-    // Initialize signal buffer
-    const signalBuffer = getChiSignalBuffer();
-
-    // Start monitor
-    await startChiRequestMonitor();
-
-    // Create fake WASM memory
-    const fakeWasmMemory = new SharedArrayBuffer(count * 16 + 1024);
+    // Create fake WASM memory (large enough for signal region at 1MB + result data)
+    const fakeWasmMemorySize = CHI_SIGNAL_OFFSET + 32 + count * 16 + 1024;
+    const fakeWasmMemory = new SharedArrayBuffer(fakeWasmMemorySize);
     setWasmMemory({ buffer: fakeWasmMemory });
 
-    // Worker code - receives signal buffer via postMessage to share with main thread
+    // Start monitor (uses WASM memory at CHI_SIGNAL_OFFSET)
+    await startChiRequestMonitor();
+
+    // Worker code - uses WASM memory at CHI_SIGNAL_OFFSET for signal buffer
     // This simulates what web-spawn workers do when calling request_chi_computation
     const workerCode = `
+        const CHI_SIGNAL_OFFSET = ${CHI_SIGNAL_OFFSET};
+
         self.onmessage = async function(e) {
-            const { wasmMemory, chiPtr, count, resultPtr, signalBuffer } = e.data;
+            const { wasmMemory, chiPtr, count, resultPtr } = e.data;
 
             try {
-                // Create views on the SHARED signal buffer (passed from main thread)
-                const signalView = new Int32Array(signalBuffer);
+                // Create views on WASM memory at signal offset (same as main thread)
+                const signalView = new Int32Array(wasmMemory, CHI_SIGNAL_OFFSET, 4);
+                const chiSignalView = new Uint8Array(wasmMemory, CHI_SIGNAL_OFFSET + 16, 16);
 
                 // Write chi seed to WASM memory at chiPtr
-                const wasmView = new Uint8Array(wasmMemory.buffer);
+                const wasmView = new Uint8Array(wasmMemory);
                 const chi = new Uint8Array(16);
                 crypto.getRandomValues(chi);
                 wasmView.set(chi, chiPtr);
 
-                // Write chi to signal buffer at offset 16
-                const chiSignalView = new Uint8Array(signalBuffer, 16, 16);
+                // Write chi to signal region at offset 16
                 chiSignalView.set(chi);
 
-                // Write count and resultPtr to signal buffer
+                // Write count and resultPtr to signal region
                 Atomics.store(signalView, 1, count);
                 Atomics.store(signalView, 2, resultPtr);
 
@@ -164,7 +163,7 @@ export async function testChiBridgeInWorker(count = 1000, wasmUrl = null) {
                 Atomics.store(signalView, 0, 0);
 
                 // Verify result was written
-                const resultView = new Uint8Array(wasmMemory.buffer, resultPtr, count * 16);
+                const resultView = new Uint8Array(wasmMemory, resultPtr, count * 16);
                 const nonZeroBytes = Array.from(resultView.slice(0, 100)).filter(b => b !== 0).length;
 
                 self.postMessage({
@@ -206,14 +205,13 @@ export async function testChiBridgeInWorker(count = 1000, wasmUrl = null) {
             resolve({ success: false, error: e.message });
         };
 
-        // Chi at offset 512, result at offset 1024
+        // Chi at offset 512, result after signal region
         const chiPtr = 512;
-        const resultPtr = 1024;
+        const resultPtr = CHI_SIGNAL_OFFSET + 32;
 
-        // Pass the SHARED signal buffer to the worker
+        // Pass the WASM memory (SharedArrayBuffer) to the worker
         worker.postMessage({
-            wasmMemory: { buffer: fakeWasmMemory },
-            signalBuffer,
+            wasmMemory: fakeWasmMemory,
             chiPtr,
             count,
             resultPtr

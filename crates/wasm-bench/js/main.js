@@ -107,6 +107,23 @@ async function main() {
                 setStatus(`Initializing thread pool (${concurrency} threads)...`);
                 await wasm.init_thread_pool(concurrency);
                 console.log('Thread pool initialized');
+
+                // Initialize chi worker pool and monitor for zk_prover benchmarks
+                const hasZkProver = filter && filter.some(b => b.startsWith('zk_prover/'));
+                if (hasZkProver || !filter) {
+                    console.log('Initializing chi worker pool for zk_prover...');
+                    // Get WASM memory via exported function
+                    const wasmMemory = wasm.get_wasm_memory();
+                    if (wasmMemory) {
+                        console.log('WASM memory obtained via get_wasm_memory()');
+                        bench.setWasmMemory(wasmMemory);
+                    } else {
+                        console.warn('WASM memory not available - chi_pool may not work');
+                    }
+                    await bench.initChiWorkerPool();
+                    await bench.startChiRequestMonitor();
+                    console.log('Chi infrastructure ready');
+                }
             } else {
                 console.log('Skipping thread pool init (no MT benchmarks selected)');
             }

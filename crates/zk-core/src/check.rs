@@ -11,31 +11,25 @@ use mpz_core::{
 use serde::{Deserialize, Serialize};
 use zerocopy::IntoBytes;
 
-// WASM extern for parallel chi computation via JS worker pool.
-// This function blocks (via Atomics.wait) until the JS coordinator
-// computes the chi values using private-memory workers and writes
-// the result to `result_ptr`.
-//
-// The `raw_module` path is relative to where the WASM is loaded from (pkg/).
-// chi-bridge.js must be copied to pkg/ during build.
-#[cfg(target_arch = "wasm32")]
+use crate::vole::{vole_receiver, vole_sender};
+
+// Chi-bridge import for chi_pool feature on wasm32
+#[cfg(all(target_arch = "wasm32", feature = "chi_pool"))]
 #[wasm_bindgen::prelude::wasm_bindgen(raw_module = "./chi-bridge.js")]
 extern "C" {
-    /// Request parallel chi computation from the JS coordinator.
+    /// Request chi computation from JS coordinator.
+    /// This function BLOCKS via Atomics.wait() until result is ready.
     ///
-    /// # Arguments
-    /// * `chi_ptr` - Pointer to 16-byte chi seed in shared WASM memory
-    /// * `count` - Number of chi values to compute
-    /// * `result_ptr` - Pointer where result (count * 16 bytes) will be written
-    ///
-    /// # Blocking
-    /// This function blocks the calling thread via `Atomics.wait()` until
-    /// the JS coordinator signals completion. Only call from web-spawn workers,
-    /// never from the main thread.
-    fn request_chi_computation(chi_ptr: *const u8, count: u32, result_ptr: *mut u8);
+    /// Parameters:
+    ///   memory - WASM memory object (from wasm_bindgen::memory())
+    ///   chi_ptr, count, result_ptr - raw pointers into WASM linear memory
+    fn request_chi_computation(
+        memory: wasm_bindgen::JsValue,
+        chi_ptr: u32,
+        count: u32,
+        result_ptr: u32,
+    );
 }
-
-use crate::vole::{vole_receiver, vole_sender};
 
 type Result<T> = core::result::Result<T, CheckError>;
 
@@ -81,100 +75,103 @@ impl Check {
     }
 
     fn compute_chis(&self, chi: Block) -> Vec<Block> {
+        let n = self.triples.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
         cfg_if! {
-            if #[cfg(target_arch = "wasm32")] {
-                // WASM: parallel computation via JS worker pool with private memory.
-                // The extern blocks via Atomics.wait() until JS computes the result.
-                let n = self.triples.len();
-                if n == 0 {
-                    return Vec::new();
-                }
-
-                // Allocate result buffer in shared WASM memory
-                let mut result_bytes: Vec<u8> = vec![0u8; n * 16];
-
-                // Call JS coordinator - this blocks until computation is done
-                // SAFETY: chi is 16 bytes, result_bytes is n*16 bytes, both in shared memory
-                unsafe {
-                    request_chi_computation(
-                        chi.to_bytes().as_ptr(),
-                        n as u32,
-                        result_bytes.as_mut_ptr(),
-                    );
-                }
-
-                // Convert bytes back to Blocks
-                result_bytes
-                    .chunks_exact(16)
-                    .map(|chunk| {
-                        Block::try_from(chunk).expect("chunk is exactly 16 bytes")
-                    })
-                    .collect()
+            if #[cfg(all(target_arch = "wasm32", feature = "chi_pool"))] {
+                // Use chi worker pool via chi-bridge
+                Self::compute_chis_via_chi_pool(chi, n)
             } else if #[cfg(feature = "rayon")] {
-                // Native with rayon: parallel computation using segments
-                use rayon::prelude::*;
-
-                const PARALLELISM: usize = 16;
-                let n = self.triples.len();
-                if n == 0 {
-                    return Vec::new();
-                }
-
-                let segment_size = n.div_ceil(PARALLELISM);
-                let starts = Self::compute_chi_starts(chi, segment_size);
-
-                let segments: Vec<Vec<Block>> = starts
-                    .into_par_iter()
-                    .enumerate()
-                    .map(|(i, start)| {
-                        let seg_start = i * segment_size;
-                        let seg_end = ((i + 1) * segment_size).min(n);
-                        let seg_len = seg_end - seg_start;
-                        if seg_len == 0 {
-                            return Vec::new();
-                        }
-                        let mut segment = Vec::with_capacity(seg_len);
-                        let mut current = start;
-                        segment.push(current);
-                        for _ in 1..seg_len {
-                            current = current.gfmul(current);
-                            segment.push(current);
-                        }
-                        segment
-                    })
-                    .collect();
-
-                segments.into_iter().flatten().collect()
+                Self::compute_chis_parallel(chi, n)
             } else {
-                // Sequential fallback (native without rayon)
-                let n = self.triples.len();
-                if n == 0 {
-                    return Vec::new();
-                }
-
-                const PARALLELISM: usize = 16;
-                let segment_size = n.div_ceil(PARALLELISM);
-                let starts = Self::compute_chi_starts(chi, segment_size);
-
-                let mut chis = Vec::with_capacity(n);
-                for (i, start) in starts.into_iter().enumerate() {
-                    let seg_start = i * segment_size;
-                    let seg_end = ((i + 1) * segment_size).min(n);
-                    let mut current = start;
-                    for _ in seg_start..seg_end {
-                        chis.push(current);
-                        current = current.gfmul(current);
-                    }
-                }
-                chis.truncate(n);
-                chis
+                Self::compute_chis_sequential(chi, n)
             }
         }
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "chi_pool"))]
+    fn compute_chis_via_chi_pool(chi: Block, n: usize) -> Vec<Block> {
+        // Allocate memory for chi input (16 bytes) and result (n * 16 bytes)
+        let chi_bytes = chi.to_bytes();
+        let mut result_bytes = vec![0u8; n * 16];
+
+        // Get pointers - these are addresses in WASM linear memory
+        let chi_ptr = chi_bytes.as_ptr() as u32;
+        let result_ptr = result_bytes.as_mut_ptr() as u32;
+
+        // Call chi-bridge - blocks until result is ready
+        // Pass wasm_bindgen::memory() so it works in any context (main thread or workers)
+        request_chi_computation(
+            wasm_bindgen::memory(),
+            chi_ptr,
+            n as u32,
+            result_ptr,
+        );
+
+        // Convert result bytes to Vec<Block>
+        result_bytes
+            .chunks_exact(16)
+            .map(|chunk| Block::try_from(chunk).expect("chunk is 16 bytes"))
+            .collect()
+    }
+
+    #[cfg(feature = "rayon")]
+    fn compute_chis_parallel(chi: Block, n: usize) -> Vec<Block> {
+        use rayon::prelude::*;
+
+        const PARALLELISM: usize = 16;
+        let segment_size = n.div_ceil(PARALLELISM);
+        let starts = Self::compute_chi_starts(chi, segment_size);
+
+        let segments: Vec<Vec<Block>> = starts
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, start)| {
+                let seg_start = i * segment_size;
+                let seg_end = ((i + 1) * segment_size).min(n);
+                let seg_len = seg_end - seg_start;
+                if seg_len == 0 {
+                    return Vec::new();
+                }
+                let mut segment = Vec::with_capacity(seg_len);
+                let mut current = start;
+                segment.push(current);
+                for _ in 1..seg_len {
+                    current = current.gfmul(current);
+                    segment.push(current);
+                }
+                segment
+            })
+            .collect();
+
+        segments.into_iter().flatten().collect()
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    fn compute_chis_sequential(chi: Block, n: usize) -> Vec<Block> {
+        const PARALLELISM: usize = 16;
+        let segment_size = n.div_ceil(PARALLELISM);
+        let starts = Self::compute_chi_starts(chi, segment_size);
+
+        let mut chis = Vec::with_capacity(n);
+        for (i, start) in starts.into_iter().enumerate() {
+            let seg_start = i * segment_size;
+            let seg_end = ((i + 1) * segment_size).min(n);
+            let mut current = start;
+            for _ in seg_start..seg_end {
+                chis.push(current);
+                current = current.gfmul(current);
+            }
+        }
+        chis.truncate(n);
+        chis
+    }
+
     /// Computes independent starting points for parallel chi computation.
     /// Bootstrap 16 values via squaring, hash each to get independent starts.
-    #[cfg(not(target_arch = "wasm32"))]
     fn compute_chi_starts(chi: Block, segment_size: usize) -> [Block; 16] {
         use blake3::Hasher;
 

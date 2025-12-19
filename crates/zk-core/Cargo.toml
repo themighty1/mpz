@@ -9,6 +9,8 @@ workspace = true
 [features]
 default = []
 rayon = ["dep:rayon", "mpz-core/rayon", "blake3/rayon", "itybity/rayon"]
+# Use chi worker pool (via JS chi-bridge) instead of rayon for chi computation
+chi_pool = []
 
 [dependencies]
 mpz-core = { workspace = true }

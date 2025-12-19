@@ -1,0 +1,13 @@
+[package]
+name = "chi-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+blake3 = { workspace = true }
+mpz-core = { workspace = true }
+wasm-bindgen = { workspace = true }
+getrandom = { version = "0.3", features = ["wasm_js"] }
