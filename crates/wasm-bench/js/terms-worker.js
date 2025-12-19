@@ -39,17 +39,13 @@ self.onmessage = async (e) => {
 
         case 'compute_terms':
             // Compute terms for a batch of triples
-            // DUMMY MODE: generate data locally to test without transfer overhead
+            // Input: triples (ArrayBuffer, 48 bytes each), chis (ArrayBuffer, 16 bytes each)
+            // Output: partial (u, v) as 32 bytes
             const { triples, chis, requestId } = data;
             try {
-                // Get count from transferred buffer size
-                const count = new Uint8Array(triples).length / 48;
-
-                // Generate dummy data locally (no transfer overhead)
-                const triplesArr = new Uint8Array(count * 48);
-                const chisArr = new Uint8Array(count * 16);
-                for (let i = 0; i < triplesArr.length; i++) triplesArr[i] = i & 0xff;
-                for (let i = 0; i < chisArr.length; i++) chisArr[i] = i & 0xff;
+                // Wrap transferred ArrayBuffers as Uint8Array views
+                const triplesArr = new Uint8Array(triples);
+                const chisArr = new Uint8Array(chis);
 
                 const result = wasmModule.compute_terms_batch(triplesArr, chisArr);
 
