@@ -31,30 +31,22 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 
 /// All available benchmark groups
-const ALL_GROUPS: &[&str] = &["garble_core", "zk_core", "zk", "zk_overhead", "zk_prover", "zk_verifier", "garble", "ferret", "test"];
+const ALL_GROUPS: &[&str] = &["garbler_core", "evaluator_core", "zk_prover_core", "zk_verifier_core", "zk_prover", "zk_verifier", "garble", "ferret_sender"];
 
 /// All available benchmarks
 const ALL_BENCHMARKS: &[&str] = &[
-    "garble_core/half_gates_garble",
-    "garble_core/half_gates_evaluate",
-    "garble_core/half_gates_evaluate_batched",
-    "garble_core/half_gates_evaluate_parallel",
-    "zk_core/prover_execute",
-    "zk_core/prover_check_200k",
-    "zk_core/prover_check_400k",
-    "zk_core/prover_check_600k",
-    "zk_core/verifier_execute",
-    "zk_core/verifier_check_200k",
-    "zk_core/verifier_check_400k",
-    "zk_core/verifier_check_600k",
-    "zk/zk_st_batched",
-    "zk/zk_mt_batched",
-    "zk_overhead/baseline_100k",
-    "zk_overhead/baseline_1m",
-    "zk_overhead/baseline_10m",
-    "zk_overhead/recording_100k",
-    "zk_overhead/recording_1m",
-    "zk_overhead/recording_10m",
+    "garbler_core/half_gates",
+    "evaluator_core/half_gates",
+    "evaluator_core/half_gates_batched",
+    "evaluator_core/half_gates_parallel",
+    "zk_prover_core/execute",
+    "zk_prover_core/check_200k",
+    "zk_prover_core/check_400k",
+    "zk_prover_core/check_600k",
+    "zk_verifier_core/execute",
+    "zk_verifier_core/check_200k",
+    "zk_verifier_core/check_400k",
+    "zk_verifier_core/check_600k",
     "zk_prover/100k",
     "zk_prover/1m",
     "zk_prover/10m",
@@ -67,9 +59,9 @@ const ALL_BENCHMARKS: &[&str] = &[
     "garble/evaluator_100k",
     "garble/evaluator_1m",
     "garble/evaluator_10m",
-    "ferret/sender_st",
-    "ferret/sender_mt",
-    "test/mt_context_only",
+    "ferret_sender/100k",
+    "ferret_sender/1m",
+    "ferret_sender/10m",
 ];
 
 /// Get all benchmarks in a group
@@ -85,7 +77,7 @@ fn benchmarks_in_group(group: &str) -> Vec<&'static str> {
 /// Check if a benchmark is multi-threaded (uses concurrency parameter)
 fn is_mt_benchmark(name: &str) -> bool {
     // MT groups: all benchmarks in these groups are MT
-    let mt_groups = ["zk_overhead", "zk_prover", "zk_verifier", "garble"];
+    let mt_groups = ["zk_prover", "zk_verifier", "garble", "ferret_sender"];
     for group in mt_groups {
         if name.starts_with(&format!("{}/", group)) {
             // Exclude specific ST benchmarks
