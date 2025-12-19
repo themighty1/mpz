@@ -36,6 +36,8 @@ lto = true
 inherits = "release"
 opt-level = 3
 lto = true
+panic = "abort"
+codegen-units = 1
 
 [workspace.lints.rust]
 # unsafe_code = "forbid"
