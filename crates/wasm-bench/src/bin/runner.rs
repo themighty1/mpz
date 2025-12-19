@@ -177,12 +177,16 @@ async fn run_benchmarks_with_concurrency(
             return Err("Benchmark timed out after 5 minutes".into());
         }
 
-        // Poll console logs (track count but don't print - reduces noise)
+        // Poll console logs and print new ones
         let logs_check = page
             .evaluate("window.__consoleLogs ? JSON.stringify(window.__consoleLogs) : '[]'")
             .await?;
         if let Ok(logs_json) = logs_check.into_value::<String>() {
             if let Ok(logs) = serde_json::from_str::<Vec<String>>(&logs_json) {
+                // Print any new logs
+                for log in logs.iter().skip(last_log_count) {
+                    eprintln!("[console] {}", log);
+                }
                 last_log_count = logs.len();
             }
         }

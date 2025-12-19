@@ -25,6 +25,7 @@ members = [
     "crates/zk-core",
     "crates/zk",
     "crates/wasm-bench",
+    "crates/chi-wasm",
 ]
 exclude = ["crates/lpn-estimator"]
 resolver = "2"

@@ -26,6 +26,35 @@ pub struct BenchResult {
     pub and_gates: u64,
 }
 
+/// GF(2^128) multiplication for chi worker pool.
+/// Takes two 16-byte blocks and returns their product.
+#[wasm_bindgen]
+pub fn gfmul(a: &[u8], b: &[u8]) -> Vec<u8> {
+    use mpz_core::Block;
+
+    let a_block = Block::try_from(a).expect("a must be 16 bytes");
+    let b_block = Block::try_from(b).expect("b must be 16 bytes");
+    let result = a_block.gfmul(b_block);
+    result.to_bytes().to_vec()
+}
+
+/// Compute chi values sequentially using WASM gfmul.
+/// Returns count * 16 bytes of chi values.
+#[wasm_bindgen]
+pub fn compute_chi_segment(start: &[u8], count: u32) -> Vec<u8> {
+    use mpz_core::Block;
+
+    let mut current = Block::try_from(start).expect("start must be 16 bytes");
+    let mut result = Vec::with_capacity(count as usize * 16);
+
+    for _ in 0..count {
+        result.extend_from_slice(&current.to_bytes());
+        current = current.gfmul(current);
+    }
+
+    result
+}
+
 /// Initialize the web_spawn spawner and rayon thread pool for MT benchmarks.
 /// Must be called before running any MT benchmarks.
 #[cfg(target_arch = "wasm32")]

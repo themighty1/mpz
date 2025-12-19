@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Step 2 Validation Tests - Chi Bridge Integration</title>
+    <style>
+        body {
+            font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 20px;
+            margin: 0;
+        }
+        h1 {
+            color: #569cd6;
+            margin-bottom: 10px;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .status.running {
+            background: #264f78;
+        }
+        .status.passed {
+            background: #2d5a2d;
+        }
+        .status.failed {
+            background: #5a2d2d;
+        }
+        #output {
+            background: #0d0d0d;
+            padding: 15px;
+            border-radius: 4px;
+            white-space: pre-wrap;
+            font-size: 13px;
+            line-height: 1.4;
+            max-height: 600px;
+            overflow-y: auto;
+        }
+        .pass { color: #4ec9b0; }
+        .fail { color: #f14c4c; }
+        .info { color: #dcdcaa; }
+        button {
+            background: #0e639c;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-right: 10px;
+        }
+        button:hover {
+            background: #1177bb;
+        }
+        button:disabled {
+            background: #3c3c3c;
+            cursor: not-allowed;
+        }
+        .controls {
+            margin: 15px 0;
+        }
+    </style>
+</head>
+<body>
+    <h1>Step 2 Validation Tests</h1>
+    <p>Chi Bridge Integration - Atomics.wait blocking in web-spawn workers</p>
+
+    <div class="controls">
+        <button id="runTests" onclick="runTests()">Run All Tests</button>
+        <button id="runWithWasm" onclick="runWithWasm()">Run Tests + WASM</button>
+    </div>
+
+    <div id="statusBox" class="status">Ready to run tests</div>
+
+    <div id="output">Test output will appear here...</div>
+
+    <script type="module">
+        import * as bench from './js/bench.js';
+        import * as tests from './js/test-chi-bridge.js';
+
+        // Make modules available globally for console access
+        window.bench = bench;
+        window.tests = tests;
+
+        // Capture console output
+        const output = document.getElementById('output');
+        const statusBox = document.getElementById('statusBox');
+        const originalLog = console.log;
+        const originalError = console.error;
+        const originalWarn = console.warn;
+
+        function appendOutput(text, className = '') {
+            const span = document.createElement('span');
+            span.className = className;
+            span.textContent = text + '\n';
+            output.appendChild(span);
+            output.scrollTop = output.scrollHeight;
+        }
+
+        console.log = (...args) => {
+            originalLog.apply(console, args);
+            const text = args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
+            const className = text.includes('PASS') ? 'pass' : text.includes('FAIL') ? 'fail' : 'info';
+            appendOutput(text, className);
+        };
+
+        console.error = (...args) => {
+            originalError.apply(console, args);
+            const text = args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
+            appendOutput(text, 'fail');
+        };
+
+        console.warn = (...args) => {
+            originalWarn.apply(console, args);
+            const text = args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ');
+            appendOutput(text, 'info');
+        };
+
+        function setStatus(text, className) {
+            statusBox.textContent = text;
+            statusBox.className = 'status ' + className;
+        }
+
+        window.runTests = async function() {
+            output.innerHTML = '';
+            setStatus('Running tests...', 'running');
+            document.getElementById('runTests').disabled = true;
+            document.getElementById('runWithWasm').disabled = true;
+
+            try {
+                const result = await tests.runAll();
+
+                if (result.allPassed) {
+                    setStatus('All tests PASSED!', 'passed');
+                } else {
+                    setStatus('Some tests FAILED', 'failed');
+                }
+            } catch (e) {
+                console.error('Test error:', e);
+                setStatus('Test error: ' + e.message, 'failed');
+            }
+
+            document.getElementById('runTests').disabled = false;
+            document.getElementById('runWithWasm').disabled = false;
+        };
+
+        window.runWithWasm = async function() {
+            output.innerHTML = '';
+            setStatus('Loading WASM module...', 'running');
+            document.getElementById('runTests').disabled = true;
+            document.getElementById('runWithWasm').disabled = true;
+
+            try {
+                // Import and initialize WASM
+                const wasm = await import('./pkg/mpz_wasm_bench.js');
+                await wasm.default();
+                await bench.init(wasm);
+
+                console.log('WASM module loaded successfully');
+                console.log('');
+
+                setStatus('Running tests with WASM...', 'running');
+                const result = await tests.runAll(wasm);
+
+                if (result.allPassed) {
+                    setStatus('All tests PASSED! (with WASM)', 'passed');
+                } else {
+                    setStatus('Some tests FAILED (with WASM)', 'failed');
+                }
+            } catch (e) {
+                console.error('Error:', e);
+                setStatus('Error: ' + e.message, 'failed');
+            }
+
+            document.getElementById('runTests').disabled = false;
+            document.getElementById('runWithWasm').disabled = false;
+        };
+
+        // Auto-run if ?autorun parameter is set
+        const params = new URLSearchParams(window.location.search);
+        if (params.has('autorun')) {
+            if (params.get('autorun') === 'wasm') {
+                window.runWithWasm();
+            } else {
+                window.runTests();
+            }
+        }
+    </script>
+</body>
+</html>

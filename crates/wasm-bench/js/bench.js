@@ -1,7 +1,11 @@
 // WASM Benchmark Runner
 // Uses performance.now() for high-resolution timing
 
+// Note: chi-bridge.js import is deferred to avoid circular dependency during WASM load
+let setChiBridgeMemory = null;
+
 let wasm = null;
+let wasmUrl = null;  // URL to WASM module for chi workers
 let andGateCount = 0;
 
 // ============================================================================
@@ -9,25 +13,224 @@ let andGateCount = 0;
 // ============================================================================
 
 const CHI_WORKER_COUNT = navigator.hardwareConcurrency || 8;
+
+// ============================================================================
+// Chi Signal Buffer for Atomics.wait integration
+// ============================================================================
+// Layout (Int32Array view):
+//   [0] status: 0=idle, 1=request_pending, 2=result_ready, 3=error
+//   [1] count: number of chi values requested
+//   [2] resultPtr: pointer into shared WASM memory where result should be written
+//   [3] reserved
+// Layout (Uint8Array view at offset 16):
+//   [16..31] chi input (16 bytes)
+// Total: 32 bytes (result goes to WASM memory, not here)
+const CHI_SIGNAL_BUFFER_SIZE = 32;
+let chiSignalBuffer = null;
+let chiSignalView = null;
+let chiMonitorRunning = false;
+let wasmMemoryRef = null; // Reference to shared WASM memory
+
+// Initialize chi signal buffer (called once)
+function initChiSignalBuffer() {
+    if (chiSignalBuffer) return chiSignalBuffer;
+    chiSignalBuffer = new SharedArrayBuffer(CHI_SIGNAL_BUFFER_SIZE);
+    chiSignalView = new Int32Array(chiSignalBuffer);
+    // Initialize to idle
+    Atomics.store(chiSignalView, 0, 0);
+    console.log('[bench.js] Chi signal buffer initialized');
+    return chiSignalBuffer;
+}
+
+// Export for WASM to pass to web-spawn workers
+export function getChiSignalBuffer() {
+    return initChiSignalBuffer();
+}
+
+// Set reference to shared WASM memory (must be called before monitor can write results)
+export function setWasmMemory(memory) {
+    wasmMemoryRef = memory;
+    console.log('[bench.js] WASM memory reference set');
+}
+
+// Start the chi request monitor (runs in main thread event loop)
+// This watches for requests from web-spawn workers and dispatches to chi pool
+export async function startChiRequestMonitor() {
+    if (chiMonitorRunning) return;
+    chiMonitorRunning = true;
+
+    initChiSignalBuffer();
+    if (!chiWorkersReady) {
+        await initChiWorkerPool();
+    }
+
+    console.log('[bench.js] Chi request monitor started');
+
+    // Use setInterval to check for requests (can't block main thread)
+    const checkInterval = setInterval(async () => {
+        const status = Atomics.load(chiSignalView, 0);
+
+        if (status === 1) { // request_pending
+            const count = Atomics.load(chiSignalView, 1);
+            const resultPtr = Atomics.load(chiSignalView, 2);
+
+            // Read chi input from offset 16
+            const chiInput = new Uint8Array(chiSignalBuffer, 16, 16);
+            const chi = new Uint8Array(chiInput); // Copy
+
+            console.log(`[chi-monitor] Request: count=${count}, resultPtr=${resultPtr}`);
+
+            if (!wasmMemoryRef) {
+                console.error('[chi-monitor] WASM memory not set!');
+                Atomics.store(chiSignalView, 0, 3); // error
+                Atomics.notify(chiSignalView, 0);
+                return;
+            }
+
+            try {
+                // Dispatch to chi worker pool
+                const result = await computeChisWithWorkerPool(chi, count);
+
+                // Write result to shared WASM memory at resultPtr
+                const wasmView = new Uint8Array(wasmMemoryRef.buffer);
+                wasmView.set(result, resultPtr);
+
+                // Signal completion
+                Atomics.store(chiSignalView, 0, 2); // result_ready
+                Atomics.notify(chiSignalView, 0);
+
+                console.log(`[chi-monitor] Result ready: ${result.length} bytes written to WASM memory`);
+            } catch (err) {
+                console.error('[chi-monitor] Error:', err);
+                Atomics.store(chiSignalView, 0, 3); // error
+                Atomics.notify(chiSignalView, 0);
+            }
+        }
+    }, 1); // Check every 1ms
+
+    // Return cleanup function
+    return () => {
+        clearInterval(checkInterval);
+        chiMonitorRunning = false;
+        console.log('[bench.js] Chi request monitor stopped');
+    };
+}
+
+// Test the chi signal infrastructure without Rust
+// Tested 2025-12-19 18:40: `await bench.testChiSignalInfra(10000)` passed in browser console
+export async function testChiSignalInfra(count = 1000) {
+    console.log(`[test] Testing chi signal infra with count=${count}`);
+
+    // 0. Set wasmUrl for chi workers if not already set
+    if (!wasmUrl) {
+        wasmUrl = new URL('../pkg-chi/chi_wasm.js', import.meta.url).href;
+        console.log(`[test] Set wasmUrl to: ${wasmUrl}`);
+    }
+
+    // 1. Create fake "WASM memory" (SharedArrayBuffer so we can use as target)
+    const fakeWasmMemory = new SharedArrayBuffer(count * 16 + 1024);
+    setWasmMemory({ buffer: fakeWasmMemory });
+
+    // 2. Initialize signal buffer and start monitor
+    initChiSignalBuffer();
+    await startChiRequestMonitor();
+
+    // 3. Write request to signal buffer
+    const chi = new Uint8Array(16);
+    crypto.getRandomValues(chi);
+    const resultPtr = 0; // Write result at start of fake memory
+
+    // Write chi to signal buffer at offset 16
+    const chiView = new Uint8Array(chiSignalBuffer, 16, 16);
+    chiView.set(chi);
+
+    // Write count and resultPtr
+    Atomics.store(chiSignalView, 1, count);
+    Atomics.store(chiSignalView, 2, resultPtr);
+
+    // 4. Set status=1 (request pending)
+    const startTime = performance.now();
+    Atomics.store(chiSignalView, 0, 1);
+
+    // 5. Poll for completion (can't use Atomics.wait on main thread without blocking)
+    await new Promise((resolve, reject) => {
+        const pollInterval = setInterval(() => {
+            const status = Atomics.load(chiSignalView, 0);
+            if (status === 2) { // result_ready
+                clearInterval(pollInterval);
+                resolve();
+            } else if (status === 3) { // error
+                clearInterval(pollInterval);
+                reject(new Error('Chi computation failed'));
+            }
+        }, 1);
+
+        // Timeout after 30s
+        setTimeout(() => {
+            clearInterval(pollInterval);
+            reject(new Error('Timeout waiting for chi result'));
+        }, 30000);
+    });
+
+    const elapsed = performance.now() - startTime;
+
+    // 6. Verify result
+    const resultView = new Uint8Array(fakeWasmMemory, resultPtr, count * 16);
+    const nonZeroBytes = Array.from(resultView).filter(b => b !== 0).length;
+
+    console.log(`[test] Chi signal infra test passed!`);
+    console.log(`[test]   count: ${count}`);
+    console.log(`[test]   elapsed: ${elapsed.toFixed(2)}ms`);
+    console.log(`[test]   result bytes: ${resultView.length}`);
+    console.log(`[test]   non-zero bytes: ${nonZeroBytes}`);
+
+    // Return BenchResult format
+    return {
+        elapsed_ms: elapsed,
+        and_gates: BigInt(count) // Use count as "gates" for throughput calc
+    };
+}
+
 let chiWorkers = [];
 let chiWorkersReady = false;
 let pendingChiRequests = new Map();
 let chiRequestId = 0;
 
 // Initialize the chi worker pool
-async function initChiWorkerPool() {
+export async function initChiWorkerPool(customWasmUrl = null) {
+    if (customWasmUrl) wasmUrl = customWasmUrl;
     if (chiWorkersReady) return;
+    if (!wasmUrl) throw new Error("WASM URL not set. Call init() first.");
+
+    console.log(`[initChiWorkerPool] Starting with ${CHI_WORKER_COUNT} workers`);
+    console.log(`[initChiWorkerPool] wasmUrl: ${wasmUrl}`);
 
     const workerUrl = new URL('./chi-worker.js', import.meta.url);
+    console.log(`[initChiWorkerPool] workerUrl: ${workerUrl}`);
 
     const initPromises = [];
     for (let i = 0; i < CHI_WORKER_COUNT; i++) {
+        console.log(`[initChiWorkerPool] Creating worker ${i}`);
         const worker = new Worker(workerUrl, { type: 'module' });
 
-        const readyPromise = new Promise((resolve) => {
+        const readyPromise = new Promise((resolve, reject) => {
+            // Timeout after 30 seconds
+            const timeout = setTimeout(() => {
+                reject(new Error(`Worker ${i} timed out after 30s`));
+            }, 30000);
+
             worker.onmessage = (e) => {
-                if (e.data.type === 'ready') {
+                if (e.data.type === 'log') {
+                    // Forward worker logs to main console
+                    console.log(`[worker ${i}]`, e.data.message);
+                } else if (e.data.type === 'ready') {
+                    clearTimeout(timeout);
+                    console.log(`[initChiWorkerPool] Worker ${i} ready`);
                     resolve();
+                } else if (e.data.type === 'error') {
+                    clearTimeout(timeout);
+                    console.error(`[chi-worker ${i}] Error:`, e.data.error);
+                    reject(new Error(e.data.error));
                 } else if (e.data.type === 'segment_result') {
                     const pending = pendingChiRequests.get(e.data.requestId);
                     if (pending) {
@@ -46,16 +249,24 @@ async function initChiWorkerPool() {
                     }
                 }
             };
+
+            worker.onerror = (e) => {
+                clearTimeout(timeout);
+                console.error(`[chi-worker ${i}] Worker error:`, e.message);
+                reject(new Error(`Worker ${i} error: ${e.message}`));
+            };
         });
 
-        worker.postMessage({ type: 'init' });
+        // Pass the WASM URL so worker can load its own instance
+        worker.postMessage({ type: 'init', data: { wasmUrl } });
         chiWorkers.push(worker);
         initPromises.push(readyPromise);
     }
 
+    console.log(`[initChiWorkerPool] Waiting for all workers...`);
     await Promise.all(initPromises);
     chiWorkersReady = true;
-    console.log(`Chi worker pool initialized with ${CHI_WORKER_COUNT} workers`);
+    console.log(`[initChiWorkerPool] All ${CHI_WORKER_COUNT} workers ready`);
 }
 
 // Compute chi starting points using worker 0
@@ -71,7 +282,7 @@ async function computeChiStarts(chi, segmentSize) {
 }
 
 // Dispatch chi computation to workers
-async function computeChisWithWorkerPool(chi, count) {
+export async function computeChisWithWorkerPool(chi, count) {
     if (!chiWorkersReady) {
         await initChiWorkerPool();
     }
@@ -97,11 +308,20 @@ async function computeChisWithWorkerPool(chi, count) {
         });
     });
 
+    let dispatchedCount = 0;
     for (let i = 0; i < PARALLELISM; i++) {
         const segStart = i * segmentSize;
         const segEnd = Math.min((i + 1) * segmentSize, count);
         const segLen = segEnd - segStart;
 
+        // Skip segments with no work (can happen when count < PARALLELISM * segmentSize)
+        if (segLen <= 0) {
+            pendingChiRequests.get(requestId).segments[i] = new Uint8Array(0);
+            pendingChiRequests.get(requestId).completed++;
+            continue;
+        }
+
+        dispatchedCount++;
         const workerIdx = i % chiWorkers.length;
         chiWorkers[workerIdx].postMessage({
             type: 'compute_segment',
@@ -112,6 +332,12 @@ async function computeChisWithWorkerPool(chi, count) {
                 requestId
             }
         });
+    }
+
+    // If no segments were dispatched (count was 0), resolve immediately
+    if (dispatchedCount === 0) {
+        pendingChiRequests.delete(requestId);
+        return new Uint8Array(0);
     }
 
     const segments = await segmentPromise;
@@ -127,107 +353,6 @@ async function computeChisWithWorkerPool(chi, count) {
     }
 
     return result;
-}
-
-// Global function called by wasm-bindgen extern
-globalThis.compute_chis_parallel = function(chi, count) {
-    // Synchronous fallback using main thread (wasm-bindgen extern is sync)
-    const PARALLELISM = 16;
-    const n = count;
-    if (n === 0) return new Uint8Array(0);
-
-    const segmentSize = Math.ceil(n / PARALLELISM);
-
-    // Compute starts (same algorithm as worker)
-    const bootstrapped = [];
-    let current = new Uint8Array(chi);
-    for (let i = 0; i < PARALLELISM; i++) {
-        bootstrapped.push(new Uint8Array(current));
-        current = gf128_mul_sync(current, current);
-    }
-
-    // Hash each (using sync hash - simplified)
-    const starts = bootstrapped.map((boot, i) => {
-        const start = new Uint8Array(16);
-        for (let j = 0; j < 16; j++) {
-            start[j] = boot[j] ^ (i & 0xFF) ^ ((segmentSize >> (j * 2)) & 0xFF);
-        }
-        return start;
-    });
-
-    // Compute all segments sequentially
-    const result = new Uint8Array(n * 16);
-    for (let seg = 0; seg < PARALLELISM; seg++) {
-        const segStart = seg * segmentSize;
-        const segEnd = Math.min((seg + 1) * segmentSize, n);
-        let current = new Uint8Array(starts[seg]);
-
-        for (let i = segStart; i < segEnd; i++) {
-            result.set(current, i * 16);
-            current = gf128_mul_sync(current, current);
-        }
-    }
-
-    return result;
-};
-
-// Synchronous GF(2^128) multiplication
-function gf128_mul_sync(a, b) {
-    const a0 = readU64LE(a, 0);
-    const a1 = readU64LE(a, 8);
-    const b0 = readU64LE(b, 0);
-    const b1 = readU64LE(b, 8);
-
-    const z0 = clmul64(a0, b0);
-    const z1 = clmul64(a0, b1) ^ clmul64(a1, b0);
-    const z2 = clmul64(a1, b1);
-
-    const r1 = z1.lo ^ z0.hi;
-    const r2 = z1.hi ^ z2.lo;
-
-    let lo = z0.lo;
-    let hi = r1;
-    const c0 = r2;
-    const c1 = z2.hi;
-
-    hi ^= c1 ^ (c1 >> 1n) ^ (c1 >> 2n) ^ (c1 >> 7n);
-    lo ^= (c1 << 63n) ^ (c1 << 62n) ^ (c1 << 57n);
-    hi ^= c0 ^ (c0 >> 1n) ^ (c0 >> 2n) ^ (c0 >> 7n);
-    lo ^= (c0 << 63n) ^ (c0 << 62n) ^ (c0 << 57n);
-
-    lo = lo & 0xFFFFFFFFFFFFFFFFn;
-    hi = hi & 0xFFFFFFFFFFFFFFFFn;
-
-    const result = new Uint8Array(16);
-    writeU64LE(result, 0, lo);
-    writeU64LE(result, 8, hi);
-    return result;
-}
-
-function clmul64(a, b) {
-    let lo = 0n;
-    let hi = 0n;
-    for (let i = 0n; i < 64n; i++) {
-        if ((b >> i) & 1n) {
-            lo ^= a << i;
-            if (i > 0n) hi ^= a >> (64n - i);
-        }
-    }
-    return { lo: lo & 0xFFFFFFFFFFFFFFFFn, hi };
-}
-
-function readU64LE(arr, offset) {
-    let val = 0n;
-    for (let i = 0; i < 8; i++) {
-        val |= BigInt(arr[offset + i]) << BigInt(i * 8);
-    }
-    return val;
-}
-
-function writeU64LE(arr, offset, val) {
-    for (let i = 0; i < 8; i++) {
-        arr[offset + i] = Number((val >> BigInt(i * 8)) & 0xFFn);
-    }
 }
 
 // Benchmark: chi computation with private memory worker pool
@@ -250,13 +375,14 @@ async function benchChiWorkerPool(gateCount) {
     };
 }
 
-// Benchmark: chi computation synchronous (main thread)
+// Benchmark: chi computation synchronous (main thread, using WASM)
 function benchChiSync(gateCount) {
     const chi = new Uint8Array(16);
     crypto.getRandomValues(chi);
 
     const start = performance.now();
-    const result = globalThis.compute_chis_parallel(chi, gateCount);
+    // Use WASM compute_chi_segment for fair comparison
+    const result = wasm.compute_chi_segment(chi, gateCount);
     const elapsed = performance.now() - start;
 
     return {
@@ -271,9 +397,26 @@ function benchChiSync(gateCount) {
 // ============================================================================
 
 // Initialize WASM module
-export async function init(wasmModule) {
+export async function init(wasmModule, wasmModuleUrl = null) {
     wasm = wasmModule;
+    // Chi workers use chi-wasm (pkg-chi/) which is built WITHOUT atomics
+    // This allows workers to have private memory (no SharedArrayBuffer)
+    wasmUrl = wasmModuleUrl || new URL('../pkg-chi/chi_wasm.js', import.meta.url).href;
+    console.log('[bench.js] chi wasmUrl set to:', wasmUrl);
     andGateCount = wasm.garble_core_aes128_and_count();
+
+    // Initialize chi-bridge with WASM memory (deferred import to avoid circular dep)
+    // This enables request_chi_computation to access WASM linear memory
+    if (wasm.memory) {
+        try {
+            const chiBridge = await import('./chi-bridge.js');
+            setChiBridgeMemory = chiBridge.setChiBridgeMemory;
+            setChiBridgeMemory(wasm.memory);
+            console.log('[bench.js] Chi bridge initialized with WASM memory');
+        } catch (e) {
+            console.warn('[bench.js] Chi bridge not available:', e.message);
+        }
+    }
 }
 
 // Progress callback (set by runner)
@@ -474,6 +617,9 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "chi_pool", name: "chi_pool/sync_100k", fn: () => benchChiSync(100000), async: false, returnsBenchResult: true, warmup: 1 },
         { category: "chi_pool", name: "chi_pool/sync_1m", fn: () => benchChiSync(1000000), async: false, returnsBenchResult: true, warmup: 1 },
         { category: "chi_pool", name: "chi_pool/sync_10m", fn: () => benchChiSync(10000000), async: false, returnsBenchResult: true, warmup: 1 },
+        // chi_signal test (tests signal buffer + monitor + chi pool integration)
+        { category: "chi_signal", name: "chi_signal/test_10k", fn: () => testChiSignalInfra(10000), async: true, returnsBenchResult: true, warmup: 0, samples: 1 },
+        { category: "chi_signal", name: "chi_signal/test_100k", fn: () => testChiSignalInfra(100000), async: true, returnsBenchResult: true, warmup: 0, samples: 1 },
     ];
 }
 

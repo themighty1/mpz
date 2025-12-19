@@ -11,20 +11,31 @@ use mpz_core::{
 use serde::{Deserialize, Serialize};
 use zerocopy::IntoBytes;
 
+// WASM extern for parallel chi computation via JS worker pool.
+// This function blocks (via Atomics.wait) until the JS coordinator
+// computes the chi values using private-memory workers and writes
+// the result to `result_ptr`.
+//
+// The `raw_module` path is relative to where the WASM is loaded from (pkg/).
+// chi-bridge.js must be copied to pkg/ during build.
 #[cfg(target_arch = "wasm32")]
-use wasm_bindgen::prelude::*;
+#[wasm_bindgen::prelude::wasm_bindgen(raw_module = "./chi-bridge.js")]
+extern "C" {
+    /// Request parallel chi computation from the JS coordinator.
+    ///
+    /// # Arguments
+    /// * `chi_ptr` - Pointer to 16-byte chi seed in shared WASM memory
+    /// * `count` - Number of chi values to compute
+    /// * `result_ptr` - Pointer where result (count * 16 bytes) will be written
+    ///
+    /// # Blocking
+    /// This function blocks the calling thread via `Atomics.wait()` until
+    /// the JS coordinator signals completion. Only call from web-spawn workers,
+    /// never from the main thread.
+    fn request_chi_computation(chi_ptr: *const u8, count: u32, result_ptr: *mut u8);
+}
 
 use crate::vole::{vole_receiver, vole_sender};
-
-/// Extern declaration for JS worker pool chi computation.
-/// JS must provide this function when the WASM module is loaded.
-/// Input: starting chi (16 bytes), count of chis to compute
-/// Returns: Vec<u8> containing count × 16 bytes of computed chis
-#[cfg(target_arch = "wasm32")]
-#[wasm_bindgen]
-extern "C" {
-    fn compute_chis_parallel(chi: &[u8], count: u32) -> Vec<u8>;
-}
 
 type Result<T> = core::result::Result<T, CheckError>;
 
@@ -72,11 +83,32 @@ impl Check {
     fn compute_chis(&self, chi: Block) -> Vec<Block> {
         cfg_if! {
             if #[cfg(target_arch = "wasm32")] {
-                // WASM: use JS private-memory worker pool
-                let result = compute_chis_parallel(&chi.to_bytes(), self.triples.len() as u32);
-                result
+                // WASM: parallel computation via JS worker pool with private memory.
+                // The extern blocks via Atomics.wait() until JS computes the result.
+                let n = self.triples.len();
+                if n == 0 {
+                    return Vec::new();
+                }
+
+                // Allocate result buffer in shared WASM memory
+                let mut result_bytes: Vec<u8> = vec![0u8; n * 16];
+
+                // Call JS coordinator - this blocks until computation is done
+                // SAFETY: chi is 16 bytes, result_bytes is n*16 bytes, both in shared memory
+                unsafe {
+                    request_chi_computation(
+                        chi.to_bytes().as_ptr(),
+                        n as u32,
+                        result_bytes.as_mut_ptr(),
+                    );
+                }
+
+                // Convert bytes back to Blocks
+                result_bytes
                     .chunks_exact(16)
-                    .map(|chunk| Block::try_from(chunk).expect("chunk should be 16 bytes"))
+                    .map(|chunk| {
+                        Block::try_from(chunk).expect("chunk is exactly 16 bytes")
+                    })
                     .collect()
             } else if #[cfg(feature = "rayon")] {
                 // Native with rayon: parallel computation using segments
@@ -162,8 +194,8 @@ impl Check {
             hasher.update(&(i as u64).to_le_bytes());
             hasher.update(&(segment_size as u64).to_le_bytes());
             let hash = hasher.finalize();
-            starts[i] = Block::try_from(&hash.as_bytes()[..16])
-                .expect("hash should be at least 16 bytes");
+            starts[i] =
+                Block::try_from(&hash.as_bytes()[..16]).expect("hash should be at least 16 bytes");
         }
 
         starts
