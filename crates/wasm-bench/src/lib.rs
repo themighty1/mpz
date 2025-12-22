@@ -8,15 +8,22 @@
 //! - `zk`: QuickSilver ZK benchmarks (core + protocol + prover/verifier)
 //! - `ot`: Oblivious transfer benchmarks (Ferret)
 
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+#[cfg(target_arch = "wasm32")]
 mod garble;
+#[cfg(target_arch = "wasm32")]
 mod ot;
+#[cfg(target_arch = "wasm32")]
 mod zk;
 
 // Re-export all wasm_bindgen functions
+#[cfg(target_arch = "wasm32")]
 pub use garble::*;
+#[cfg(target_arch = "wasm32")]
 pub use ot::*;
+#[cfg(target_arch = "wasm32")]
 pub use zk::*;
 
 /// Get WASM memory for chi-bridge integration.
@@ -28,7 +35,7 @@ pub fn get_wasm_memory() -> JsValue {
 }
 
 /// Common benchmark result containing timing and work done.
-#[wasm_bindgen(getter_with_clone)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen(getter_with_clone))]
 pub struct BenchResult {
     pub elapsed_ms: f64,
     pub and_gates: u64,
