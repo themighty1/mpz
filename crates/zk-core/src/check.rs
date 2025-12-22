@@ -309,26 +309,47 @@ impl Check {
 
         let chi = Block::try_from(&transcript.finalize().as_bytes()[..16])
             .expect("block should be 16 bytes");
-        let chis = self.compute_chis(chi);
         let macs = mem::take(&mut self.triples);
         cfg_if! {
             if #[cfg(all(target_arch = "wasm32", feature = "terms_pool"))] {
                 // Use terms worker pool via terms-bridge (blocking call)
                 // This offloads the expensive gfmul operations to private memory workers
                 // using fast polyval soft64 implementation
+                let chis = self.compute_chis(chi);
                 let (mut u, mut v) = Self::compute_terms_via_pool(&macs, &chis);
             } else if #[cfg(feature = "rayon")] {
                 use rayon::prelude::*;
 
+                // Fused chi + terms computation with pre-split lanes.
+                // Computes chi on-the-fly (no Vec<Block> allocation for all chis).
+                const PARALLELISM: usize = 16;
+                let n = macs.len();
+                let segment_size = n.div_ceil(PARALLELISM);
+                let starts = Self::compute_chi_starts(chi, segment_size);
+
                 let (mut u, mut v) = macs
-                    .into_par_iter()
-                    .zip(chis)
-                    .map(|(macs, chi)| compute_terms(macs, chi))
+                    .par_chunks(segment_size)
+                    .zip(starts.into_par_iter())
+                    .map(|(segment, chi_start)| {
+                        let mut current_chi = chi_start;
+                        let mut u_acc = Block::ZERO;
+                        let mut v_acc = Block::ZERO;
+
+                        for &triple in segment {
+                            let (u, v) = compute_terms(triple, current_chi);
+                            u_acc ^= u;
+                            v_acc ^= v;
+                            current_chi = current_chi.gfmul(current_chi);
+                        }
+
+                        (u_acc, v_acc)
+                    })
                     .reduce(
                         || (Block::ZERO, Block::ZERO),
-                        |(u_acc, v_acc), (u, v)| (u_acc ^ u, v_acc ^ v),
+                        |(u1, v1), (u2, v2)| (u1 ^ u2, v1 ^ v2),
                     );
             } else {
+                let chis = self.compute_chis(chi);
                 let (mut u, mut v) = macs
                     .into_iter()
                     .zip(chis)
@@ -444,21 +465,38 @@ impl Check {
 
         let chi = Block::try_from(&transcript.finalize().as_bytes()[..16])
             .expect("block should be 16 bytes");
-        let chis = self.compute_chis(chi);
         let keys = mem::take(&mut self.triples);
         cfg_if! {
             if #[cfg(feature = "rayon")] {
                 use rayon::prelude::*;
 
+                // Fused chi + terms computation with pre-split lanes.
+                // Computes chi on-the-fly (no Vec<Block> allocation for all chis).
+                const PARALLELISM: usize = 16;
+                let n = keys.len();
+                let segment_size = n.div_ceil(PARALLELISM);
+                let starts = Self::compute_chi_starts(chi, segment_size);
+
                 let mut w = keys
-                    .into_par_iter()
-                    .zip(chis)
-                    .map(|(keys, chi)| compute_term(keys, chi, delta))
+                    .par_chunks(segment_size)
+                    .zip(starts.into_par_iter())
+                    .map(|(segment, chi_start)| {
+                        let mut current_chi = chi_start;
+                        let mut w_acc = Block::ZERO;
+
+                        for &triple in segment {
+                            w_acc ^= compute_term(triple, current_chi, delta);
+                            current_chi = current_chi.gfmul(current_chi);
+                        }
+
+                        w_acc
+                    })
                     .reduce(
                         || Block::ZERO,
-                        |w_acc, w| w_acc ^ w,
+                        |w1, w2| w1 ^ w2,
                     );
             } else {
+                let chis = self.compute_chis(chi);
                 let mut w = keys
                     .into_iter()
                     .zip(chis)

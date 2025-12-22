@@ -200,5 +200,109 @@ fn bench_prover_check_10m(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, criterion_benchmark, bench_prover_check_10m);
+/// Benchmark prover check phase with 400K gates.
+fn bench_prover_check_400k(c: &mut Criterion) {
+    const TARGET_GATES: usize = 400_000;
+
+    let circuit: Arc<mpz_circuits::Circuit> = AES128.clone();
+    let and_count = circuit.and_count();
+    let inputs_per_circuit = circuit.inputs().len();
+    let circuit_count = TARGET_GATES.div_ceil(and_count);
+    let actual_gates = circuit_count * and_count;
+
+    let mut group = c.benchmark_group("zk-core-check");
+    group.throughput(Throughput::Elements(actual_gates as u64));
+    group.sample_size(50);
+
+    group.bench_function("prover_check_400k", |b| {
+        // Setup correlations (once)
+        let mut rng = StdRng::seed_from_u64(0);
+        let delta = Delta::random(&mut rng);
+        let mut rcot = IdealRCOT::new(rng.random(), delta.into_inner());
+
+        // Input correlations
+        let total_inputs = inputs_per_circuit * circuit_count;
+        rcot.alloc(total_inputs);
+        rcot.flush().unwrap();
+        let (
+            RCOTSenderOutput { .. },
+            RCOTReceiverOutput {
+                msgs: mut macs,
+                choices,
+                ..
+            },
+        ) = rcot.transfer(total_inputs).unwrap();
+        macs.iter_mut()
+            .zip(&choices)
+            .for_each(|(mac, &choice)| mac.set_lsb(choice));
+        let input_macs = Mac::from_blocks(macs);
+
+        // Gate correlations
+        let total_and_gates = and_count * circuit_count;
+        rcot.alloc(total_and_gates);
+        rcot.flush().unwrap();
+        let (
+            RCOTSenderOutput { .. },
+            RCOTReceiverOutput {
+                choices: gate_masks,
+                msgs: macs,
+                ..
+            },
+        ) = rcot.transfer(total_and_gates).unwrap();
+        let gate_macs = Mac::from_blocks(macs);
+
+        // SVOLE for check phase
+        rcot.alloc(128);
+        rcot.flush().unwrap();
+        let (
+            RCOTSenderOutput { .. },
+            RCOTReceiverOutput {
+                choices: svole_choices,
+                msgs: svole_ev,
+                ..
+            },
+        ) = rcot.transfer(128).unwrap();
+
+        // Use iter_batched to separate setup from measurement
+        b.iter_batched(
+            || {
+                // Setup: accumulate all circuits (not timed)
+                let mut prover = Prover::default();
+
+                for i in 0..circuit_count {
+                    let input_start = i * inputs_per_circuit;
+                    let input_end = input_start + inputs_per_circuit;
+                    let gate_start = i * and_count;
+                    let gate_end = gate_start + and_count;
+
+                    let mut prover_exec = prover
+                        .execute(
+                            circuit.clone(),
+                            &input_macs[input_start..input_end],
+                            &gate_masks[gate_start..gate_end],
+                            &gate_macs[gate_start..gate_end],
+                        )
+                        .unwrap();
+
+                    // Consume adjustments
+                    for _ in prover_exec.iter() {}
+                    let _ = prover_exec.finish().unwrap();
+                }
+
+                prover
+            },
+            |mut prover| {
+                // Timed: only the check phase
+                let mut prover_transcript = Hasher::default();
+                let uv = prover
+                    .check(&mut prover_transcript, &svole_choices, &svole_ev)
+                    .unwrap();
+                black_box(uv)
+            },
+            criterion::BatchSize::PerIteration,
+        )
+    });
+}
+
+criterion_group!(benches, criterion_benchmark, bench_prover_check_400k, bench_prover_check_10m);
 criterion_main!(benches);
