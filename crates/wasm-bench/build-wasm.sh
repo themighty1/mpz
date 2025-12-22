@@ -31,7 +31,8 @@ echo "Done. WASM output in pkg/"
 echo ""
 echo "Building chi-wasm (simd128, no atomics) for chi workers..."
 cd ../chi-wasm
-RUSTFLAGS='-Ctarget-feature=+simd128' wasm-pack build --target web --release --out-dir ../wasm-bench/pkg-chi
+RUSTFLAGS='-Ctarget-feature=+simd128 --cfg getrandom_backend="wasm_js"' \
+    wasm-pack build --target web --release --out-dir ../wasm-bench/pkg-chi
 
 echo "Done. Chi WASM output in pkg-chi/"
 
@@ -39,6 +40,7 @@ echo "Done. Chi WASM output in pkg-chi/"
 echo ""
 echo "Building terms-wasm (simd128, no atomics) for terms workers..."
 cd ../terms-wasm
-RUSTFLAGS='-Ctarget-feature=+simd128' wasm-pack build --target web --release --out-dir ../wasm-bench/pkg-terms
+RUSTFLAGS='-Ctarget-feature=+simd128 --cfg getrandom_backend="wasm_js"' \
+    wasm-pack build --target web --release --out-dir ../wasm-bench/pkg-terms
 
 echo "Done. Terms WASM output in pkg-terms/"
