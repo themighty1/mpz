@@ -3,6 +3,9 @@
 set -e
 cd "$(dirname "$0")"
 
+# Ensure wasm-pack uses the same wasm32 flags as .cargo/config.toml.
+export RUSTFLAGS='-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 --cfg getrandom_backend="wasm_js"'
+
 # Ensure correct wasm-pack version is installed
 echo "Ensuring wasm-pack version (rev 32e52ca)..."
 cargo install --git https://github.com/rustwasm/wasm-pack.git --rev 32e52ca
