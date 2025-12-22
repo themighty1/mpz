@@ -18,7 +18,13 @@ use std::sync::Arc;
 const THRESHOLDS: &[(u64, &str)] = &[(100_000, "100K"), (1_000_000, "1M"), (10_000_000, "10M")];
 
 // Gate count thresholds for check
-const CHECK_THRESHOLDS: &[(u64, &str)] = &[(200_000, "200K"), (400_000, "400K"), (600_000, "600K")];
+const CHECK_THRESHOLDS: &[(u64, &str)] = &[
+    (200_000, "200K"),
+    (400_000, "400K"),
+    (600_000, "600K"),
+    (800_000, "800K"),
+    (1_000_000, "1M"),
+];
 
 /// Benchmarks only the execute phase (no check).
 fn bench_verifier_execute(c: &mut Criterion) {
