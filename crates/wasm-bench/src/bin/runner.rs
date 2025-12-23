@@ -187,6 +187,7 @@ async fn run_benchmarks_with_concurrency(
     let timeout = Duration::from_secs(300);
     let start = std::time::Instant::now();
     let mut last_status = String::new();
+    let mut last_log_count = 0usize;
     let result: BenchOutput = loop {
         if start.elapsed() > timeout {
             return Err("Benchmark timed out after 5 minutes".into());

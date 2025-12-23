@@ -43,7 +43,7 @@ pub struct BenchResult {
 
 /// GF(2^128) multiplication for chi worker pool.
 /// Takes two 16-byte blocks and returns their product.
-#[wasm_bindgen]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn gfmul(a: &[u8], b: &[u8]) -> Vec<u8> {
     use mpz_core::Block;
 
@@ -55,7 +55,7 @@ pub fn gfmul(a: &[u8], b: &[u8]) -> Vec<u8> {
 
 /// Compute chi values sequentially using WASM gfmul.
 /// Returns count * 16 bytes of chi values.
-#[wasm_bindgen]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn compute_chi_segment(start: &[u8], count: u32) -> Vec<u8> {
     use mpz_core::Block;
 
