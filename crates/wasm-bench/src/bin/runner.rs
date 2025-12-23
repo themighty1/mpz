@@ -30,6 +30,7 @@ const ALL_GROUPS: &[&str] = &[
     "garbler_core",
     "evaluator_core",
     "zk_prover_core",
+    "zk_prover_core/check",
     "zk_verifier_core",
     "zk_prover",
     "zk_verifier",
@@ -48,6 +49,7 @@ const ALL_BENCHMARKS: &[&str] = &[
     "zk_prover_core/check_200k",
     "zk_prover_core/check_400k",
     "zk_prover_core/check_600k",
+    "zk_prover_core/check_800k",
     "zk_prover_core/check_1m",
     "zk_prover_core/check_10m",
     "zk_prover_core/check_async_400k",
@@ -84,6 +86,14 @@ const ALL_BENCHMARKS: &[&str] = &[
 
 /// Get all benchmarks in a group
 fn benchmarks_in_group(group: &str) -> Vec<&'static str> {
+    if group == "zk_prover_core/check" {
+        return ALL_BENCHMARKS
+            .iter()
+            .filter(|b| b.starts_with("zk_prover_core/check_"))
+            .copied()
+            .collect();
+    }
+
     let prefix = format!("{}/", group);
     ALL_BENCHMARKS
         .iter()

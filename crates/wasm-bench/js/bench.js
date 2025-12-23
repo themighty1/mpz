@@ -932,6 +932,7 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "zk_prover_core", name: "zk_prover_core/check_200k", fn: (n) => wasm.zk_core_prover_check_200k(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         { category: "zk_prover_core", name: "zk_prover_core/check_400k", fn: (n) => wasm.zk_core_prover_check_400k(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         { category: "zk_prover_core", name: "zk_prover_core/check_600k", fn: (n) => wasm.zk_core_prover_check_600k(n, concurrency), async: true, returnsBenchResult: true, mt: true },
+        { category: "zk_prover_core", name: "zk_prover_core/check_800k", fn: (n) => wasm.zk_core_prover_check_800k(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         { category: "zk_prover_core", name: "zk_prover_core/check_1m", fn: (n) => wasm.zk_core_prover_check_1m(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         { category: "zk_prover_core", name: "zk_prover_core/check_10m", fn: (n) => wasm.zk_core_prover_check_10m(n, concurrency), async: true, returnsBenchResult: true, mt: true },
         // Async worker pool benchmarks (wasm_workers feature - no rayon/SharedArrayBuffer)

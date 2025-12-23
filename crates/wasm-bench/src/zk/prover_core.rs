@@ -423,6 +423,13 @@ pub async fn zk_core_prover_check_600k(n: u32, concurrency: u32) -> BenchResult 
     prover_check_impl(n, concurrency, 600_000).await
 }
 
+/// Benchmark ZK prover check phase with 800K gates.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn zk_core_prover_check_800k(n: u32, concurrency: u32) -> BenchResult {
+    prover_check_impl(n, concurrency, 800_000).await
+}
+
 /// Benchmark ZK prover check phase with 1M gates (rayon + chi_pool).
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]

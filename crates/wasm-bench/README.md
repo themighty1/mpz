@@ -56,5 +56,5 @@ Options:
   --headed              Run with visible browser window (for debugging)
   --help, -h            Show help
 
-Groups: garbler_core, evaluator_core, zk_prover_core, zk_verifier_core, zk_prover, zk_verifier, garble, ferret_sender
+Groups: garbler_core, evaluator_core, zk_prover_core, zk_prover_core/check, zk_verifier_core, zk_prover, zk_verifier, garble, ferret_sender
 ```
