@@ -93,15 +93,18 @@ impl Check {
         svole_ev: &[Block],
     ) -> Result<UV> {
         #[inline]
-        fn compute_terms(triple: Triple, chi: Block) -> (Block, Block) {
+        fn compute_terms(triple: Triple, chi: Block) -> ((Block, Block), (Block, Block)) {
             let Triple { x, y, z } = triple;
 
-            let u = x.gfmul(y).gfmul(chi);
+            // Reducing x * y since, otherwise we'd have to perform 2 clmuls
+            // which would neutralize this optimization.
+            let xy = x.gfmul(y);
+            let u = xy.clmul(chi);
 
             // (Note that the LSB of a MAC contains the authenticated bit).
             let a_10 = if x.lsb() { y } else { Block::ZERO };
             let a_11 = if y.lsb() { x } else { Block::ZERO };
-            let v = (a_10 ^ a_11 ^ z).gfmul(chi);
+            let v = (a_10 ^ a_11 ^ z).clmul(chi);
 
             (u, v)
         }
@@ -121,13 +124,15 @@ impl Check {
 
         let process_segment = |segment: &[Triple], chi_start: Block| {
             let mut current_chi = chi_start;
-            let mut u_acc = Block::ZERO;
-            let mut v_acc = Block::ZERO;
+            let mut u_acc = (Block::ZERO, Block::ZERO);
+            let mut v_acc = (Block::ZERO, Block::ZERO);
 
             for &triple in segment {
                 let (u, v) = compute_terms(triple, current_chi);
-                u_acc ^= u;
-                v_acc ^= v;
+                u_acc.0 ^= u.0;
+                u_acc.1 ^= u.1;
+                v_acc.0 ^= v.0;
+                v_acc.1 ^= v.1;
                 current_chi = current_chi.gfmul(current_chi);
             }
 
@@ -143,17 +148,17 @@ impl Check {
                     .zip(starts.into_par_iter())
                     .map(|(segment, chi_start)| process_segment(segment, chi_start))
                     .reduce(
-                        || (Block::ZERO, Block::ZERO),
-                        |(u1, v1), (u2, v2)| (u1 ^ u2, v1 ^ v2),
+                        || ((Block::ZERO,Block::ZERO),(Block::ZERO,Block::ZERO)),
+                        |((u10, u11), (v10, v11)), ((u20, u21), (v20, v21))| ((u10 ^ u20, u11 ^ u21), (v10 ^ v20, v11 ^ v21)),
                     );
             } else {
-                let (mut u, mut v) = macs
+                let (u, v) = macs
                     .chunks(segment_size)
                     .zip(starts.into_iter())
                     .map(|(segment, chi_start)| process_segment(segment, chi_start))
                     .fold(
-                        (Block::ZERO, Block::ZERO),
-                        |(u1, v1), (u2, v2)| (u1 ^ u2, v1 ^ v2),
+                        ((Block::ZERO,Block::ZERO),(Block::ZERO,Block::ZERO)),
+                        |((u10, u11), (v10, v11)), ((u20, u21), (v20, v21))| ((u10 ^ u20, u11 ^ u21), (v10 ^ v20, v11 ^ v21)),
                     );
             }
         }
@@ -162,6 +167,9 @@ impl Check {
             svole_choices.try_into().map_err(|_| CheckError::SVole)?,
             svole_ev.try_into().map_err(|_| CheckError::SVole)?,
         );
+
+        let mut u = Block::reduce_gcm(u.0, u.1);
+        let mut v = Block::reduce_gcm(v.0, v.1);
 
         u ^= a_0;
         v ^= a_1;
