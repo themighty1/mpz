@@ -20,7 +20,7 @@ pools = ["chi_pool", "terms_pool"]
 [dependencies]
 mpz-garble-core = { workspace = true }
 mpz-garble = { workspace = true }
-mpz-zk-core = { workspace = true, features = ["rayon", "chi_pool", "terms_pool"] }
+mpz-zk-core = { workspace = true, features = ["rayon"] }
 mpz-zk = { workspace = true, features = ["rayon"] }
 pollster = { workspace = true }
 mpz-circuits = { workspace = true, features = ["aes"] }
