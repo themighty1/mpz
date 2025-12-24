@@ -97,10 +97,7 @@ impl Prover {
         let mut check = std::mem::take(&mut *self.check.lock().unwrap());
         // Mutex is now released
 
-        // Await without holding any lock
-        let result = check
-            .check_prover_async(transcript, svole_choices, svole_ev)
-            .await;
+        let result = check.check_prover(transcript, svole_choices, svole_ev);
 
         // Put the (now empty) Check back
         *self.check.lock().unwrap() = check;
