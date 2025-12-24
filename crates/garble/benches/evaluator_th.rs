@@ -1,9 +1,9 @@
-//! Isolated evaluator benchmarks.
+//! Isolated three-halves evaluator benchmarks.
 //!
 //! Records protocol messages for replay-based isolated benchmarking of
-//! evaluator.
+//! three-halves evaluator.
 //!
-//! Run with: cargo bench -p mpz-garble --bench evaluator
+//! Run with: cargo bench -p mpz-garble --bench evaluator_th
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use mpz_common::context::{
     Multithread, RecordedMtData, recording_mt_context_with_limit, recording_st_context_with_limit,
     replay_mt_context_with_limit, replay_st_context,
 };
-use mpz_garble::protocol::semihonest::{Evaluator, Garbler};
+use mpz_garble::protocol::semihonest::three_halves::{Evaluator, Garbler};
 use mpz_memory_core::{Array, binary::U8, correlated::Delta};
 use mpz_ot::ideal::cot::ideal_cot;
 use mpz_vm_core::{Call, prelude::*};
@@ -25,7 +25,7 @@ const THRESHOLDS: &[(u64, &str)] = &[(100_000, "100K"), (1_000_000, "1M"), (10_0
 
 /// Calculate max frame length based on workload size.
 fn max_frame_length(circuit: &Circuit, circuit_count: usize) -> usize {
-    let bytes_per_gate = 32 + 16; // garbled gate + label overhead
+    let bytes_per_gate = 25 + 16; // three-halves gate (25 bytes) + label overhead
     let overhead = 1.5; // serialization overhead
     let gates = circuit.and_count() * circuit_count;
     ((gates * bytes_per_gate) as f64 * overhead) as usize
