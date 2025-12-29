@@ -68,6 +68,20 @@ impl Check {
         })
     }
 
+    /// Async version of prover check for WASM with wasm_workers feature.
+    /// Currently just wraps the synchronous version since we use rayon.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm_workers"))]
+    pub(crate) async fn check_prover_async(
+        &mut self,
+        transcript: &mut Hasher,
+        svole_choices: &[bool],
+        svole_ev: &[Block],
+    ) -> Result<UV> {
+        // For now, just call the synchronous version
+        // Rayon with wasm threads handles the parallelism
+        self.check_prover(transcript, svole_choices, svole_ev)
+    }
+
     /// Executes the prover check, returning `U` and `V` defined in Figure 5,
     /// Step 7.b.
     pub(crate) fn check_prover(
