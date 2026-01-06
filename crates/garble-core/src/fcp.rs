@@ -926,9 +926,14 @@ impl FcpEval {
             // This uses the b̄ structure: subtracting v[γ] extracts the β terms
 
             if !self.v_full.is_empty() {
-                // v_{k,2} = v_full[some_idx][n + k] - v_full[idx_gamma][n + k]
-                let val_2 = if idx_gamma < self.v_full.len() && (n + k) < self.v_full[0].len() {
-                    self.v_full[0][n + k] ^ self.v_full[idx_gamma][n + k]
+                // v_{k,2} = â_{k,2}β + c_{k,2}
+                // â_{k,2} is at position 3n+k in A's input (α·ā ∪ (â_{i,2}) ∪ {α})
+                // Use subtraction trick: v_full[idx_beta_gamma][3n+k] - v_full[idx_gamma][3n+k]
+                let val_2 = if idx_beta_gamma < self.v_full.len()
+                    && idx_gamma < self.v_full.len()
+                    && (3 * n + k) < self.v_full[0].len()
+                {
+                    self.v_full[idx_beta_gamma][3 * n + k] ^ self.v_full[idx_gamma][3 * n + k]
                 } else {
                     Block::ZERO
                 };
