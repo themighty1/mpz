@@ -11,6 +11,8 @@ name = "mpz_garble_core"
 
 [features]
 default = []
+# Use Fcp (compressed preprocessing) instead of Fpre
+fcp = []
 rayon = [
     "dep:rayon",
     "mpz-core/rayon",
@@ -23,6 +25,7 @@ rayon = [
 mpz-circuits = { workspace = true }
 mpz-common = { workspace = true, features = ["future"] }
 mpz-core = { workspace = true }
+mpz-fields = { workspace = true }
 mpz-memory-core = { workspace = true }
 mpz-ot-core = { workspace = true }
 mpz-vm-core = { workspace = true }
@@ -46,6 +49,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_arrays = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+utils = { workspace = true }
 
 [dev-dependencies]
 mpz-circuits = { workspace = true, features = ["aes"] }

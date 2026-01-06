@@ -48,6 +48,69 @@ pub use mpz_circuits::Circuit;
 /// Statistical security parameter for authenticated garbling
 pub const SSP: usize = 40;
 
+/// Generate preprocessing material for authenticated garbling.
+///
+/// When `fcp` feature is disabled (default): Uses WRK17/Fpre protocol
+/// When `fcp` feature is enabled: Uses compressed Fcp protocol
+///
+/// # Arguments
+/// * `num_and` - Number of AND gates
+/// * `num_wires` - Number of wire shares (only used for Fpre)
+/// * `bucket_size` - Bucket size for bucketing (only used for Fpre)
+/// * `seed` - Random seed
+/// * `rng` - Random number generator
+///
+/// # Returns
+/// (Generator output, Evaluator output) containing wire_shares and triple_shares
+#[cfg(not(feature = "fcp"))]
+pub fn generate_preprocessing(
+    num_and: usize,
+    num_wires: usize,
+    bucket_size: usize,
+    seed: u64,
+    rng: &mut rand::rngs::StdRng,
+) -> (
+    (Vec<AuthBitShare>, Vec<AuthTripleShare>),
+    (Vec<AuthBitShare>, Vec<AuthTripleShare>),
+) {
+    let (gen_output, eval_output) = fpre(num_wires, num_and, bucket_size, seed, rng);
+    (
+        (gen_output.wire_shares, gen_output.triple_shares),
+        (eval_output.wire_shares, eval_output.triple_shares),
+    )
+}
+
+/// Generate preprocessing material for authenticated garbling using Fcp.
+///
+/// Uses the compressed Fcp protocol when `fcp` feature is enabled.
+///
+/// # Arguments
+/// * `num_and` - Number of AND gates
+/// * `_num_wires` - Unused (kept for API compatibility)
+/// * `_bucket_size` - Unused (kept for API compatibility)
+/// * `seed` - Random seed
+/// * `rng` - Random number generator
+///
+/// # Returns
+/// (Generator output, Evaluator output) containing wire_shares and triple_shares
+#[cfg(feature = "fcp")]
+pub fn generate_preprocessing<R: rand::Rng + rand::CryptoRng>(
+    num_and: usize,
+    _num_wires: usize,  // Unused in Fcp
+    _bucket_size: usize,  // Unused in Fcp
+    seed: u64,
+    rng: &mut R,
+) -> (
+    (Vec<AuthBitShare>, Vec<AuthTripleShare>),
+    (Vec<AuthBitShare>, Vec<AuthTripleShare>),
+) {
+    let (gen_output, eval_output) = fcp(num_and, seed, rng);
+    (
+        (gen_output.wire_shares, gen_output.triple_shares),
+        (eval_output.wire_shares, eval_output.triple_shares),
+    )
+}
+
 const KB: usize = 1024;
 const BYTES_PER_GATE: usize = 32;
 
