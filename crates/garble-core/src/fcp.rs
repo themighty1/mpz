@@ -938,9 +938,14 @@ impl FcpEval {
                     Block::ZERO
                 };
 
-                // v_{k,3} = similar subtraction
-                let val_3 = if idx_gamma < self.v_full.len() && (2 * n + k) < self.v_full[0].len() {
-                    self.v_full[0][2 * n + k] ^ self.v_full[idx_gamma][2 * n + k]
+                // v_{k,3} = â_k α β + c_{k,3}
+                // α·â_k is at position 2n+k in A's input
+                // Use subtraction trick: v_full[idx_beta_gamma][2n+k] - v_full[idx_gamma][2n+k]
+                let val_3 = if idx_beta_gamma < self.v_full.len()
+                    && idx_gamma < self.v_full.len()
+                    && (2 * n + k) < self.v_full[0].len()
+                {
+                    self.v_full[idx_beta_gamma][2 * n + k] ^ self.v_full[idx_gamma][2 * n + k]
                 } else {
                     Block::ZERO
                 };
