@@ -5,6 +5,8 @@
 #![forbid(unsafe_code)]
 
 pub mod gf2_128;
+pub mod goldilocks;
+pub mod m61;
 pub mod p256;
 
 use std::{

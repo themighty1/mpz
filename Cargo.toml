@@ -3,6 +3,8 @@ members = [
     "crates/core",
     "crates/common",
     "crates/fields",
+    "crates/justvengers-core",
+    "crates/justvengers",
     "crates/circuits",
     "crates/circuits-core",
     "crates/circuits-data",
@@ -70,6 +72,8 @@ mpz-memory-core = { path = "crates/memory-core" }
 mpz-vm-core = { path = "crates/vm-core" }
 mpz-zk-core = { path = "crates/zk-core" }
 mpz-zk = { path = "crates/zk" }
+mpz-justvengers-core = { path = "crates/justvengers-core" }
+mpz-justvengers = { path = "crates/justvengers" }
 clmul = { path = "crates/clmul" }
 matrix-transpose = { path = "crates/matrix-transpose" }
 rangeset = "0.4"
