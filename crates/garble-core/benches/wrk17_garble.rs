@@ -98,7 +98,8 @@ fn bench_wrk17_garble(c: &mut Criterion) {
             let (_px_gen, _py_gen) = gb.generate_de(circuit).unwrap();
             let (px_eval, py_eval) = ev.generate_de(circuit).unwrap();
 
-            // Now measure only the garbling phase
+            // Now measure only the garbling phase (including finish)
+            let masked_values = vec![false; circuit.feed_count()];
             b.iter(|| {
                 for _ in 0..iterations {
                     let mut iter = gb
@@ -110,8 +111,8 @@ fn bench_wrk17_garble(c: &mut Criterion) {
                             py_eval.clone(),
                         )
                         .unwrap();
-                    let gates: Vec<_> = iter.by_ref().collect();
-                    black_box(gates);
+                    let _gates: Vec<_> = iter.by_ref().collect();
+                    black_box(iter.finish(masked_values.clone()).unwrap());
                 }
             })
         });
@@ -161,7 +162,8 @@ fn bench_wrk17_garble(c: &mut Criterion) {
             let (_px_gen, _py_gen) = gb.generate_de(circuit).unwrap();
             let (px_eval, py_eval) = ev.generate_de(circuit).unwrap();
 
-            // Now measure only the garbling phase
+            // Now measure only the garbling phase (including finish)
+            let masked_values = vec![false; circuit.feed_count()];
             b.iter(|| {
                 for _ in 0..iterations {
                     let mut iter = gb
@@ -173,8 +175,8 @@ fn bench_wrk17_garble(c: &mut Criterion) {
                             py_eval.clone(),
                         )
                         .unwrap();
-                    let gates: Vec<_> = iter.by_ref().collect();
-                    black_box(gates);
+                    let _gates: Vec<_> = iter.by_ref().collect();
+                    black_box(iter.finish(masked_values.clone()).unwrap());
                 }
             })
         });

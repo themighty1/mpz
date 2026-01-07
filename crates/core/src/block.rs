@@ -142,6 +142,13 @@ impl Block {
         (self.0[0] & 1) == 1
     }
 
+    /// Multiplies the block by a boolean value.
+    /// Returns the block if the value is true, otherwise returns zero.
+    #[inline]
+    pub fn mul_bool(self, value: bool) -> Self {
+        self & Self::SELECT_MASK[value as usize]
+    }
+
     /// Let `x0` and `x1` be the lower and higher halves of `x`, respectively.
     /// This function compute ``sigma( x = x0 || x1 ) = x1 || (x0 xor x1)``.
     #[inline(always)]

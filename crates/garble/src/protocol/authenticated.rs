@@ -9,7 +9,9 @@ pub use auth_gen::AuthGen;
 
 #[cfg(test)]
 mod tests {
-    use mpz_circuits::circuits::AES128;
+    use aes::Aes128;
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+    use mpz_circuits::AES128;
     use mpz_common::context::test_st_context;
     use mpz_memory_core::{
         Array, MemoryExt, ViewExt,
@@ -21,6 +23,14 @@ mod tests {
     use rand::{SeedableRng, rngs::StdRng};
 
     use super::*;
+
+    /// Compute cleartext AES-128 encryption for testing
+    fn aes128_encrypt(key: [u8; 16], plaintext: [u8; 16]) -> [u8; 16] {
+        let cipher = Aes128::new(&key.into());
+        let mut block = plaintext.into();
+        cipher.encrypt_block(&mut block);
+        block.into()
+    }
 
     #[test]
     fn test_semihonest_is_vm() {
@@ -104,9 +114,15 @@ mod tests {
             }
         );
 
+        // Verify both parties agree on the values
         assert_eq!(gen_key, ev_key);
         assert_eq!(gen_msg, ev_msg);
         assert_eq!(gen_ciphertext, ev_ciphertext);
+
+        // Verify the garbled circuit output matches cleartext AES computation
+        let expected = aes128_encrypt(gen_key, gen_msg);
+        assert_eq!(gen_ciphertext, expected, "Garbled circuit output does not match cleartext AES");
+        assert_eq!(ev_ciphertext, expected, "Evaluator output does not match cleartext AES");
     }
 
     #[tokio::test]
@@ -196,8 +212,7 @@ mod tests {
                 gb.commit(msg_2).unwrap();
 
                 gb.execute_all(&mut ctx_a).await.unwrap();
-                ciphertext.try_recv().unwrap().unwrap();
-                ciphertext_2.try_recv().unwrap().unwrap()
+                (ciphertext.try_recv().unwrap().unwrap(), ciphertext_2.try_recv().unwrap().unwrap())
             },
             async {
                 let key: Array<U8, 16> = ev.alloc().unwrap();
@@ -254,11 +269,21 @@ mod tests {
                 ev.commit(msg_2).unwrap();
 
                 ev.execute_all(&mut ctx_b).await.unwrap();
-                ciphertext.try_recv().unwrap().unwrap();
-                ciphertext_2.try_recv().unwrap().unwrap()
+                (ciphertext.try_recv().unwrap().unwrap(), ciphertext_2.try_recv().unwrap().unwrap())
             }
         );
 
+        // Verify both parties agree on the outputs
         assert_eq!(gen_out, ev_out);
+
+        // Verify the garbled circuit outputs match cleartext AES computation
+        // First parallel call: AES([69u8;16], [42u8;16])
+        let expected_ciphertext_2 = aes128_encrypt([69u8; 16], [42u8; 16]);
+        assert_eq!(gen_out.1, expected_ciphertext_2, "Parallel AES output does not match cleartext");
+
+        // Chained calls: output = AES([0u8;16], [42u8;16]), then final = AES([0u8;16], output)
+        let intermediate = aes128_encrypt([0u8; 16], [42u8; 16]);
+        let expected_ciphertext = aes128_encrypt([0u8; 16], intermediate);
+        assert_eq!(gen_out.0, expected_ciphertext, "Chained AES output does not match cleartext");
     }
 }

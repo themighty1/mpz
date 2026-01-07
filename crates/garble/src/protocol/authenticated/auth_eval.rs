@@ -21,7 +21,7 @@ use mpz_ot::cot::COTReceiverOutput;
 
 use serio::{SinkExt, stream::IoStreamExt};
 
-use crate::{auth_eval::receive_garbled_circuit, store::AuthEvalStore};
+use crate::{auth_eval::receive_garbled_circuit, store::auth_eval::AuthEvalStore};
 
 struct PendingFlush {
     cot: Option<Box<dyn Output<COTReceiverOutput<Block>> + Send>>,

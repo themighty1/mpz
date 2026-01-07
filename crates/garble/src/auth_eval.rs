@@ -14,7 +14,7 @@ use mpz_core::Block;
 use mpz_cointoss::{cointoss_receiver, CointossError};
 
 #[tracing::instrument(fields(thread = %ctx.id()), skip_all)]
-pub async fn receive_garbled_circuit(
+pub(crate) async fn receive_garbled_circuit(
     ctx: &mut Context,
     circ: &Circuit,
 ) -> Result<AuthGarbledCircuit, AuthEvaluatorError> {
@@ -40,7 +40,7 @@ pub async fn receive_garbled_circuit(
 /// This function performs blocking computation, so be careful when calling it
 /// from an async context.
 #[tracing::instrument(fields(thread = %ctx.id()), skip_all)]
-pub async fn evaluate(
+pub(crate) async fn evaluate(
     ctx: &mut Context,
     circ: Arc<Circuit>,
     delta: Delta,

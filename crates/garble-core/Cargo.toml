@@ -10,7 +10,7 @@ workspace = true
 name = "mpz_garble_core"
 
 [features]
-default = []
+default = ["fcp"]
 # Use Fcp (compressed preprocessing) instead of Fpre
 fcp = []
 rayon = [
@@ -65,4 +65,12 @@ harness = false
 
 [[bench]]
 name = "evaluate"
+harness = false
+
+[[bench]]
+name = "wrk17_garble"
+harness = false
+
+[[bench]]
+name = "wrk17_preprocess"
 harness = false

@@ -16,7 +16,7 @@ use mpz_cointoss::{cointoss_sender, CointossError};
 /// This function performs blocking computation, so be careful when calling it
 /// from an async context.
 #[tracing::instrument(fields(thread = %ctx.id()), skip_all)]
-pub async fn generate(
+pub(crate) async fn generate(
     ctx: &mut Context,
     circ: Arc<Circuit>,
     delta: Delta,

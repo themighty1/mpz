@@ -2,6 +2,10 @@
 
 mod evaluator;
 mod garbler;
+/// Authenticated generator store.
+pub mod auth_gen;
+/// Authenticated evaluator store.
+pub mod auth_eval;
 
 pub use evaluator::{EvaluatorStore, EvaluatorStoreError};
 pub use garbler::{GarblerStore, GarblerStoreError};
@@ -10,6 +14,8 @@ use blake3::Hash;
 use mpz_core::bitvec::BitVec;
 use mpz_memory_core::correlated::{Mac, MacCommitment};
 use serde::{Deserialize, Serialize};
+
+use crate::view::AuthFlushView;
 
 /// Flush message sent by the garbler.
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,6 +42,43 @@ pub struct EvaluatorFlush {
 pub struct MacProof {
     bits: BitVec,
     proof: Hash,
+}
+
+/// Flush message sent by auth generator.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthGenFlush {
+    /// Flush view.
+    pub(crate) view: AuthFlushView,
+    /// Share proof.
+    pub(crate) share_proof: Option<ShareProof>,
+    /// Half masked inputs.
+    pub(crate) half_masked_inputs: BitVec,
+    /// Input labels.
+    pub(crate) labels: Vec<Mac>,
+    /// Decode share proof.
+    pub(crate) decode_share_proof: Option<ShareProof>,
+}
+
+/// Flush message sent by auth evaluator.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AuthEvalFlush {
+    /// Flush view.
+    pub(crate) view: AuthFlushView,
+    /// Share proof.
+    pub(crate) share_proof: Option<ShareProof>,
+    /// Half masked inputs.
+    pub(crate) half_masked_inputs: BitVec,
+    /// Output labels.
+    pub(crate) labels: Vec<Mac>,
+    /// Decode share proof.
+    pub(crate) decode_share_proof: Option<ShareProof>,
+}
+
+/// Share proof sent from the generator to the evaluator to prove inputs shares
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShareProof {
+    pub(crate) bits: BitVec,
+    pub(crate) macs: Vec<Mac>,
 }
 
 mod validation {

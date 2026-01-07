@@ -55,11 +55,13 @@
 
 mod keys;
 mod macs;
+pub mod auth;
 
 use std::ops::BitXor;
 
 pub use keys::{Key, KeyStore, KeyStoreError};
 pub use macs::{Mac, MacStore, MacStoreError};
+pub use auth::{AuthBitStore, AuthBitStoreError};
 
 use mpz_core::Block;
 
@@ -103,6 +105,20 @@ impl Delta {
     #[inline]
     pub fn into_inner(self) -> Block {
         self.0
+    }
+
+    /// Sets the least significant bit and returns self.
+    #[inline]
+    pub fn set_lsb(mut self, value: bool) -> Self {
+        self.0.set_lsb(value);
+        self
+    }
+
+    /// Multiplies the delta by a boolean value.
+    /// Returns the block if the value is true, otherwise returns zero.
+    #[inline]
+    pub fn mul_bool(&self, value: bool) -> Block {
+        self.0.mul_bool(value)
     }
 }
 

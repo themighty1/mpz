@@ -32,6 +32,8 @@ fn take_preprocess_calls(call_stack: &mut Vec<(Call, Slice)>) -> Vec<(Call, Slic
 
 #[cfg(test)]
 mod tests {
+    use aes::Aes128;
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
     use mpz_circuits::AES128;
     use mpz_common::{Flush, context::test_st_context};
     use mpz_core::Block;
@@ -48,6 +50,14 @@ mod tests {
     use rand::{SeedableRng, rngs::StdRng};
 
     use super::*;
+
+    /// Compute cleartext AES-128 encryption for testing
+    fn aes128_encrypt(key: [u8; 16], plaintext: [u8; 16]) -> [u8; 16] {
+        let cipher = Aes128::new(&key.into());
+        let mut block = plaintext.into();
+        cipher.encrypt_block(&mut block);
+        block.into()
+    }
 
     #[test]
     fn test_semihonest_is_vm() {
@@ -122,7 +132,13 @@ mod tests {
             }
         );
 
+        // Verify both parties agree on the output
         assert_eq!(gen_out, ev_out);
+
+        // Verify the garbled circuit output matches cleartext AES computation
+        let expected = aes128_encrypt([0u8; 16], [42u8; 16]);
+        assert_eq!(gen_out, expected, "Garbled circuit output does not match cleartext AES");
+        assert_eq!(ev_out, expected, "Evaluator output does not match cleartext AES");
     }
 
     #[tokio::test]

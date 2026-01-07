@@ -4,7 +4,7 @@ use mpz_common::{Context, ContextError, Flush};
 use mpz_core::{Block, bitvec::{BitVec, BitSlice}};
 use mpz_garble_core::{
     Delta, Key, Mac,
-    store::{AuthGenStore as Core, AuthGenStoreError as CoreError},
+    store::auth_gen::{AuthGenStore as Core, AuthGenStoreError as CoreError},
 };
 use mpz_memory_core::{DecodeFuture, Memory, Slice, View, binary::Binary};
 use mpz_ot::cot::{COTReceiver, COTSender};

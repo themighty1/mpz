@@ -13,9 +13,8 @@ use mpz_memory_core::{
 use mpz_ot_core::cot::COTSender;
 
 use crate::{
-    FlushView,
     store::{EvaluatorFlush, GarblerFlush, MacProof},
-    view::{View, ViewError},
+    view::{FlushView, View, ViewError},
 };
 
 type Error = GarblerStoreError;

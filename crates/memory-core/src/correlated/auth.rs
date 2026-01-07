@@ -155,7 +155,7 @@ impl AuthBitStore {
     pub fn prove_share(&self, ranges: &RangeSet) -> Result<(BitVec, Vec<Mac>)> {
         let mut bits = BitVec::with_capacity(ranges.len());
         let mut macs = Vec::with_capacity(ranges.len());
-        for range in ranges.iter_ranges() {
+        for range in ranges.iter() {
             let slice = Slice::from_range_unchecked(range);
             let slice_bits = self.bits.try_get(slice)?;
             let slice_macs = self.macs.try_get(slice)?;    
@@ -170,7 +170,7 @@ impl AuthBitStore {
 
     pub fn check_share(&mut self, ranges: &RangeSet, bits: &BitVec, macs: &[Mac]) -> Result<()> {
         let mut expected_macs = Vec::with_capacity(ranges.len());
-        for range in ranges.iter_ranges() {
+        for range in ranges.iter() {
             let slice = Slice::from_range_unchecked(range);
             expected_macs.extend(self.keys.authenticate(slice, bits)?);
         }

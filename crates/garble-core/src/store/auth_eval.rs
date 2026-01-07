@@ -223,11 +223,13 @@ where
         let view = self.view.flush().clone();
 
         // Send OT keys for masks.
-        let masks = view.gen_masks.clone() | view.eval_masks.clone() | view.public.clone();
+        let mut masks = view.gen_masks.clone();
+        masks |= &view.eval_masks;
+        masks |= &view.public;
         if !masks.is_empty() {
             let keys = (0..masks.len()).map(|_| self.prg.random()).collect::<Vec<_>>();
             // Store keys in mask store.
-            for range in masks.iter_ranges() {
+            for range in masks.iter() {
                 let slice = Slice::from_range_unchecked(range);
                 self.mask_store.try_set_keys(slice, &keys)?;
             }
@@ -244,7 +246,7 @@ where
         let cot = if !masks.is_empty() {
             // Collect the choices for oblivious transfer.
             let choices: Vec<bool> = (0..masks.len()).map(|_| self.prg.random()).collect::<Vec<_>>();
-            for range in masks.iter_ranges() {
+            for range in masks.iter() {
                 let slice = Slice::from_range_unchecked(range);
                 self.mask_store.try_set_bits(slice, &BitVec::from_iter(choices.iter()))?;
             }
@@ -264,7 +266,7 @@ where
             let (bits1, macs1) = self.mask_store.prove_share(&view.gen_reveal)?;
             // Set masked_value_store using sent bits
             let mut i = 0;
-            for range in view.gen_reveal.iter_ranges() {
+            for range in view.gen_reveal.iter() {
                 let slice = Slice::from_range_unchecked(range);
                 self.masked_value_store
                     .try_set(slice, &bits1[i..i + slice.len()])?;
@@ -273,7 +275,7 @@ where
 
             i = 0;
             let (bits2, macs2) = self.mask_store.prove_share(&view.public_decode)?;
-            for range in view.public_decode.iter_ranges() {
+            for range in view.public_decode.iter() {
                 let slice = Slice::from_range_unchecked(range);
                 self.masked_value_store.try_set(slice, &bits2[i..i + slice.len()])?;
                 let data = self.data_store.try_get(slice)?;
@@ -289,7 +291,7 @@ where
 
         // Send half masked inputs corresponding to Eval's input wires. 
         let mut half_masked_inputs = BitVec::with_capacity(view.eval_reveal.len());
-        for range in view.eval_reveal.iter_ranges() {
+        for range in view.eval_reveal.iter() {
             let slice = Slice::from_range_unchecked(range);
             let mask_bits = self.mask_store.try_get_bits(slice)?;
             let data_bits = self.data_store.try_get(slice)?;
@@ -306,7 +308,7 @@ where
 
         // output labels
         let mut labels = Vec::with_capacity(view.decode_info.len());
-        for range in view.decode_info.iter_ranges() {
+        for range in view.decode_info.iter() {
             let slice = Slice::from_range_unchecked(range);
             labels.extend(self.mac_store.try_get(slice)?);
         }
@@ -362,7 +364,9 @@ where
         }
 
         // Receive OT macs for masks, expects COT to be flushed.
-        let masks = view.gen_masks.clone() | view.eval_masks.clone() | view.public.clone();
+        let mut masks = view.gen_masks.clone();
+        masks |= &view.eval_masks;
+        masks |= &view.public;
         let mut i = 0;
         if let Some(mut cot) = cot {
             let COTReceiverOutput { msgs: macs, .. } = cot
@@ -370,7 +374,7 @@ where
                 .map_err(Error::cot)?
                 .ok_or_else(|| Error::cot("COT output is not ready"))?;
             let macs = Mac::from_blocks(macs);
-            for range in masks.iter_ranges() {
+            for range in masks.iter() {
                 let slice = Slice::from_range_unchecked(range);
                 self.mask_store.try_set_macs(slice, &macs[i..i + slice.len()])?;
                 i += slice.len();
@@ -385,14 +389,14 @@ where
             self.mask_store.check_share(&view.public_decode, &bits2, &macs[view.eval_reveal.len()..])?;
             // Update masked values of eval's input wires with share proof bits
             let mut i = 0;
-            for range in view.eval_reveal.iter_ranges() {
+            for range in view.eval_reveal.iter() {
                 let slice = Slice::from_range_unchecked(range);
                 self.masked_value_store.update_xor(slice, &bits1[i..i + slice.len()])?;
                 i += slice.len();
             }
 
             i = 0;
-            for range in view.public_decode.iter_ranges() {
+            for range in view.public_decode.iter() {
                 let slice = Slice::from_range_unchecked(range);
                 self.masked_value_store.update_xor(slice, &bits2[i..i + slice.len()])?;
                 i += slice.len();
@@ -401,7 +405,7 @@ where
 
         // Update masked values with gen's half masked inputs
         i = 0;
-        for range in view.gen_reveal.iter_ranges() {
+        for range in view.gen_reveal.iter() {
             let slice = Slice::from_range_unchecked(range);
             self.masked_value_store.update_xor(slice, &half_masked_inputs[i..i + slice.len()])?;
             i += slice.len();
@@ -409,7 +413,7 @@ where
 
         // Store MAC labels
         let mut i = 0;
-        for range in view.labels.iter_ranges() {
+        for range in view.labels.iter() {
             let slice = Slice::from_range_unchecked(range);
             self.mac_store.try_set(slice, &labels[i..i + slice.len()])?;
             i += slice.len();
@@ -420,7 +424,7 @@ where
 
             // Decode gen's input wires.
             let mut i = 0;
-            for range in view.gen_decode.iter_ranges() {
+            for range in view.gen_decode.iter() {
                 let slice = Slice::from_range_unchecked(range);
                 self.data_store.try_set(slice, &bits[i..i + slice.len()])?;
                 self.data_store.update_xor(slice, self.masked_value_store.try_get(slice)?)?;
