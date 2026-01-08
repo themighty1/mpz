@@ -89,9 +89,10 @@ pub use protocol::{run_prover, run_prover_with_vole, run_verifier, run_protocol 
 pub use jv_optimized::{
     JVProver, JVVerifier, JVProverPhase, JVVerifierPhase,
     JVSetupMessage, JVCommitmentMessage, JVDisclosureMessage, JVOpenMessage,
-    JVLpzkProofMessage, AggregatedLpzkProofMessage,
+    JVLpzkProofMessage, AggregatedLpzkProofMessage, ItPacOpenMessage,
     JVProverError, JVVerifierError, JVProtocolError,
     run_jv_protocol, estimate_communication, CommunicationEstimate,
+    extract_verifier_shares_from_pool, GoldilocksItMac,
 };
 
 /// Protocol parameters for Justvengers.

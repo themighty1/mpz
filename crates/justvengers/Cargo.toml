@@ -43,14 +43,6 @@ futures = { workspace = true }
 tokio = { workspace = true }
 
 [[bench]]
-name = "e2e_bench"
-harness = false
-
-[[bench]]
-name = "prover"
-harness = false
-
-[[bench]]
 name = "vm_bench"
 harness = false
 

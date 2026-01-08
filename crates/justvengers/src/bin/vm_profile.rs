@@ -17,11 +17,12 @@ use mpz_justvengers::{
     Circuit, CircuitBatch, SolderingConstraint,
     topology::TopologyVector,
     soldering::SolderingChallengeMessage,
-    JVProver, JVVerifier,
+    JVProver, JVVerifier, JVSetupMessage, GoldilocksItMac,
 };
 
 use mpz_core::{prg::Prg, Block};
 use mpz_fields::goldilocks::GOLDILOCKS;
+use mpz_justvengers_core::{GlobalKey, VolePool};
 use rand::{Rng, SeedableRng};
 
 const MODULUS: u64 = GOLDILOCKS;
@@ -31,12 +32,14 @@ const NUM_INPUTS: usize = STATE_SIZE * 2 + 1;
 
 #[derive(Clone)]
 struct RecordedVerifierMessages {
-    eval_points: Vec<u64>,
+    setup_msg: JVSetupMessage,
     chi: u64,
     topology_vectors: Vec<TopologyVector>,
     soldering_challenge: Option<SolderingChallengeMessage>,
     rho: u64,
     gamma: u64,
+    global_key: GlobalKey<GoldilocksItMac>,
+    circuit_size: usize,
 }
 
 fn create_vm_circuit(op_value: u64) -> Circuit {
@@ -144,10 +147,14 @@ fn record_verifier_messages<const R: usize>(
     let setup_msg = verifier.setup(circuits, &mut rng).unwrap();
     verifier.setup_soldering(soldering_constraints.to_vec()).unwrap();
 
-    let eval_points = setup_msg.eval_points.clone();
     let topology_vectors = verifier.topology_vectors().to_vec();
+    let global_key = verifier.global_key().clone();
+    let circuit_size = circuits.get(0).map(|c| c.num_wires()).unwrap_or(10);
 
-    let commitment = prover.commit(&setup_msg.eval_points).unwrap();
+    // Create VOLE pool for IT-PAC
+    let vole_pool = VolePool::generate(&global_key, circuit_size * 2, &mut rng);
+
+    let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
     let soldering_commit = prover.commit_soldering().unwrap();
 
     let chi = verifier.receive_commitment(commitment).unwrap();
@@ -178,12 +185,14 @@ fn record_verifier_messages<const R: usize>(
     assert!(result, "Protocol verification failed during recording");
 
     RecordedVerifierMessages {
-        eval_points,
+        setup_msg,
         chi,
         topology_vectors,
         soldering_challenge,
         rho,
         gamma,
+        global_key,
+        circuit_size,
     }
 }
 
@@ -200,7 +209,10 @@ fn run_prover_with_replay<const R: usize>(
     prover.setup(circuits, inputs_per_rep).unwrap();
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
-    let _commitment = prover.commit(&recorded.eval_points).unwrap();
+    // Create VOLE pool for IT-PAC
+    let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
+
+    let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
     let _soldering_commit = prover.commit_soldering().unwrap();
 
     let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
@@ -210,7 +222,70 @@ fn run_prover_with_replay<const R: usize>(
     }
 
     let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
+
+    // IT-PAC opening
+    let _itpac_open_msg = prover.open_itpac().unwrap();
+
     let _lpzk_proof = prover.prove_multiplications_aggregated(recorded.gamma).unwrap();
+}
+
+/// Runs ONLY the protocol phases (no setup) for profiling pure prover time.
+/// Setup is done once, then protocol phases are run `iters` times via cloning.
+fn run_protocol_only<const R: usize>(
+    circuits: &CircuitBatch,
+    active_branches: &[usize],
+    inputs_per_rep: &[Vec<u64>],
+    soldering_constraints: &[SolderingConstraint],
+    recorded: &RecordedVerifierMessages,
+    iters: usize,
+) {
+    let mut rng = Prg::from_seed(Block::ZERO);
+
+    // Setup done ONCE outside the profiling loop
+    eprintln!("Setting up prover (one-time)...");
+    let setup_start = Instant::now();
+    let mut base_prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    base_prover.setup(circuits, inputs_per_rep).unwrap();
+    base_prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
+    eprintln!("Setup done in {:.2} ms", setup_start.elapsed().as_secs_f64() * 1000.0);
+
+    // Now profile ONLY the protocol phases (commit, disclose, open, prove)
+    eprintln!("\n=== PROFILING ZONE START (protocol phases only) ===");
+    let profile_start = Instant::now();
+
+    for i in 0..iters {
+        // Clone the setup prover to reset state
+        let mut prover = base_prover.clone();
+
+        // Create VOLE pool for IT-PAC
+        let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
+
+        // Protocol phases only - this is what we're profiling
+        let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
+        let _soldering_commit = prover.commit_soldering().unwrap();
+        let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
+
+        if let Some(ref challenge) = recorded.soldering_challenge {
+            let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
+        }
+
+        let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
+
+        // IT-PAC opening
+        let _itpac_open_msg = prover.open_itpac().unwrap();
+
+        let _lpzk_proof = prover.prove_multiplications_aggregated(recorded.gamma).unwrap();
+
+        if (i + 1) % 10 == 0 {
+            eprintln!("  {} iterations done", i + 1);
+        }
+    }
+
+    let profile_elapsed = profile_start.elapsed();
+    eprintln!("=== PROFILING ZONE END ===\n");
+    eprintln!("{} iterations in {:.2} s ({:.2} ms/iter)",
+              iters, profile_elapsed.as_secs_f64(),
+              profile_elapsed.as_secs_f64() * 1000.0 / iters as f64);
 }
 
 /// Runs prover with detailed timing for each phase.
@@ -235,8 +310,11 @@ fn run_prover_with_timing<const R: usize>(
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
     let t_setup_solder = t2.elapsed();
 
+    // Create VOLE pool for IT-PAC
+    let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
+
     let t3 = Instant::now();
-    let _commitment = prover.commit(&recorded.eval_points).unwrap();
+    let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
     let t_commit = t3.elapsed();
 
     let t4 = Instant::now();
@@ -277,7 +355,7 @@ fn run_prover_with_timing<const R: usize>(
 }
 
 macro_rules! impl_profile {
-    ($r:expr, $circuits:expr, $active_branches:expr, $inputs:expr, $soldering:expr, $iters:expr, $final_acc:expr) => {{
+    ($r:expr, $circuits:expr, $active_branches:expr, $inputs:expr, $soldering:expr, $iters:expr, $final_acc:expr, $protocol_only:expr) => {{
         const R: usize = $r;
 
         eprintln!("Recording verifier messages for R={}...", R);
@@ -289,34 +367,46 @@ macro_rules! impl_profile {
         );
         eprintln!("Recording done.");
 
-        // Run once with detailed timing
-        run_prover_with_timing::<R>(
-            &$circuits,
-            &$active_branches,
-            &$inputs,
-            &$soldering,
-            &recorded,
-        );
-
-        eprintln!("\nStarting {} iterations of prover replay...", $iters);
-        let start = Instant::now();
-
-        for i in 0..$iters {
-            run_prover_with_replay::<R>(
+        if $protocol_only {
+            // Profile ONLY protocol phases (setup done once, cloned for each iteration)
+            run_protocol_only::<R>(
+                &$circuits,
+                &$active_branches,
+                &$inputs,
+                &$soldering,
+                &recorded,
+                $iters,
+            );
+        } else {
+            // Run once with detailed timing
+            run_prover_with_timing::<R>(
                 &$circuits,
                 &$active_branches,
                 &$inputs,
                 &$soldering,
                 &recorded,
             );
-            if (i + 1) % 10 == 0 {
-                eprintln!("  {} iterations done", i + 1);
-            }
-        }
 
-        let elapsed = start.elapsed();
-        eprintln!("\n{} iterations completed in {:.2} s ({:.2} ms/iter)",
-                  $iters, elapsed.as_secs_f64(), elapsed.as_secs_f64() * 1000.0 / $iters as f64);
+            eprintln!("\nStarting {} iterations of prover replay (full)...", $iters);
+            let start = Instant::now();
+
+            for i in 0..$iters {
+                run_prover_with_replay::<R>(
+                    &$circuits,
+                    &$active_branches,
+                    &$inputs,
+                    &$soldering,
+                    &recorded,
+                );
+                if (i + 1) % 10 == 0 {
+                    eprintln!("  {} iterations done", i + 1);
+                }
+            }
+
+            let elapsed = start.elapsed();
+            eprintln!("\n{} iterations completed in {:.2} s ({:.2} ms/iter)",
+                      $iters, elapsed.as_secs_f64(), elapsed.as_secs_f64() * 1000.0 / $iters as f64);
+        }
         eprintln!("Final accumulator: {}", $final_acc);
     }};
 }
@@ -330,12 +420,16 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10);
+    let protocol_only: bool = env::var("PROTOCOL_ONLY")
+        .ok()
+        .map(|s| s == "1" || s.to_lowercase() == "true")
+        .unwrap_or(false);
 
     eprintln!("VM Profile Configuration:");
     eprintln!("  Branches: {}", NUM_BRANCHES);
     eprintln!("  State size: {}", STATE_SIZE);
     eprintln!("  Inputs per rep: {}", NUM_INPUTS);
-    eprintln!("  REPS={} ITERS={}", reps, iters);
+    eprintln!("  REPS={} ITERS={} PROTOCOL_ONLY={}", reps, iters, protocol_only);
 
     let circuits = create_vm_circuit_batch();
 
@@ -351,23 +445,23 @@ fn main() {
     match reps {
         100 => {
             let (inputs, branches, final_acc) = generate_vm_inputs_per_rep(100);
-            impl_profile!(100, circuits, branches, inputs, soldering, iters, final_acc);
+            impl_profile!(100, circuits, branches, inputs, soldering, iters, final_acc, protocol_only);
         }
         1000 => {
             let (inputs, branches, final_acc) = generate_vm_inputs_per_rep(1000);
-            impl_profile!(1000, circuits, branches, inputs, soldering, iters, final_acc);
+            impl_profile!(1000, circuits, branches, inputs, soldering, iters, final_acc, protocol_only);
         }
         10000 => {
             let (inputs, branches, final_acc) = generate_vm_inputs_per_rep(10000);
-            impl_profile!(10000, circuits, branches, inputs, soldering, iters, final_acc);
+            impl_profile!(10000, circuits, branches, inputs, soldering, iters, final_acc, protocol_only);
         }
         25000 => {
             let (inputs, branches, final_acc) = generate_vm_inputs_per_rep(25000);
-            impl_profile!(25000, circuits, branches, inputs, soldering, iters, final_acc);
+            impl_profile!(25000, circuits, branches, inputs, soldering, iters, final_acc, protocol_only);
         }
         50000 => {
             let (inputs, branches, final_acc) = generate_vm_inputs_per_rep(50000);
-            impl_profile!(50000, circuits, branches, inputs, soldering, iters, final_acc);
+            impl_profile!(50000, circuits, branches, inputs, soldering, iters, final_acc, protocol_only);
         }
         _ => {
             eprintln!("Unsupported REPS value: {}. Supported: 100, 1000, 10000, 25000, 50000", reps);

@@ -14,10 +14,11 @@ use mpz_justvengers::{
     Circuit, CircuitBatch, SolderingConstraint,
     topology::TopologyVector,
     soldering::SolderingChallengeMessage,
-    // JustVengers O(R+B+C) optimized prover
-    JVProver, JVVerifier,
+    // JustVengers O(R+B+C) optimized prover with IT-PAC
+    JVProver, JVVerifier, JVSetupMessage, GoldilocksItMac,
+    extract_verifier_shares_from_pool,
 };
-use mpz_justvengers_core::ItMacField;
+use mpz_justvengers_core::{VolePool, GlobalKey};
 
 use mpz_core::{prg::Prg, Block};
 use mpz_fields::goldilocks::GOLDILOCKS;
@@ -27,50 +28,6 @@ const MODULUS: u64 = GOLDILOCKS;
 const NUM_BRANCHES: usize = 30;
 const STATE_SIZE: usize = 32;
 const NUM_INPUTS: usize = STATE_SIZE * 2 + 1; // old_state + new_state + op
-
-/// Goldilocks field for VOLE operations.
-#[derive(Copy, Clone, Debug, Default, PartialEq)]
-struct GoldilocksField(u64);
-
-impl std::ops::Add for GoldilocksField {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        Self((self.0 + rhs.0) % MODULUS)
-    }
-}
-
-impl std::ops::Sub for GoldilocksField {
-    type Output = Self;
-    fn sub(self, rhs: Self) -> Self {
-        Self((self.0 + MODULUS - rhs.0) % MODULUS)
-    }
-}
-
-impl std::ops::Mul for GoldilocksField {
-    type Output = Self;
-    fn mul(self, rhs: Self) -> Self {
-        Self((self.0 as u128 * rhs.0 as u128 % MODULUS as u128) as u64)
-    }
-}
-
-impl ItMacField for GoldilocksField {
-    fn zero() -> Self { Self(0) }
-    fn one() -> Self { Self(1) }
-    fn random<R: Rng>(rng: &mut R) -> Self {
-        Self(rng.random_range(0..MODULUS))
-    }
-    fn neg(self) -> Self {
-        if self.0 == 0 { Self(0) } else { Self(MODULUS - self.0) }
-    }
-}
-
-impl From<u64> for GoldilocksField {
-    fn from(v: u64) -> Self { Self(v % MODULUS) }
-}
-
-impl From<GoldilocksField> for u64 {
-    fn from(v: GoldilocksField) -> u64 { v.0 }
-}
 
 // Message size computation helpers
 mod msg_size {
@@ -108,7 +65,7 @@ mod msg_size {
 
     pub fn jv_commitment_message(msg: &JVCommitmentMessage) -> usize {
         8 // num_polynomials: usize
-        + msg.poly_commitments.len() * 8 // Vec<u64>
+        + msg.poly_commitment_ciphertexts.len() * 64 // Vec<Ciphertext> - estimate
     }
 
     /// JV Disclosure: O(R) instead of O(RC)!
@@ -235,7 +192,12 @@ fn generate_vm_inputs_per_rep(num_repetitions: usize) -> (Vec<Vec<u64>>, Vec<usi
 /// Recorded verifier messages for JV protocol replay.
 #[derive(Clone)]
 struct JVRecordedMessages {
-    eval_points: Vec<u64>,
+    /// Full setup message including encrypted powers for IT-PAC
+    setup_msg: JVSetupMessage,
+    /// Global key for VOLE generation
+    global_key: GlobalKey<GoldilocksItMac>,
+    /// Circuit size for VOLE pool generation
+    circuit_size: usize,
     chi: u64,
     topology_vectors: Vec<TopologyVector>,
     soldering_challenge: Option<SolderingChallengeMessage>,
@@ -294,7 +256,7 @@ fn jv_record_verifier_messages<const R: usize>(
     let mut rng = Prg::from_seed(Block::ZERO);
     let mut stats = JVProtocolStats::default();
 
-    // Use JVProver instead of ProverState
+    // Use JVProver with IT-PAC
     let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
     prover.setup(circuits, inputs_per_rep).unwrap();
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
@@ -303,14 +265,21 @@ fn jv_record_verifier_messages<const R: usize>(
     let setup_msg = verifier.setup(circuits, &mut rng).unwrap();
     verifier.setup_soldering(soldering_constraints.to_vec()).unwrap();
 
-    // V → P: SetupMessage
+    // V → P: SetupMessage (includes encrypted powers for IT-PAC)
     stats.prover_received += msg_size::jv_setup_message(&setup_msg);
 
-    let eval_points = setup_msg.eval_points.clone();
     let topology_vectors = verifier.topology_vectors().to_vec();
 
-    // P → V: CommitmentMessage
-    let commitment = prover.commit(&setup_msg.eval_points).unwrap();
+    // Create VOLE pool for IT-PAC commitments
+    let circuit_size = circuits.get(0).map(|c| c.num_wires()).unwrap_or(10);
+    let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
+
+    // Extract verifier shares before passing pool to prover
+    let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
+    verifier.set_verifier_local_keys(verifier_shares);
+
+    // P → V: CommitmentMessage (IT-PAC ciphertexts)
+    let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
     let commit_size = msg_size::jv_commitment_message(&commitment);
     stats.prover_sent += commit_size;
     stats.commitment = commit_size;
@@ -367,6 +336,10 @@ fn jv_record_verifier_messages<const R: usize>(
 
     verifier.receive_open(open_msg).unwrap();
 
+    // P → V: IT-PAC Opening (polynomials + MAC tags)
+    let itpac_open_msg = prover.open_itpac().unwrap();
+    assert!(verifier.verify_itpac_opening(&itpac_open_msg), "IT-PAC verification failed");
+
     // P → V: AggregatedLpzkProofMessage - O(R) instead of O(M×R)!
     let gamma = verifier.generate_lpzk_challenge(&mut rng);
     let lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
@@ -378,7 +351,9 @@ fn jv_record_verifier_messages<const R: usize>(
     assert!(result, "JV Protocol verification failed during recording");
 
     JVRecordedMessages {
-        eval_points,
+        setup_msg,
+        global_key: verifier.global_key().clone(),
+        circuit_size,
         chi,
         topology_vectors,
         soldering_challenge,
@@ -401,7 +376,11 @@ fn jv_run_prover_with_replay<const R: usize>(
     prover.setup(circuits, inputs_per_rep).unwrap();
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
-    let _commitment = prover.commit(&recorded.eval_points).unwrap();
+    // Create VOLE pool for IT-PAC commitments (same as in recording)
+    let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
+
+    // P → V: CommitmentMessage (IT-PAC ciphertexts)
+    let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
     let _soldering_commit = prover.commit_soldering().unwrap();
 
     let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
@@ -411,6 +390,9 @@ fn jv_run_prover_with_replay<const R: usize>(
     }
 
     let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
+
+    // IT-PAC opening
+    let _itpac_open_msg = prover.open_itpac().unwrap();
 
     // Use a deterministic gamma for replay (same as recording)
     let gamma = rng.random_range(1..MODULUS);

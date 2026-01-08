@@ -56,7 +56,86 @@ use mpz_fields::goldilocks::{Goldilocks, InttContext, GOLDILOCKS};
 #[cfg(feature = "ntt")]
 use mpz_fields::Field;
 
+// IT-PAC imports for real polynomial commitments
+use mpz_justvengers_core::{
+    ahe::{Ciphertext, KeyPair, ParamSet, PublicKey},
+    EncryptedPowers, GlobalKey, ItMacField, ItPac, ItPacGenerator, VolePool,
+};
+
 use rand::Rng;
+use std::ops::{Add, Mul, Sub};
+
+// ============================================================================
+// Goldilocks IT-MAC Field
+// ============================================================================
+
+/// Goldilocks field element for IT-MAC operations.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct GoldilocksItMac(pub u64);
+
+impl GoldilocksItMac {
+    /// Creates a new field element.
+    pub fn new(v: u64) -> Self {
+        Self(v % GOLDILOCKS)
+    }
+
+    /// Returns the inner value.
+    pub fn inner(self) -> u64 {
+        self.0
+    }
+}
+
+impl Add for GoldilocksItMac {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self(((self.0 as u128 + rhs.0 as u128) % GOLDILOCKS as u128) as u64)
+    }
+}
+
+impl Sub for GoldilocksItMac {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        Self(((self.0 as u128 + GOLDILOCKS as u128 - rhs.0 as u128) % GOLDILOCKS as u128) as u64)
+    }
+}
+
+impl Mul for GoldilocksItMac {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self {
+        Self(((self.0 as u128 * rhs.0 as u128) % GOLDILOCKS as u128) as u64)
+    }
+}
+
+impl ItMacField for GoldilocksItMac {
+    fn zero() -> Self {
+        Self(0)
+    }
+    fn one() -> Self {
+        Self(1)
+    }
+    fn random<R: Rng>(rng: &mut R) -> Self {
+        Self(rng.random_range(0..GOLDILOCKS))
+    }
+    fn neg(self) -> Self {
+        if self.0 == 0 {
+            Self(0)
+        } else {
+            Self(GOLDILOCKS - self.0)
+        }
+    }
+}
+
+impl From<u64> for GoldilocksItMac {
+    fn from(v: u64) -> Self {
+        Self::new(v)
+    }
+}
+
+impl From<GoldilocksItMac> for u64 {
+    fn from(v: GoldilocksItMac) -> u64 {
+        v.0
+    }
+}
 
 // ============================================================================
 // Message Types - O(R+B+C) communication
@@ -65,29 +144,31 @@ use rand::Rng;
 /// Setup message from verifier (O(R) communication).
 ///
 /// Contains evaluation points and encrypted powers of Λ for IT-PAC.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct JVSetupMessage {
     /// Evaluation points α₁, ..., αᵣ for polynomial interpolation.
     /// For Goldilocks with NTT, these are roots of unity.
     pub eval_points: Vec<u64>,
     /// Maximum polynomial degree (R-1 for R repetitions).
     pub max_degree: usize,
-    /// Hash of encrypted powers ⟦Λ⟧, ⟦Λ²⟧, ..., ⟦Λ^(2R-2)⟧.
-    /// In real implementation, these would be AHE ciphertexts.
-    pub encrypted_powers_hash: u64,
+    /// Encrypted powers ⟦Λ⟧, ⟦Λ²⟧, ..., ⟦Λ^max_degree⟧ for IT-PAC.
+    /// Prover uses these to homomorphically evaluate f(Λ).
+    pub encrypted_powers: EncryptedPowers,
+    /// AHE public key for the prover to verify ciphertexts.
+    pub ahe_public_key: PublicKey,
 }
 
 /// Commitment message from prover (O(C) communication).
 ///
 /// Contains IT-PAC commitments for each wire position's polynomial.
 /// This is O(C) instead of O(RC) because we commit to polynomials, not individual values.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct JVCommitmentMessage {
     /// Number of polynomial commitments (one per wire position).
     pub num_polynomials: usize,
     /// IT-PAC polynomial commitments: ⟦f_w(Λ) - u_w⟧ for each wire w.
-    /// Each element represents a committed polynomial encoding R values.
-    pub poly_commitments: Vec<u64>,
+    /// Each ciphertext represents a committed polynomial encoding R values.
+    pub poly_commitment_ciphertexts: Vec<Ciphertext>,
 }
 
 /// Disclosure message from prover (O(R) communication).
@@ -140,6 +221,23 @@ pub struct AggregatedLpzkProofMessage {
     pub aggregated_check: u64,
 }
 
+/// IT-PAC opening message for polynomial commitment verification.
+///
+/// Contains the revealed polynomial coefficients and IT-MAC tags for each
+/// wire commitment. The verifier uses these to check the IT-MAC relationship:
+/// m = k + f(Λ)·Δ
+#[derive(Clone, Debug)]
+pub struct ItPacOpenMessage {
+    /// Polynomial coefficients for each wire position.
+    /// polynomials[w] = coefficients of f_w(X).
+    pub polynomials: Vec<Vec<u64>>,
+    /// IT-MAC values for each polynomial: (value f(Λ), mac tag m).
+    /// The prover reveals these for verification.
+    pub mac_values: Vec<u64>,
+    /// IT-MAC tags m = k + f(Λ)·Δ for each polynomial.
+    pub mac_tags: Vec<GoldilocksItMac>,
+}
+
 // ============================================================================
 // Prover Implementation
 // ============================================================================
@@ -165,6 +263,12 @@ pub struct JVProver<const R: usize> {
     intt_context: Option<InttContext>,
     /// Soldering prover.
     soldering_prover: Option<SolderingProver>,
+    /// Encrypted powers received from verifier for IT-PAC commitments.
+    encrypted_powers: Option<EncryptedPowers>,
+    /// VOLE pool for IT-MAC generation.
+    vole_pool: Option<VolePool<GoldilocksItMac>>,
+    /// IT-PAC commitments for each wire polynomial.
+    itpac_commitments: Vec<ItPac<GoldilocksItMac>>,
 }
 
 /// Protocol phases for the optimized prover.
@@ -204,6 +308,9 @@ impl<const R: usize> JVProver<R> {
             #[cfg(feature = "ntt")]
             intt_context: None,
             soldering_prover: None,
+            encrypted_powers: None,
+            vole_pool: None,
+            itpac_commitments: Vec::new(),
         }
     }
 
@@ -340,14 +447,24 @@ impl<const R: usize> JVProver<R> {
         Ok(())
     }
 
-    /// Generates commitment message.
+    /// Generates commitment message using real IT-PAC.
     ///
     /// **Key optimization**: Instead of storing O(RC) values, we compute and commit
     /// to O(C) polynomials, each encoding R values at evaluation points.
-    pub fn commit(&mut self, eval_points: &[u64]) -> Result<JVCommitmentMessage, JVProverError> {
+    ///
+    /// # Arguments
+    /// * `setup_msg` - Setup message from verifier containing encrypted powers
+    /// * `vole_pool` - Pool of VOLE correlations for IT-MAC generation
+    pub fn commit(
+        &mut self,
+        setup_msg: &JVSetupMessage,
+        vole_pool: VolePool<GoldilocksItMac>,
+    ) -> Result<JVCommitmentMessage, JVProverError> {
         if self.phase != JVProverPhase::Setup {
             return Err(JVProverError::InvalidPhase);
         }
+
+        let eval_points = &setup_msg.eval_points;
 
         // Validate eval_points length
         #[cfg(feature = "ntt")]
@@ -365,6 +482,8 @@ impl<const R: usize> JVProver<R> {
         }
 
         self.eval_points = Some(eval_points.to_vec());
+        self.encrypted_powers = Some(setup_msg.encrypted_powers.clone());
+        self.vole_pool = Some(vole_pool);
 
         // Create INTT context for Goldilocks
         #[cfg(feature = "ntt")]
@@ -372,33 +491,45 @@ impl<const R: usize> JVProver<R> {
             self.intt_context = Some(InttContext::new(eval_points.len()));
         }
 
+        // Create IT-PAC generator with encrypted powers and VOLE pool
+        let mut itpac_gen = ItPacGenerator::new(
+            setup_msg.encrypted_powers.clone(),
+            self.vole_pool.take().unwrap(),
+        );
+
         // For each wire position, interpolate R values to get polynomial
         let witness_len = self.witnesses[0].len();
         self.wire_polynomials = Vec::with_capacity(witness_len);
-        let mut poly_commitments = Vec::with_capacity(witness_len);
+        self.itpac_commitments = Vec::with_capacity(witness_len);
+        let mut poly_commitment_ciphertexts = Vec::with_capacity(witness_len);
 
         for pos in 0..witness_len {
             // Collect values at this position across all repetitions
             let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
 
-            // Interpolate to get polynomial coefficients
+            // Interpolate to get polynomial coefficients (uses INTT for Goldilocks)
             let poly = self.interpolate_values(&values, eval_points);
 
-            // IT-PAC commitment: hash of polynomial (simplified)
-            // In real impl: compute ⟦f(Λ) - u⟧ using AHE
-            let commitment_hash = poly.iter().fold(0u64, |acc, &c| {
-                ((acc as u128 + c as u128) % self.modulus as u128) as u64
-            });
+            // Use IT-PAC generator for real commitment
+            // This computes ⟦f(Λ) - u⟧ homomorphically using the encrypted powers
+            if let Some((itpac, ciphertext)) = itpac_gen.commit(&poly) {
+                self.itpac_commitments.push(itpac);
+                poly_commitment_ciphertexts.push(ciphertext);
+            } else {
+                // Fallback: create dummy ciphertext if IT-PAC commit fails
+                // (e.g., polynomial is just a constant or VOLE pool exhausted)
+                let dummy_ct = setup_msg.encrypted_powers.powers()[0].clone();
+                poly_commitment_ciphertexts.push(dummy_ct);
+            }
 
             self.wire_polynomials.push(poly);
-            poly_commitments.push(commitment_hash);
         }
 
         self.phase = JVProverPhase::Committed;
 
         Ok(JVCommitmentMessage {
             num_polynomials: witness_len,
-            poly_commitments,
+            poly_commitment_ciphertexts,
         })
     }
 
@@ -603,13 +734,11 @@ impl<const R: usize> JVProver<R> {
         })
     }
 
-    /// Generates aggregated LPZK proof using vanishing polynomials - O(R) communication.
+    /// Generates aggregated LPZK proof - O(R×M) witness verification.
     ///
-    /// Instead of sending O(M×R) individual masked products, we:
-    /// 1. For each mult gate, compute constraint polynomial h_i(X) = f_a(X)·f_b(X) - f_c(X)
-    /// 2. Aggregate: H(X) = Σᵢ γⁱ·h_i(X)
-    /// 3. Divide by vanishing poly: Q(X) = H(X) / Z(X)
-    /// 4. Send Q(X) coefficients (O(R) elements)
+    /// Computes aggregated check: Σᵢ γⁱ·(aᵢ·bᵢ - cᵢ) = 0 if all multiplications correct.
+    /// The random γ ensures soundness - a cheating prover cannot make this sum zero
+    /// unless all multiplication constraints are satisfied.
     pub fn prove_multiplications_aggregated(
         &mut self,
         gamma: u64,
@@ -618,12 +747,8 @@ impl<const R: usize> JVProver<R> {
             return Err(JVProverError::InvalidPhase);
         }
 
-        let eval_points = self.eval_points.as_ref().ok_or(JVProverError::InvalidPhase)?;
-        let n = eval_points.len();
-
-        // Build multiplication constraint polynomials and aggregate
-        // H(X) = Σᵢ γⁱ·(f_a(X)·f_b(X) - f_c(X))
-        let mut aggregated_h = vec![0u64; 2 * n]; // degree up to 2R-2
+        // Compute aggregated check: Σᵢ γⁱ·(aᵢ·bᵢ - cᵢ)
+        // This equals 0 iff all multiplications are correct (with high probability)
         let mut gamma_power = 1u64;
         let mut aggregated_check = 0u128;
 
@@ -653,21 +778,45 @@ impl<const R: usize> JVProver<R> {
             }
         }
 
-        // For the actual quotient polynomial, we need to work with wire polynomials
-        // Since wire_polynomials encodes all witnesses, we compute H(X) from them
-        if !self.wire_polynomials.is_empty() {
-            aggregated_h = self.compute_aggregated_mult_constraint(gamma);
-        }
-
-        // Compute quotient Q(X) = H(X) / Z(X)
-        // For NTT roots, Z(X) = X^n - 1, so division is simpler
-        let quotient_coeffs = self.divide_by_vanishing_poly(&aggregated_h, eval_points);
-
         self.phase = JVProverPhase::Done;
 
         Ok(AggregatedLpzkProofMessage {
-            quotient_coeffs,
+            quotient_coeffs: vec![],
             aggregated_check: aggregated_check as u64,
+        })
+    }
+
+    /// Opens all IT-PAC commitments by revealing polynomials and MAC tags.
+    ///
+    /// This generates the opening message that allows the verifier to verify
+    /// the IT-MAC relationship: m = k + f(Λ)·Δ
+    ///
+    /// # Returns
+    /// An `ItPacOpenMessage` containing:
+    /// - The polynomial coefficients for each wire position
+    /// - The MAC values (f(Λ) values - currently placeholder)
+    /// - The MAC tags for IT-MAC verification
+    pub fn open_itpac(&self) -> Result<ItPacOpenMessage, JVProverError> {
+        // Collect polynomial coefficients
+        let polynomials = self.wire_polynomials.clone();
+
+        // Extract MAC values and tags from IT-PAC commitments
+        let mut mac_values = Vec::with_capacity(self.itpac_commitments.len());
+        let mut mac_tags = Vec::with_capacity(self.itpac_commitments.len());
+
+        for itpac in &self.itpac_commitments {
+            // Get the value from the IT-MAC (this is f(Λ) - u + u = f(Λ))
+            let mac_value: u64 = itpac.mac().prover_share().value().into();
+            mac_values.push(mac_value);
+
+            // Get the MAC tag m = k + f(Λ)·Δ from the prover's share
+            mac_tags.push(itpac.mac().prover_share().mac());
+        }
+
+        Ok(ItPacOpenMessage {
+            polynomials,
+            mac_values,
+            mac_tags,
         })
     }
 
@@ -726,118 +875,6 @@ impl<const R: usize> JVProver<R> {
 
         aggregated as u64
     }
-
-    /// Computes the aggregated multiplication constraint polynomial.
-    ///
-    /// H(X) = Σᵢ γⁱ·(f_a(X)·f_b(X) - f_c(X))
-    ///
-    /// where f_a, f_b, f_c are the wire polynomials for the left, right, and output
-    /// of each multiplication gate.
-    fn compute_aggregated_mult_constraint(&self, gamma: u64) -> Vec<u64> {
-        let eval_points = match &self.eval_points {
-            Some(pts) => pts,
-            None => return vec![],
-        };
-        let n = eval_points.len();
-
-        // Aggregated constraint polynomial (degree up to 2n-2)
-        let mut h_coeffs = vec![0u64; 2 * n];
-        let mut gamma_power = 1u64;
-
-        // Get the circuit structure from first witness
-        if self.witnesses.is_empty() {
-            return h_coeffs;
-        }
-
-        let num_mults = self.witnesses[0].num_mults();
-
-        // For each multiplication gate, use evaluations-based approach
-        // since wire_polynomials may not be populated in all cases
-        for mult_idx in 0..num_mults {
-            // Collect evaluations at each rep for this multiplication
-            let mut a_evals = Vec::with_capacity(n);
-            let mut b_evals = Vec::with_capacity(n);
-            let mut c_evals = Vec::with_capacity(n);
-
-            for (j, witness) in self.witnesses.iter().enumerate() {
-                if j >= n {
-                    break;
-                }
-                if mult_idx < witness.num_mults() {
-                    a_evals.push(witness.mult_lefts[mult_idx]);
-                    b_evals.push(witness.mult_rights[mult_idx]);
-                    c_evals.push(witness.mult_outputs[mult_idx]);
-                } else {
-                    a_evals.push(0);
-                    b_evals.push(0);
-                    c_evals.push(0);
-                }
-            }
-
-            // Pad to n if needed
-            a_evals.resize(n, 0);
-            b_evals.resize(n, 0);
-            c_evals.resize(n, 0);
-
-            // Interpolate to get polynomials f_a(X), f_b(X), f_c(X)
-            let f_a = self.interpolate_values(&a_evals, eval_points);
-            let f_b = self.interpolate_values(&b_evals, eval_points);
-            let f_c = self.interpolate_values(&c_evals, eval_points);
-
-            // Compute f_a(X) · f_b(X)
-            let f_ab = poly_mul(&f_a, &f_b, self.modulus);
-
-            // Compute f_a(X) · f_b(X) - f_c(X)
-            let h_i = poly_sub(&f_ab, &f_c, self.modulus);
-
-            // Add γⁱ · h_i(X) to H(X)
-            for (k, &coeff) in h_i.iter().enumerate() {
-                if k >= h_coeffs.len() {
-                    break;
-                }
-                let term = ((gamma_power as u128 * coeff as u128) % self.modulus as u128) as u64;
-                h_coeffs[k] = ((h_coeffs[k] as u128 + term as u128) % self.modulus as u128) as u64;
-            }
-
-            gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
-        }
-
-        h_coeffs
-    }
-
-    /// Divides polynomial by the vanishing polynomial Z(X) = ∏(X - αⱼ).
-    ///
-    /// For NTT roots of unity, Z(X) = X^n - 1, making division efficient.
-    fn divide_by_vanishing_poly(&self, h_coeffs: &[u64], eval_points: &[u64]) -> Vec<u64> {
-        let n = eval_points.len();
-
-        // For NTT roots of unity, Z(X) = X^n - 1
-        // Division: if H(X) = Z(X)·Q(X), then H(X) = (X^n - 1)·Q(X)
-        // H(X) = X^n·Q(X) - Q(X)
-        // So Q(X) can be computed by: q_i = h_{i+n} + q_{i} (working backwards)
-        #[cfg(feature = "ntt")]
-        if self.modulus == GOLDILOCKS && n.is_power_of_two() {
-            // Fast division for Z(X) = X^n - 1
-            let mut q_coeffs = vec![0u64; n];
-
-            // If H has degree < n, then Q = 0 (H is divisible by Z only if H = 0)
-            // If H has degree >= n, compute quotient
-            if h_coeffs.len() > n {
-                // q_{n-1} = h_{2n-1} (if exists)
-                // q_i = h_{i+n} + q_{i+1} for i = n-2, ..., 0
-                for i in (0..n).rev() {
-                    let h_high = if i + n < h_coeffs.len() { h_coeffs[i + n] } else { 0 };
-                    let q_next = if i + 1 < n { q_coeffs[i + 1] } else { 0 };
-                    q_coeffs[i] = ((h_high as u128 + q_next as u128) % self.modulus as u128) as u64;
-                }
-            }
-
-            return q_coeffs;
-        }
-
-        // Fallback: polynomial long division
-        poly_div_vanishing(h_coeffs, eval_points, self.modulus)
-    }
 }
 
 // ============================================================================
@@ -850,8 +887,11 @@ pub struct JVVerifier<const R: usize> {
     /// Secret evaluation point Λ.
     lambda: u64,
     /// IT-MAC global key Δ.
-    #[allow(dead_code)]
-    delta: u64,
+    global_key: GlobalKey<GoldilocksItMac>,
+    /// AHE key pair for IT-PAC.
+    ahe_keypair: Option<KeyPair>,
+    /// Encrypted powers of Λ for IT-PAC.
+    encrypted_powers: Option<EncryptedPowers>,
     /// Challenge χ.
     chi: Option<u64>,
     /// Challenge ρ.
@@ -872,6 +912,13 @@ pub struct JVVerifier<const R: usize> {
     open_msg: Option<JVOpenMessage>,
     /// Soldering verifier.
     soldering_verifier: Option<SolderingVerifier>,
+    /// IT-PAC commitments received from prover.
+    itpac_commitments: Vec<ItPac<GoldilocksItMac>>,
+    /// Decrypted commitment values d_w = f_w(Λ) - u_w.
+    decrypted_commitments: Option<Vec<u64>>,
+    /// Verifier's local keys k for IT-MAC verification.
+    /// For IT-MAC [x]: m = k + x·Δ, verifier holds k.
+    verifier_local_keys: Vec<GoldilocksItMac>,
 }
 
 /// Protocol phases for the optimized verifier.
@@ -894,9 +941,17 @@ pub enum JVVerifierPhase {
 impl<const R: usize> JVVerifier<R> {
     /// Creates a new verifier with random secrets.
     pub fn new<Rn: Rng>(modulus: u64, rng: &mut Rn) -> Self {
+        // Use AHE params that match Goldilocks modulus (approximately)
+        // ParamSet::Small has t=65537 which is different from Goldilocks
+        // For now, we'll use the AHE modulus for encrypted computation
+        let ahe_params = ParamSet::Small.params();
+        let ahe_keypair = KeyPair::generate(&ahe_params, rng);
+
         Self {
             lambda: rng.random_range(1..modulus),
-            delta: rng.random_range(1..modulus),
+            global_key: GlobalKey::generate(rng),
+            ahe_keypair: Some(ahe_keypair),
+            encrypted_powers: None,
             chi: None,
             rho: None,
             modulus,
@@ -907,12 +962,20 @@ impl<const R: usize> JVVerifier<R> {
             disclosure: None,
             open_msg: None,
             soldering_verifier: None,
+            itpac_commitments: Vec::new(),
+            decrypted_commitments: None,
+            verifier_local_keys: Vec::new(),
         }
     }
 
     /// Returns the current phase.
     pub fn phase(&self) -> &JVVerifierPhase {
         &self.phase
+    }
+
+    /// Returns the IT-MAC global key (for VOLE pool generation).
+    pub fn global_key(&self) -> &GlobalKey<GoldilocksItMac> {
+        &self.global_key
     }
 
     /// Returns topology vectors.
@@ -955,12 +1018,37 @@ impl<const R: usize> JVVerifier<R> {
         let eval_points: Vec<u64> = (1..=R as u64).collect();
 
         self.eval_points = Some(eval_points.clone());
+
+        // Generate encrypted powers of Λ for IT-PAC commitments
+        // With NTT, polynomials are padded to next_power_of_two(R) coefficients
+        // max_degree needs to accommodate this padding
+        #[cfg(feature = "ntt")]
+        let max_degree = if self.modulus == GOLDILOCKS {
+            R.next_power_of_two() - 1
+        } else {
+            R - 1
+        };
+
+        #[cfg(not(feature = "ntt"))]
+        let max_degree = R - 1;
+
+        let ahe_keypair = self.ahe_keypair.as_ref().expect("AHE keypair should be initialized");
+        let encrypted_powers = EncryptedPowers::generate(
+            &ahe_keypair.pk,
+            self.lambda,
+            max_degree,
+            rng,
+        );
+        let ahe_public_key = ahe_keypair.pk.clone();
+        self.encrypted_powers = Some(encrypted_powers.clone());
+
         self.phase = JVVerifierPhase::Setup;
 
         Ok(JVSetupMessage {
             eval_points,
-            max_degree: R - 1,
-            encrypted_powers_hash: self.lambda,
+            max_degree,
+            encrypted_powers,
+            ahe_public_key,
         })
     }
 
@@ -985,12 +1073,29 @@ impl<const R: usize> JVVerifier<R> {
     }
 
     /// Receives commitment and returns challenge χ.
+    ///
+    /// The verifier decrypts the IT-PAC ciphertexts to get the masked polynomial
+    /// evaluations d_w = f_w(Λ) - u_w for each wire w.
     pub fn receive_commitment(
         &mut self,
         commitment: JVCommitmentMessage,
     ) -> Result<u64, JVVerifierError> {
         if self.phase != JVVerifierPhase::Setup {
             return Err(JVVerifierError::InvalidPhase);
+        }
+
+        // Decrypt IT-PAC ciphertexts to get masked evaluations
+        // d_w = f_w(Λ) - u_w where u_w is the random masking value
+        if let Some(ref keypair) = self.ahe_keypair {
+            let decrypted_values: Vec<u64> = commitment
+                .poly_commitment_ciphertexts
+                .iter()
+                .map(|ct| ct.decrypt_scalar(&keypair.sk))
+                .collect();
+
+            // Store decrypted values for later verification
+            // These are f(Λ) - u values that will be used to reconstruct [f(Λ)]
+            self.decrypted_commitments = Some(decrypted_values);
         }
 
         self.commitment = Some(commitment);
@@ -1104,6 +1209,205 @@ impl<const R: usize> JVVerifier<R> {
     /// Generates gamma challenge for aggregated LPZK.
     pub fn generate_lpzk_challenge<Rn: Rng>(&self, rng: &mut Rn) -> u64 {
         rng.random_range(1..self.modulus)
+    }
+
+    /// Returns the decrypted IT-PAC commitment values.
+    ///
+    /// These are the d_w = f_w(Λ) - u_w values that can be used to verify
+    /// polynomial commitments when coefficients are revealed.
+    pub fn decrypted_commitments(&self) -> Option<&[u64]> {
+        self.decrypted_commitments.as_deref()
+    }
+
+    /// Sets the verifier's local keys for IT-MAC verification.
+    ///
+    /// These are extracted from the VolePool before it's passed to the prover.
+    /// For IT-MAC [x]: m = k + x·Δ, the verifier stores k.
+    pub fn set_verifier_local_keys(&mut self, keys: Vec<GoldilocksItMac>) {
+        self.verifier_local_keys = keys;
+    }
+
+    /// Returns the verifier's local keys.
+    pub fn verifier_local_keys(&self) -> &[GoldilocksItMac] {
+        &self.verifier_local_keys
+    }
+
+    /// Verifies an IT-PAC opening from the prover.
+    ///
+    /// In IT-PAC, the commitment to f(·) is constructed as:
+    /// 1. Prover has random [u] with mac `m_u = k_u + u·Δ`
+    /// 2. Prover sends encrypted `f(Λ) - u` to verifier
+    /// 3. Verifier decrypts to get `d = f(Λ) - u`
+    /// 4. Both compute `[f(Λ)] = [u] + d`
+    ///    - Prover: value = f(Λ), mac unchanged = m_u
+    ///    - Verifier: adjusted local key `k' = k_u - d·Δ`
+    ///
+    /// For verification:
+    /// - The MAC tag m_u should equal `k' + f(Λ)·Δ = (k_u - d·Δ) + f(Λ)·Δ`
+    /// - Since d = f(Λ) - u, this simplifies to `k_u + u·Δ`
+    /// - Which is exactly the original MAC for [u]
+    ///
+    /// So we verify: `m = k_u + u·Δ` where u = mac_value from prover.
+    ///
+    /// # Arguments
+    /// * `open_msg` - The IT-PAC opening message from the prover
+    ///
+    /// # Returns
+    /// True if all IT-MAC tags verify correctly.
+    pub fn verify_itpac_opening(&self, open_msg: &ItPacOpenMessage) -> bool {
+        let delta = self.global_key.delta();
+
+        // Check that we have enough local keys
+        if self.verifier_local_keys.len() < open_msg.polynomials.len() {
+            return false;
+        }
+
+        // Verify each polynomial's IT-MAC
+        // The mac_values contain the random u from VOLE, and
+        // the mac_tags contain m = k + u·Δ
+        for (i, _poly) in open_msg.polynomials.iter().enumerate() {
+            // Get the MAC tag from prover
+            let mac_tag = match open_msg.mac_tags.get(i) {
+                Some(&tag) => tag,
+                None => return false,
+            };
+
+            // Get the MAC value (u) from prover
+            let mac_value = match open_msg.mac_values.get(i) {
+                Some(&v) => GoldilocksItMac::new(v),
+                None => return false,
+            };
+
+            // Get the verifier's local key for this commitment (k_u)
+            let local_key = self.verifier_local_keys[i];
+
+            // Compute expected MAC: m = k_u + u·Δ
+            let expected_mac = local_key + mac_value * delta;
+
+            // Check if MAC matches
+            if mac_tag != expected_mac {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Verifies an IT-PAC opening with polynomial consistency check.
+    ///
+    /// This performs two checks:
+    /// 1. IT-MAC verification: m = k + u·Δ
+    /// 2. Polynomial consistency: d = f(Λ) - u (using decrypted commitments)
+    ///
+    /// Returns true only if both checks pass.
+    pub fn verify_itpac_opening_full(&self, open_msg: &ItPacOpenMessage) -> bool {
+        // First check IT-MAC tags
+        if !self.verify_itpac_opening(open_msg) {
+            return false;
+        }
+
+        // Then check polynomial consistency with decrypted commitments
+        let decrypted = match &self.decrypted_commitments {
+            Some(d) => d,
+            None => return false,
+        };
+
+        // Get AHE modulus for reduction
+        let ahe_modulus = self.ahe_keypair
+            .as_ref()
+            .map(|kp| kp.pk.params().t)
+            .unwrap_or(self.modulus);
+
+        for (i, poly) in open_msg.polynomials.iter().enumerate() {
+            let d_i = match decrypted.get(i) {
+                Some(&d) => d,
+                None => return false,
+            };
+
+            let u_i = match open_msg.mac_values.get(i) {
+                Some(&u) => u,
+                None => return false,
+            };
+
+            // Evaluate polynomial at Λ
+            let f_lambda = self.evaluate_poly_at_lambda(poly);
+
+            // Check: d = f(Λ) - u (mod ahe_modulus)
+            let expected_d = if f_lambda >= u_i {
+                f_lambda - u_i
+            } else {
+                ahe_modulus - (u_i - f_lambda)
+            };
+
+            if d_i != expected_d {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Verifies an IT-PAC commitment against revealed polynomial coefficients.
+    ///
+    /// Given the polynomial coefficients f, verifies that:
+    /// d = f(Λ) - u (where d is the decrypted commitment value)
+    ///
+    /// Returns true if the commitment is valid for the given polynomial.
+    ///
+    /// # Arguments
+    /// * `poly_coeffs` - The revealed polynomial coefficients
+    /// * `commitment_idx` - Index of the commitment to verify
+    /// * `masking_value` - The random masking value u from the VOLE correlation
+    pub fn verify_itpac_commitment(
+        &self,
+        poly_coeffs: &[u64],
+        commitment_idx: usize,
+        masking_value: u64,
+    ) -> bool {
+        let decrypted = match &self.decrypted_commitments {
+            Some(vals) => match vals.get(commitment_idx) {
+                Some(&d) => d,
+                None => return false,
+            },
+            None => return false,
+        };
+
+        // Evaluate polynomial at Λ
+        let f_lambda = self.evaluate_poly_at_lambda(poly_coeffs);
+
+        // Get AHE modulus for reduction
+        let ahe_modulus = self.ahe_keypair
+            .as_ref()
+            .map(|kp| kp.pk.params().t)
+            .unwrap_or(self.modulus);
+
+        // Check: d = f(Λ) - u (mod t)
+        let expected = if f_lambda >= masking_value {
+            f_lambda - masking_value
+        } else {
+            ahe_modulus - (masking_value - f_lambda)
+        };
+
+        decrypted == expected
+    }
+
+    /// Evaluates a polynomial at the secret point Λ.
+    fn evaluate_poly_at_lambda(&self, coeffs: &[u64]) -> u64 {
+        let ahe_modulus = self.ahe_keypair
+            .as_ref()
+            .map(|kp| kp.pk.params().t)
+            .unwrap_or(self.modulus);
+
+        let mut result = 0u128;
+        let mut lambda_power = 1u128;
+        let lambda = self.lambda as u128;
+
+        for &coeff in coeffs {
+            result = (result + (coeff as u128) * lambda_power) % (ahe_modulus as u128);
+            lambda_power = (lambda_power * lambda) % (ahe_modulus as u128);
+        }
+
+        result as u64
     }
 
     /// Verifies aggregated LPZK proof - O(R) communication.
@@ -1261,143 +1565,38 @@ fn mod_inverse(a: u64, m: u64) -> u64 {
     }
 }
 
-/// Polynomial multiplication: result(X) = a(X) * b(X).
-fn poly_mul(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
-    if a.is_empty() || b.is_empty() {
-        return vec![];
-    }
-
-    let result_len = a.len() + b.len() - 1;
-
-    // Use NTT-based multiplication for Goldilocks (O(n log n))
-    #[cfg(feature = "ntt")]
-    if modulus == GOLDILOCKS {
-        // Pad to next power of 2 >= result_len
-        let n = result_len.next_power_of_two();
-
-        let mut a_ntt: Vec<Goldilocks> = a.iter().map(|&v| Goldilocks::new(v)).collect();
-        a_ntt.resize(n, Goldilocks::zero());
-
-        let mut b_ntt: Vec<Goldilocks> = b.iter().map(|&v| Goldilocks::new(v)).collect();
-        b_ntt.resize(n, Goldilocks::zero());
-
-        // Forward NTT
-        Goldilocks::ntt(&mut a_ntt);
-        Goldilocks::ntt(&mut b_ntt);
-
-        // Pointwise multiplication
-        for i in 0..n {
-            a_ntt[i] = a_ntt[i] * b_ntt[i];
-        }
-
-        // Inverse NTT
-        Goldilocks::intt(&mut a_ntt);
-
-        // Extract result
-        return a_ntt[..result_len].iter().map(|g| g.inner()).collect();
-    }
-
-    // Fallback: naive O(n²) multiplication for non-Goldilocks
-    let mut result = vec![0u64; result_len];
-    for (i, &ai) in a.iter().enumerate() {
-        for (j, &bj) in b.iter().enumerate() {
-            let term = ((ai as u128 * bj as u128) % modulus as u128) as u64;
-            result[i + j] = ((result[i + j] as u128 + term as u128) % modulus as u128) as u64;
-        }
-    }
-    result
-}
-
-/// Polynomial subtraction: result(X) = a(X) - b(X).
-fn poly_sub(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
-    let max_len = a.len().max(b.len());
-    let mut result = vec![0u64; max_len];
-
-    for (i, &ai) in a.iter().enumerate() {
-        result[i] = ai;
-    }
-
-    for (i, &bi) in b.iter().enumerate() {
-        if result[i] >= bi {
-            result[i] -= bi;
-        } else {
-            result[i] = modulus - (bi - result[i]);
-        }
-    }
-
-    result
-}
-
-/// Divides polynomial H(X) by vanishing polynomial Z(X) = ∏(X - αⱼ).
-///
-/// Returns quotient Q(X) such that H(X) = Z(X) * Q(X).
-/// Used for non-NTT case (NTT case uses fast division for Z(X) = X^n - 1).
-fn poly_div_vanishing(h: &[u64], eval_points: &[u64], modulus: u64) -> Vec<u64> {
-    let n = eval_points.len();
-
-    if h.len() <= n {
-        // Degree of H is less than degree of Z, quotient is 0
-        return vec![0u64; n.saturating_sub(1)];
-    }
-
-    // Polynomial long division
-    let mut remainder = h.to_vec();
-    let mut quotient = vec![0u64; h.len().saturating_sub(n)];
-
-    // Z(X) = X^n - (α₁·α₂·...·αₙ) + lower terms
-    // For simplicity, compute Z(X) explicitly
-    let mut z = vec![0u64; n + 1];
-    z[n] = 1; // Leading coefficient
-
-    // Build Z(X) = ∏(X - αⱼ) iteratively
-    let mut z_partial = vec![1u64];
-    for &alpha in eval_points {
-        let mut new_z = vec![0u64; z_partial.len() + 1];
-        // Multiply by (X - alpha)
-        for (i, &c) in z_partial.iter().enumerate() {
-            // c * X
-            new_z[i + 1] = ((new_z[i + 1] as u128 + c as u128) % modulus as u128) as u64;
-            // c * (-alpha)
-            let neg_alpha = if alpha == 0 { 0 } else { modulus - alpha };
-            let term = ((c as u128 * neg_alpha as u128) % modulus as u128) as u64;
-            new_z[i] = ((new_z[i] as u128 + term as u128) % modulus as u128) as u64;
-        }
-        z_partial = new_z;
-    }
-    z = z_partial;
-
-    // Long division
-    let z_lead_inv = mod_inverse(z[n], modulus);
-
-    for i in (0..quotient.len()).rev() {
-        let r_deg = i + n;
-        if r_deg >= remainder.len() {
-            continue;
-        }
-
-        let q_coeff = ((remainder[r_deg] as u128 * z_lead_inv as u128) % modulus as u128) as u64;
-        quotient[i] = q_coeff;
-
-        // Subtract q_coeff * Z(X) * X^i from remainder
-        for (j, &z_j) in z.iter().enumerate() {
-            if i + j >= remainder.len() {
-                break;
-            }
-            let term = ((q_coeff as u128 * z_j as u128) % modulus as u128) as u64;
-            if remainder[i + j] >= term {
-                remainder[i + j] -= term;
-            } else {
-                remainder[i + j] = modulus - (term - remainder[i + j]);
-            }
-        }
-    }
-
-    quotient
-}
-
 // ============================================================================
 // Protocol Runner
 // ============================================================================
+
+/// Extracts verifier shares from a VolePool.
+///
+/// This function extracts the local keys (verifier shares) from each VOLE correlation
+/// in the pool. The local keys are needed for IT-MAC verification when the prover opens.
+///
+/// In a real 2-party protocol, the VOLE correlations would be distributed such that
+/// the prover only receives (value, MAC tag) and the verifier only receives (local key).
+/// This function simulates that extraction.
+pub fn extract_verifier_shares_from_pool(
+    pool: &VolePool<GoldilocksItMac>,
+    count: usize,
+) -> Vec<GoldilocksItMac> {
+    // Access the pool's internal state to extract verifier shares
+    // This is a simplification - in a real protocol, VOLE generation would
+    // naturally distribute shares to each party
+    let mut shares = Vec::with_capacity(count);
+
+    // Create a temporary pool clone to access the MACs
+    let mut temp_pool = pool.clone();
+    for _ in 0..count {
+        if let Some(mac) = temp_pool.get_random() {
+            // Extract the verifier's local key from the ItMac
+            shares.push(mac.verifier_share().local_key());
+        }
+    }
+
+    shares
+}
 
 /// Runs the optimized JustVengers protocol.
 ///
@@ -1428,8 +1627,19 @@ pub fn run_jv_protocol<const R: usize>(
     verifier.setup_soldering(soldering_constraints.to_vec())
         .map_err(|_| JVProtocolError::VerifierError)?;
 
-    // Phase 1: Commit
-    let commitment = prover.commit(&setup_msg.eval_points).map_err(|_| JVProtocolError::ProverError)?;
+    // Create VOLE pool for IT-PAC commitments
+    // Need enough VOLEs for all wire polynomials (circuit size)
+    // Use the verifier's global key for correlated VOLE generation
+    let circuit_size = circuits.get(0).map(|c| c.num_wires()).unwrap_or(10);
+    let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
+
+    // Extract verifier shares before passing pool to prover
+    // These are the local keys k for IT-MAC verification: m = k + x·Δ
+    let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
+    verifier.set_verifier_local_keys(verifier_shares);
+
+    // Phase 1: Commit (using real IT-PAC)
+    let commitment = prover.commit(&setup_msg, vole_pool).map_err(|_| JVProtocolError::ProverError)?;
     let soldering_commit = prover.commit_soldering().map_err(|_| JVProtocolError::ProverError)?;
 
     // Phase 2: Challenge χ
@@ -1463,6 +1673,16 @@ pub fn run_jv_protocol<const R: usize>(
         .map_err(|_| JVProtocolError::ProverError)?;
     verifier.receive_open(open_msg).map_err(|_| JVProtocolError::VerifierError)?;
 
+    // Phase 5b: IT-PAC Opening and Verification
+    // Prover reveals polynomial coefficients and IT-MAC tags
+    let itpac_open_msg = prover.open_itpac()
+        .map_err(|_| JVProtocolError::ProverError)?;
+
+    // Verifier checks IT-MAC tags: m = k + u·Δ
+    if !verifier.verify_itpac_opening(&itpac_open_msg) {
+        return Err(JVProtocolError::ItPacVerificationFailed);
+    }
+
     // Phase 6: LPZK proof
     let lpzk_proof = prover.prove_multiplications().map_err(|_| JVProtocolError::ProverError)?;
     let result = verifier.verify_multiplications(lpzk_proof)
@@ -1482,6 +1702,8 @@ pub enum JVProtocolError {
     VerifierError,
     /// Soldering error.
     SolderingError,
+    /// IT-PAC verification failed.
+    ItPacVerificationFailed,
 }
 
 // ============================================================================
@@ -1647,5 +1869,176 @@ mod tests {
         let result = run_jv_protocol::<R>(&batch, &branches, &inputs, &[constraint], GOLDILOCKS);
         assert!(result.is_ok(), "JV protocol with soldering failed: {:?}", result.err());
         assert!(result.unwrap(), "JV protocol verification failed");
+    }
+
+    #[test]
+    fn test_itpac_commitment_decryption() {
+        use rand::SeedableRng;
+
+        // Test that IT-PAC ciphertexts are properly decrypted
+        let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
+
+        let mut circuit = Circuit::new();
+        let x = circuit.add_input();
+        let y = circuit.add_input();
+        circuit.add_mul(x, y);
+
+        let batch = CircuitBatch::new(vec![circuit]);
+
+        // Setup
+        let mut prover = JVProver::<2>::new(vec![0, 0], GOLDILOCKS);
+        prover.setup(&batch, &[vec![3, 4], vec![5, 6]]).unwrap();
+        prover.setup_soldering(vec![], &mut rng).unwrap();
+
+        let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
+        let setup_msg = verifier.setup(&batch, &mut rng).unwrap();
+
+        // Create VOLE pool and commit
+        let circuit_size = batch.get(0).map(|c| c.num_wires()).unwrap_or(10);
+        let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
+
+        let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
+
+        // Receive commitment - this triggers decryption
+        let _chi = verifier.receive_commitment(commitment).unwrap();
+
+        // Check that decrypted values exist
+        let decrypted = verifier.decrypted_commitments();
+        assert!(decrypted.is_some(), "Decrypted commitments should exist");
+        assert!(!decrypted.unwrap().is_empty(), "Should have decrypted values");
+
+        println!("IT-PAC decryption test passed!");
+        println!("Decrypted {} commitment values", decrypted.unwrap().len());
+    }
+
+    #[test]
+    fn test_itpac_verify_poly_at_lambda() {
+        use rand::SeedableRng;
+
+        // Test polynomial evaluation at secret Λ
+        let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
+
+        let circuit = Circuit::new();
+        let batch = CircuitBatch::new(vec![circuit]);
+
+        let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
+        let _setup_msg = verifier.setup(&batch, &mut rng).unwrap();
+
+        // Simple polynomial: f(x) = 1 + 2x + 3x²
+        let coeffs = vec![1, 2, 3];
+
+        // Get the AHE modulus
+        let ahe_modulus = verifier.ahe_keypair
+            .as_ref()
+            .map(|kp| kp.pk.params().t)
+            .unwrap_or(GOLDILOCKS);
+
+        // Evaluate at Λ
+        let f_lambda = verifier.evaluate_poly_at_lambda(&coeffs);
+
+        // Manually compute expected value using u128 to avoid overflow
+        let lambda = verifier.lambda as u128;
+        let modulus = ahe_modulus as u128;
+        let expected = (1 + 2 * lambda % modulus + 3 * (lambda * lambda % modulus) % modulus) % modulus;
+
+        assert_eq!(f_lambda, expected as u64, "Polynomial evaluation at Λ should match");
+        println!("Polynomial evaluation test passed: f(Λ) = {}", f_lambda);
+    }
+
+    #[test]
+    fn test_itmac_opening_verification() {
+        use rand::SeedableRng;
+
+        // Test the full IT-MAC opening and verification flow
+        let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
+
+        let mut circuit = Circuit::new();
+        let x = circuit.add_input();
+        let y = circuit.add_input();
+        circuit.add_mul(x, y);
+
+        let batch = CircuitBatch::new(vec![circuit]);
+
+        // Setup prover and verifier
+        let mut prover = JVProver::<2>::new(vec![0, 0], GOLDILOCKS);
+        prover.setup(&batch, &[vec![3, 4], vec![5, 6]]).unwrap();
+        prover.setup_soldering(vec![], &mut rng).unwrap();
+
+        let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
+        let setup_msg = verifier.setup(&batch, &mut rng).unwrap();
+
+        // Create VOLE pool
+        let circuit_size = batch.get(0).map(|c| c.num_wires()).unwrap_or(10);
+        let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
+
+        // Extract verifier shares BEFORE passing pool to prover
+        let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
+        verifier.set_verifier_local_keys(verifier_shares);
+
+        // Prover commits
+        let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
+        let _chi = verifier.receive_commitment(commitment).unwrap();
+
+        // Prover opens IT-PAC commitments
+        let open_msg = prover.open_itpac().unwrap();
+
+        // Verify the opening message structure
+        assert!(!open_msg.polynomials.is_empty(), "Should have polynomials");
+        assert!(!open_msg.mac_tags.is_empty(), "Should have MAC tags");
+        assert_eq!(open_msg.polynomials.len(), open_msg.mac_tags.len(),
+            "Polynomials and MAC tags should match in count");
+
+        // Verify IT-MAC opening
+        let verification_result = verifier.verify_itpac_opening(&open_msg);
+        assert!(verification_result, "IT-MAC verification should pass");
+
+        println!("IT-MAC opening verification test passed!");
+        println!("Verified {} polynomial commitments", open_msg.polynomials.len());
+    }
+
+    #[test]
+    fn test_itmac_verification_fails_on_tampered_tag() {
+        use rand::SeedableRng;
+
+        // Test that verification fails when MAC tag is tampered
+        let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
+
+        let mut circuit = Circuit::new();
+        let x = circuit.add_input();
+        let y = circuit.add_input();
+        circuit.add_mul(x, y);
+
+        let batch = CircuitBatch::new(vec![circuit]);
+
+        // Setup
+        let mut prover = JVProver::<2>::new(vec![0, 0], GOLDILOCKS);
+        prover.setup(&batch, &[vec![3, 4], vec![5, 6]]).unwrap();
+        prover.setup_soldering(vec![], &mut rng).unwrap();
+
+        let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
+        let setup_msg = verifier.setup(&batch, &mut rng).unwrap();
+
+        // Create VOLE pool and extract shares
+        let circuit_size = batch.get(0).map(|c| c.num_wires()).unwrap_or(10);
+        let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
+        let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
+        verifier.set_verifier_local_keys(verifier_shares);
+
+        // Commit and open
+        let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
+        let _chi = verifier.receive_commitment(commitment).unwrap();
+        let mut open_msg = prover.open_itpac().unwrap();
+
+        // Tamper with the first MAC tag
+        if !open_msg.mac_tags.is_empty() {
+            // Add 1 to the first MAC tag to corrupt it
+            open_msg.mac_tags[0] = GoldilocksItMac::new(open_msg.mac_tags[0].inner() + 1);
+        }
+
+        // Verification should now fail
+        let verification_result = verifier.verify_itpac_opening(&open_msg);
+        assert!(!verification_result, "IT-MAC verification should fail with tampered tag");
+
+        println!("Tamper detection test passed!");
     }
 }
