@@ -28,6 +28,10 @@ pub struct BgvParams {
 
     /// Bound for uniform ternary distribution {-1, 0, 1}.
     pub ternary_bound: u64,
+
+    /// Primitive 2n-th root of unity for NTT.
+    /// Satisfies: omega^n ≡ -1 (mod q), omega^(2n) ≡ 1 (mod q).
+    pub omega: u64,
 }
 
 impl BgvParams {
@@ -46,6 +50,10 @@ impl BgvParams {
         let log_n = n.trailing_zeros();
         let delta = q / t;
 
+        // Try to find primitive 2n-th root of unity for NTT (optional)
+        // NTT requires q ≡ 1 (mod 2n). If not satisfied, omega = 0 (NTT disabled)
+        let omega = Self::find_primitive_root(n, q).unwrap_or(0);
+
         Self {
             n,
             log_n,
@@ -54,7 +62,50 @@ impl BgvParams {
             delta,
             sigma,
             ternary_bound: 1,
+            omega,
         }
+    }
+
+    /// Finds a primitive 2n-th root of unity modulo q.
+    ///
+    /// Returns omega such that omega^n ≡ -1 (mod q).
+    /// Requires q ≡ 1 (mod 2n).
+    fn find_primitive_root(n: usize, q: u64) -> Option<u64> {
+        let order = 2 * n as u64;
+        if (q - 1) % order != 0 {
+            return None;
+        }
+
+        let exp = (q - 1) / order;
+
+        // Try small primes as potential generators
+        for g in 2..1000u64 {
+            let omega = Self::mod_pow(g, exp, q);
+
+            // Verify: omega^n should be -1 (i.e., q-1)
+            let omega_n = Self::mod_pow(omega, n as u64, q);
+            if omega_n == q - 1 {
+                return Some(omega);
+            }
+        }
+
+        None
+    }
+
+    /// Modular exponentiation: base^exp mod modulus
+    fn mod_pow(mut base: u64, mut exp: u64, modulus: u64) -> u64 {
+        let mut result = 1u64;
+        base %= modulus;
+
+        while exp > 0 {
+            if exp & 1 == 1 {
+                result = ((result as u128 * base as u128) % modulus as u128) as u64;
+            }
+            exp >>= 1;
+            base = ((base as u128 * base as u128) % modulus as u128) as u64;
+        }
+
+        result
     }
 
     /// Returns the maximum noise that can be tolerated before decryption fails.
@@ -91,25 +142,25 @@ impl ParamSet {
         match self {
             ParamSet::Toy => BgvParams::new(
                 256,
-                1073741789,   // Prime close to 2^30, ≡ 1 (mod 512)
+                1073738753,   // Prime ≡ 1 (mod 512) for NTT support
                 65537,        // 2^16 + 1 (prime)
                 3.2,
             ),
             ParamSet::Small => BgvParams::new(
                 1024,
-                1099511627689, // Prime close to 2^40, ≡ 1 (mod 2048)
+                1099511592961, // Prime ≡ 1 (mod 2048) for NTT support
                 65537,
                 3.2,
             ),
             ParamSet::Medium => BgvParams::new(
                 2048,
-                18014398509465601, // Prime close to 2^54, ≡ 1 (mod 4096)
+                18014398509404161, // Prime ≡ 1 (mod 4096) for NTT support
                 65537,
                 3.2,
             ),
             ParamSet::Large => BgvParams::new(
                 4096,
-                1152921504606830593, // Prime close to 2^60, ≡ 1 (mod 8192)
+                1152921504606830593, // Prime ≡ 1 (mod 8192) for NTT support
                 65537,
                 3.2,
             ),

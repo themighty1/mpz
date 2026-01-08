@@ -17,6 +17,8 @@ pub struct RingPoly {
     coeffs: Vec<u64>,
     /// The modulus q.
     q: u64,
+    /// Primitive 2n-th root of unity for NTT (optional).
+    omega: Option<u64>,
 }
 
 /// Barrett reduction for modulus q.
@@ -113,8 +115,17 @@ impl RingPoly {
     /// Creates a new ring polynomial with given coefficients.
     ///
     /// Coefficients are reduced modulo q.
+    /// Note: This constructor doesn't include omega, so NTT won't be used.
+    /// Prefer using `from_params` when BgvParams is available.
     pub fn new(coeffs: Vec<u64>, q: u64) -> Self {
-        let mut poly = Self { coeffs, q };
+        let mut poly = Self { coeffs, q, omega: None };
+        poly.reduce();
+        poly
+    }
+
+    /// Creates a new ring polynomial with NTT support.
+    pub fn new_with_omega(coeffs: Vec<u64>, q: u64, omega: u64) -> Self {
+        let mut poly = Self { coeffs, q, omega: Some(omega) };
         poly.reduce();
         poly
     }
@@ -124,6 +135,7 @@ impl RingPoly {
         Self {
             coeffs: vec![0; params.n],
             q: params.q,
+            omega: if params.omega > 0 { Some(params.omega) } else { None },
         }
     }
 
@@ -134,6 +146,7 @@ impl RingPoly {
         Self {
             coeffs,
             q: params.q,
+            omega: if params.omega > 0 { Some(params.omega) } else { None },
         }
     }
 
@@ -145,6 +158,7 @@ impl RingPoly {
         let mut poly = Self {
             coeffs,
             q: params.q,
+            omega: if params.omega > 0 { Some(params.omega) } else { None },
         };
         poly.reduce();
         poly
@@ -189,7 +203,7 @@ impl RingPoly {
             })
             .collect();
 
-        Self { coeffs, q }
+        Self { coeffs, q, omega: self.omega }
     }
 
     /// Subtracts two polynomials coefficient-wise.
@@ -215,7 +229,7 @@ impl RingPoly {
             })
             .collect();
 
-        Self { coeffs, q }
+        Self { coeffs, q, omega: self.omega }
     }
 
     /// Negates all coefficients.
@@ -226,7 +240,7 @@ impl RingPoly {
             .map(|&c| if c == 0 { 0 } else { self.q - c })
             .collect();
 
-        Self { coeffs, q: self.q }
+        Self { coeffs, q: self.q, omega: self.omega }
     }
 
     /// Multiplies by a scalar.
@@ -239,17 +253,33 @@ impl RingPoly {
             .map(|&c| reducer.reduce((c as u128) * (s as u128)))
             .collect();
 
-        Self { coeffs, q: self.q }
+        Self { coeffs, q: self.q, omega: self.omega }
     }
 
     /// Multiplies two polynomials in the ring R_q = Z_q[X]/(X^n + 1).
     ///
-    /// Uses schoolbook multiplication with reduction mod X^n + 1.
-    /// For X^n ≡ -1 (mod X^n + 1), so X^(n+i) ≡ -X^i.
+    /// Uses NTT (O(n log n)) for large polynomials when omega is available,
+    /// otherwise schoolbook multiplication (O(n²)).
     pub fn mul(&self, other: &Self) -> Self {
         assert_eq!(self.q, other.q, "moduli must match");
         assert_eq!(self.coeffs.len(), other.coeffs.len(), "dimensions must match");
 
+        let n = self.coeffs.len();
+
+        // Use NTT only for large polynomials (n >= 2048) where it's faster
+        // For smaller n, schoolbook with Barrett reduction is competitive
+        if n >= 2048 {
+            if let Some(omega) = self.omega {
+                return self.mul_ntt_internal(other, omega);
+            }
+        }
+
+        // Use schoolbook for smaller polynomials or when NTT unavailable
+        self.mul_schoolbook(other)
+    }
+
+    /// Schoolbook multiplication (O(n²)).
+    fn mul_schoolbook(&self, other: &Self) -> Self {
         let n = self.coeffs.len();
         let q = self.q;
         let mut result = vec![0i128; n];
@@ -285,48 +315,76 @@ impl RingPoly {
             })
             .collect();
 
-        Self { coeffs, q }
+        Self { coeffs, q, omega: self.omega }
+    }
+
+    /// NTT-based multiplication for negacyclic convolution (O(n log n)).
+    ///
+    /// For R_q = Z_q[X]/(X^n + 1), we use the "twisted" NTT approach:
+    /// 1. Pre-multiply by powers of psi (where psi = omega, a primitive 2n-th root)
+    /// 2. Standard NTT using omega^2 (a primitive n-th root)
+    /// 3. Pointwise multiplication
+    /// 4. Inverse NTT
+    /// 5. Post-multiply by powers of psi^(-1)
+    fn mul_ntt_internal(&self, other: &Self, psi: u64) -> Self {
+        let n = self.coeffs.len();
+        let q = self.q;
+        let reducer = BarrettReducer::new(q);
+
+        // Precompute psi powers and omega (psi^2)
+        let omega = reducer.reduce((psi as u128) * (psi as u128)); // omega = psi^2 is n-th root
+        let psi_inv = Self::mod_inverse(psi, q);
+
+        // Pre-multiply by psi^j (twist for negacyclic)
+        let mut a_twisted: Vec<u64> = Vec::with_capacity(n);
+        let mut b_twisted: Vec<u64> = Vec::with_capacity(n);
+        let mut psi_j = 1u64;
+        for j in 0..n {
+            a_twisted.push(reducer.reduce((self.coeffs[j] as u128) * (psi_j as u128)));
+            b_twisted.push(reducer.reduce((other.coeffs[j] as u128) * (psi_j as u128)));
+            psi_j = reducer.reduce((psi_j as u128) * (psi as u128));
+        }
+
+        // Forward NTT using omega (n-th root of unity)
+        Self::ntt_forward(&mut a_twisted, omega, q, &reducer);
+        Self::ntt_forward(&mut b_twisted, omega, q, &reducer);
+
+        // Pointwise multiplication
+        let mut c_ntt: Vec<u64> = a_twisted
+            .iter()
+            .zip(b_twisted.iter())
+            .map(|(&a, &b)| reducer.reduce((a as u128) * (b as u128)))
+            .collect();
+
+        // Inverse NTT
+        let omega_inv = Self::mod_inverse(omega, q);
+        Self::ntt_inverse(&mut c_ntt, omega_inv, q, &reducer);
+
+        // Scale by 1/n and post-multiply by psi^(-j) (untwist)
+        let n_inv = Self::mod_inverse(n as u64, q);
+        let mut psi_inv_j = 1u64;
+        let coeffs: Vec<u64> = c_ntt
+            .iter()
+            .map(|&c| {
+                let scaled = reducer.reduce((c as u128) * (n_inv as u128));
+                let result = reducer.reduce((scaled as u128) * (psi_inv_j as u128));
+                psi_inv_j = reducer.reduce((psi_inv_j as u128) * (psi_inv as u128));
+                result
+            })
+            .collect();
+
+        Self { coeffs, q, omega: self.omega }
     }
 
     /// Multiplies two polynomials using NTT (faster for large n).
     ///
     /// Requires that q ≡ 1 (mod 2n) for NTT to work.
     pub fn mul_ntt(&self, other: &Self, omega: u64) -> Self {
-        assert_eq!(self.q, other.q, "moduli must match");
-        assert_eq!(self.coeffs.len(), other.coeffs.len(), "dimensions must match");
-
-        let n = self.coeffs.len();
-
-        // Convert to NTT domain
-        let mut a_ntt = self.coeffs.clone();
-        let mut b_ntt = other.coeffs.clone();
-
-        Self::ntt_forward(&mut a_ntt, omega, self.q);
-        Self::ntt_forward(&mut b_ntt, omega, self.q);
-
-        // Pointwise multiplication
-        let mut c_ntt: Vec<u64> = a_ntt
-            .iter()
-            .zip(b_ntt.iter())
-            .map(|(&a, &b)| ((a as u128 * b as u128) % self.q as u128) as u64)
-            .collect();
-
-        // Convert back
-        let omega_inv = Self::mod_inverse(omega, self.q);
-        Self::ntt_inverse(&mut c_ntt, omega_inv, self.q);
-
-        // Scale by 1/n
-        let n_inv = Self::mod_inverse(n as u64, self.q);
-        let coeffs: Vec<u64> = c_ntt
-            .iter()
-            .map(|&c| ((c as u128 * n_inv as u128) % self.q as u128) as u64)
-            .collect();
-
-        Self { coeffs, q: self.q }
+        self.mul_ntt_internal(other, omega)
     }
 
-    /// Forward NTT (Cooley-Tukey).
-    fn ntt_forward(data: &mut [u64], omega: u64, q: u64) {
+    /// Forward NTT (Cooley-Tukey) with Barrett reduction.
+    fn ntt_forward(data: &mut [u64], omega: u64, q: u64, reducer: &BarrettReducer) {
         let n = data.len();
         let log_n = n.trailing_zeros();
 
@@ -340,26 +398,41 @@ impl RingPoly {
 
             // omega_m = omega^(n/m)
             let exp = n / m;
-            let omega_m = Self::mod_pow(omega, exp as u64, q);
+            let omega_m = Self::mod_pow_barrett(omega, exp as u64, reducer);
 
             for k in (0..n).step_by(m) {
                 let mut w = 1u64;
                 for j in 0..half_m {
-                    let t = ((w as u128 * data[k + j + half_m] as u128) % q as u128) as u64;
+                    let t = reducer.reduce((w as u128) * (data[k + j + half_m] as u128));
                     let u = data[k + j];
 
                     data[k + j] = if u + t >= q { u + t - q } else { u + t };
                     data[k + j + half_m] = if u >= t { u - t } else { q + u - t };
 
-                    w = ((w as u128 * omega_m as u128) % q as u128) as u64;
+                    w = reducer.reduce((w as u128) * (omega_m as u128));
                 }
             }
         }
     }
 
     /// Inverse NTT.
-    fn ntt_inverse(data: &mut [u64], omega_inv: u64, q: u64) {
-        Self::ntt_forward(data, omega_inv, q);
+    fn ntt_inverse(data: &mut [u64], omega_inv: u64, q: u64, reducer: &BarrettReducer) {
+        Self::ntt_forward(data, omega_inv, q, reducer);
+    }
+
+    /// Modular exponentiation using Barrett reduction.
+    fn mod_pow_barrett(mut base: u64, mut exp: u64, reducer: &BarrettReducer) -> u64 {
+        let mut result = 1u64;
+
+        while exp > 0 {
+            if exp & 1 == 1 {
+                result = reducer.reduce((result as u128) * (base as u128));
+            }
+            exp >>= 1;
+            base = reducer.reduce((base as u128) * (base as u128));
+        }
+
+        result
     }
 
     /// Bit-reversal permutation.
