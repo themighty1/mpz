@@ -20,9 +20,17 @@ rand = { workspace = true }
 rand_chacha = { workspace = true }
 futures = { workspace = true }
 
+# KZG polynomial commitments
+ark-ff = { workspace = true }
+ark-ec = { workspace = true }
+ark-poly = { workspace = true }
+ark-bls12-381 = { workspace = true }
+ark-serialize = { workspace = true }
+
 [features]
 default = ["ntt"]
 ntt = []
+kzg = []
 
 [dev-dependencies]
 rand = { workspace = true }

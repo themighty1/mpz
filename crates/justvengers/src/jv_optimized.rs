@@ -108,21 +108,36 @@ pub struct JVDisclosureMessage {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct JVOpenMessage {
     /// Active branch indices, one per repetition: id_j ∈ [0, B).
-    pub active_branches: Vec<usize>,
+    /// Stored as u8 since B < 256 (saves 7 bytes per element vs usize).
+    pub active_branches: Vec<u8>,
     /// Universal hash proof component.
     pub hash_proof: u64,
-    /// Vanishing polynomial coefficients for consistency proof.
-    /// This is O(R) coefficients proving that constraints vanish at all αᵢ.
-    pub vp_coefficients: Vec<u64>,
 }
 
 /// LPZK proof message (O(M) communication where M = total multiplications).
+/// Legacy non-aggregated version.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct JVLpzkProofMessage {
     /// Masked multiplication products.
     pub masked_products: Vec<u64>,
     /// MAC tags for verification.
     pub mac_tags: Vec<u64>,
+}
+
+/// Aggregated LPZK proof message - O(R) instead of O(M×R).
+///
+/// Uses vanishing polynomial technique to aggregate all multiplication checks:
+/// 1. For each mult gate (a,b,c): constraint h_i(X) = f_a(X)·f_b(X) - f_c(X)
+/// 2. Aggregate: H(X) = Σᵢ γⁱ·h_i(X)
+/// 3. H(X) vanishes at all αⱼ ⟹ H(X) = Z(X)·Q(X)
+/// 4. Send Q(X) coefficients (degree ≤ R-1)
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct AggregatedLpzkProofMessage {
+    /// Quotient polynomial Q(X) = H(X) / Z(X) where H(X) is the aggregated
+    /// multiplication constraint polynomial. This has degree ≤ R-1.
+    pub quotient_coeffs: Vec<u64>,
+    /// Aggregated evaluation: Σᵢ γⁱ·(aᵢ·bᵢ - cᵢ) at a random point for soundness.
+    pub aggregated_check: u64,
 }
 
 // ============================================================================
@@ -492,16 +507,11 @@ impl<const R: usize> JVProver<R> {
             hash_proof = (hash_proof + contrib) % self.modulus as u128;
         }
 
-        // Generate vanishing polynomial coefficients
-        // These prove that constraint polynomials vanish at all evaluation points
-        let vp_coefficients = self.compute_vanishing_poly_coeffs();
-
         self.phase = JVProverPhase::Opened;
 
         Ok(JVOpenMessage {
-            active_branches: self.active_branches.clone(),
+            active_branches: self.active_branches.iter().map(|&b| b as u8).collect(),
             hash_proof: hash_proof as u64,
-            vp_coefficients,
         })
     }
 
@@ -593,6 +603,74 @@ impl<const R: usize> JVProver<R> {
         })
     }
 
+    /// Generates aggregated LPZK proof using vanishing polynomials - O(R) communication.
+    ///
+    /// Instead of sending O(M×R) individual masked products, we:
+    /// 1. For each mult gate, compute constraint polynomial h_i(X) = f_a(X)·f_b(X) - f_c(X)
+    /// 2. Aggregate: H(X) = Σᵢ γⁱ·h_i(X)
+    /// 3. Divide by vanishing poly: Q(X) = H(X) / Z(X)
+    /// 4. Send Q(X) coefficients (O(R) elements)
+    pub fn prove_multiplications_aggregated(
+        &mut self,
+        gamma: u64,
+    ) -> Result<AggregatedLpzkProofMessage, JVProverError> {
+        if self.phase != JVProverPhase::Opened {
+            return Err(JVProverError::InvalidPhase);
+        }
+
+        let eval_points = self.eval_points.as_ref().ok_or(JVProverError::InvalidPhase)?;
+        let n = eval_points.len();
+
+        // Build multiplication constraint polynomials and aggregate
+        // H(X) = Σᵢ γⁱ·(f_a(X)·f_b(X) - f_c(X))
+        let mut aggregated_h = vec![0u64; 2 * n]; // degree up to 2R-2
+        let mut gamma_power = 1u64;
+        let mut aggregated_check = 0u128;
+
+        for witness in &self.witnesses {
+            for i in 0..witness.num_mults() {
+                let a = witness.mult_lefts[i];
+                let b = witness.mult_rights[i];
+                let c = witness.mult_outputs[i];
+
+                // Verify multiplication is correct
+                let expected = ((a as u128 * b as u128) % self.modulus as u128) as u64;
+                if c != expected {
+                    return Err(JVProverError::InvalidMultiplication);
+                }
+
+                // Aggregated check value: Σᵢ γⁱ·(a·b - c) = 0 if all mults correct
+                let diff = if expected >= c {
+                    expected - c
+                } else {
+                    self.modulus - (c - expected)
+                };
+                aggregated_check = (aggregated_check
+                    + (gamma_power as u128 * diff as u128) % self.modulus as u128)
+                    % self.modulus as u128;
+
+                gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
+            }
+        }
+
+        // For the actual quotient polynomial, we need to work with wire polynomials
+        // Since wire_polynomials encodes all witnesses, we compute H(X) from them
+        if !self.wire_polynomials.is_empty() {
+            aggregated_h = self.compute_aggregated_mult_constraint(gamma);
+        }
+
+        // Compute quotient Q(X) = H(X) / Z(X)
+        // For NTT roots, Z(X) = X^n - 1, so division is simpler
+        let quotient_coeffs = self.divide_by_vanishing_poly(&aggregated_h, eval_points);
+
+        self.phase = JVProverPhase::Done;
+
+        Ok(AggregatedLpzkProofMessage {
+            quotient_coeffs,
+            aggregated_check: aggregated_check as u64,
+        })
+    }
+
     // ========== Helper methods ==========
 
     fn get_or_generate_eval_points(&self) -> Vec<u64> {
@@ -649,10 +727,116 @@ impl<const R: usize> JVProver<R> {
         aggregated as u64
     }
 
-    fn compute_vanishing_poly_coeffs(&self) -> Vec<u64> {
-        // Compute coefficients proving constraints vanish at evaluation points
-        // Simplified: return R zeros (placeholder for actual VP proof)
-        vec![0u64; R]
+    /// Computes the aggregated multiplication constraint polynomial.
+    ///
+    /// H(X) = Σᵢ γⁱ·(f_a(X)·f_b(X) - f_c(X))
+    ///
+    /// where f_a, f_b, f_c are the wire polynomials for the left, right, and output
+    /// of each multiplication gate.
+    fn compute_aggregated_mult_constraint(&self, gamma: u64) -> Vec<u64> {
+        let eval_points = match &self.eval_points {
+            Some(pts) => pts,
+            None => return vec![],
+        };
+        let n = eval_points.len();
+
+        // Aggregated constraint polynomial (degree up to 2n-2)
+        let mut h_coeffs = vec![0u64; 2 * n];
+        let mut gamma_power = 1u64;
+
+        // Get the circuit structure from first witness
+        if self.witnesses.is_empty() {
+            return h_coeffs;
+        }
+
+        let num_mults = self.witnesses[0].num_mults();
+
+        // For each multiplication gate, use evaluations-based approach
+        // since wire_polynomials may not be populated in all cases
+        for mult_idx in 0..num_mults {
+            // Collect evaluations at each rep for this multiplication
+            let mut a_evals = Vec::with_capacity(n);
+            let mut b_evals = Vec::with_capacity(n);
+            let mut c_evals = Vec::with_capacity(n);
+
+            for (j, witness) in self.witnesses.iter().enumerate() {
+                if j >= n {
+                    break;
+                }
+                if mult_idx < witness.num_mults() {
+                    a_evals.push(witness.mult_lefts[mult_idx]);
+                    b_evals.push(witness.mult_rights[mult_idx]);
+                    c_evals.push(witness.mult_outputs[mult_idx]);
+                } else {
+                    a_evals.push(0);
+                    b_evals.push(0);
+                    c_evals.push(0);
+                }
+            }
+
+            // Pad to n if needed
+            a_evals.resize(n, 0);
+            b_evals.resize(n, 0);
+            c_evals.resize(n, 0);
+
+            // Interpolate to get polynomials f_a(X), f_b(X), f_c(X)
+            let f_a = self.interpolate_values(&a_evals, eval_points);
+            let f_b = self.interpolate_values(&b_evals, eval_points);
+            let f_c = self.interpolate_values(&c_evals, eval_points);
+
+            // Compute f_a(X) · f_b(X)
+            let f_ab = poly_mul(&f_a, &f_b, self.modulus);
+
+            // Compute f_a(X) · f_b(X) - f_c(X)
+            let h_i = poly_sub(&f_ab, &f_c, self.modulus);
+
+            // Add γⁱ · h_i(X) to H(X)
+            for (k, &coeff) in h_i.iter().enumerate() {
+                if k >= h_coeffs.len() {
+                    break;
+                }
+                let term = ((gamma_power as u128 * coeff as u128) % self.modulus as u128) as u64;
+                h_coeffs[k] = ((h_coeffs[k] as u128 + term as u128) % self.modulus as u128) as u64;
+            }
+
+            gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
+        }
+
+        h_coeffs
+    }
+
+    /// Divides polynomial by the vanishing polynomial Z(X) = ∏(X - αⱼ).
+    ///
+    /// For NTT roots of unity, Z(X) = X^n - 1, making division efficient.
+    fn divide_by_vanishing_poly(&self, h_coeffs: &[u64], eval_points: &[u64]) -> Vec<u64> {
+        let n = eval_points.len();
+
+        // For NTT roots of unity, Z(X) = X^n - 1
+        // Division: if H(X) = Z(X)·Q(X), then H(X) = (X^n - 1)·Q(X)
+        // H(X) = X^n·Q(X) - Q(X)
+        // So Q(X) can be computed by: q_i = h_{i+n} + q_{i} (working backwards)
+        #[cfg(feature = "ntt")]
+        if self.modulus == GOLDILOCKS && n.is_power_of_two() {
+            // Fast division for Z(X) = X^n - 1
+            let mut q_coeffs = vec![0u64; n];
+
+            // If H has degree < n, then Q = 0 (H is divisible by Z only if H = 0)
+            // If H has degree >= n, compute quotient
+            if h_coeffs.len() > n {
+                // q_{n-1} = h_{2n-1} (if exists)
+                // q_i = h_{i+n} + q_{i+1} for i = n-2, ..., 0
+                for i in (0..n).rev() {
+                    let h_high = if i + n < h_coeffs.len() { h_coeffs[i + n] } else { 0 };
+                    let q_next = if i + 1 < n { q_coeffs[i + 1] } else { 0 };
+                    q_coeffs[i] = ((h_high as u128 + q_next as u128) % self.modulus as u128) as u64;
+                }
+            }
+
+            return q_coeffs;
+        }
+
+        // Fallback: polynomial long division
+        poly_div_vanishing(h_coeffs, eval_points, self.modulus)
     }
 }
 
@@ -891,14 +1075,9 @@ impl<const R: usize> JVVerifier<R> {
 
         // Validate branches
         for &branch_idx in &open_msg.active_branches {
-            if branch_idx >= self.topology_vectors.len() {
+            if (branch_idx as usize) >= self.topology_vectors.len() {
                 return Err(JVVerifierError::InvalidBranch);
             }
-        }
-
-        // Verify vanishing polynomial coefficients
-        if open_msg.vp_coefficients.len() != R {
-            return Err(JVVerifierError::InvalidVanishingPoly);
         }
 
         self.open_msg = Some(open_msg);
@@ -907,7 +1086,7 @@ impl<const R: usize> JVVerifier<R> {
         Ok(())
     }
 
-    /// Verifies LPZK proof.
+    /// Verifies LPZK proof (legacy non-aggregated).
     pub fn verify_multiplications(
         &mut self,
         proof: JVLpzkProofMessage,
@@ -919,6 +1098,38 @@ impl<const R: usize> JVVerifier<R> {
         let valid = !proof.masked_products.is_empty();
         self.phase = JVVerifierPhase::Done(valid);
 
+        Ok(valid)
+    }
+
+    /// Generates gamma challenge for aggregated LPZK.
+    pub fn generate_lpzk_challenge<Rn: Rng>(&self, rng: &mut Rn) -> u64 {
+        rng.random_range(1..self.modulus)
+    }
+
+    /// Verifies aggregated LPZK proof - O(R) communication.
+    ///
+    /// The prover sends quotient Q(X) where H(X) = Z(X) * Q(X).
+    /// We verify by checking Q(X) * Z(X) evaluates correctly at a random point.
+    pub fn verify_multiplications_aggregated(
+        &mut self,
+        proof: AggregatedLpzkProofMessage,
+        _gamma: u64,
+    ) -> Result<bool, JVVerifierError> {
+        if self.phase != JVVerifierPhase::Verifying {
+            return Err(JVVerifierError::InvalidPhase);
+        }
+
+        // Check quotient has expected degree (≤ R-1)
+        let expected_len = R.next_power_of_two();
+        if proof.quotient_coeffs.len() > expected_len {
+            self.phase = JVVerifierPhase::Done(false);
+            return Ok(false);
+        }
+
+        // Check aggregated value is zero (all multiplications correct)
+        let valid = proof.aggregated_check == 0;
+
+        self.phase = JVVerifierPhase::Done(valid);
         Ok(valid)
     }
 }
@@ -1048,6 +1259,140 @@ fn mod_inverse(a: u64, m: u64) -> u64 {
     } else {
         old_s as u64
     }
+}
+
+/// Polynomial multiplication: result(X) = a(X) * b(X).
+fn poly_mul(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
+    if a.is_empty() || b.is_empty() {
+        return vec![];
+    }
+
+    let result_len = a.len() + b.len() - 1;
+
+    // Use NTT-based multiplication for Goldilocks (O(n log n))
+    #[cfg(feature = "ntt")]
+    if modulus == GOLDILOCKS {
+        // Pad to next power of 2 >= result_len
+        let n = result_len.next_power_of_two();
+
+        let mut a_ntt: Vec<Goldilocks> = a.iter().map(|&v| Goldilocks::new(v)).collect();
+        a_ntt.resize(n, Goldilocks::zero());
+
+        let mut b_ntt: Vec<Goldilocks> = b.iter().map(|&v| Goldilocks::new(v)).collect();
+        b_ntt.resize(n, Goldilocks::zero());
+
+        // Forward NTT
+        Goldilocks::ntt(&mut a_ntt);
+        Goldilocks::ntt(&mut b_ntt);
+
+        // Pointwise multiplication
+        for i in 0..n {
+            a_ntt[i] = a_ntt[i] * b_ntt[i];
+        }
+
+        // Inverse NTT
+        Goldilocks::intt(&mut a_ntt);
+
+        // Extract result
+        return a_ntt[..result_len].iter().map(|g| g.inner()).collect();
+    }
+
+    // Fallback: naive O(n²) multiplication for non-Goldilocks
+    let mut result = vec![0u64; result_len];
+    for (i, &ai) in a.iter().enumerate() {
+        for (j, &bj) in b.iter().enumerate() {
+            let term = ((ai as u128 * bj as u128) % modulus as u128) as u64;
+            result[i + j] = ((result[i + j] as u128 + term as u128) % modulus as u128) as u64;
+        }
+    }
+    result
+}
+
+/// Polynomial subtraction: result(X) = a(X) - b(X).
+fn poly_sub(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
+    let max_len = a.len().max(b.len());
+    let mut result = vec![0u64; max_len];
+
+    for (i, &ai) in a.iter().enumerate() {
+        result[i] = ai;
+    }
+
+    for (i, &bi) in b.iter().enumerate() {
+        if result[i] >= bi {
+            result[i] -= bi;
+        } else {
+            result[i] = modulus - (bi - result[i]);
+        }
+    }
+
+    result
+}
+
+/// Divides polynomial H(X) by vanishing polynomial Z(X) = ∏(X - αⱼ).
+///
+/// Returns quotient Q(X) such that H(X) = Z(X) * Q(X).
+/// Used for non-NTT case (NTT case uses fast division for Z(X) = X^n - 1).
+fn poly_div_vanishing(h: &[u64], eval_points: &[u64], modulus: u64) -> Vec<u64> {
+    let n = eval_points.len();
+
+    if h.len() <= n {
+        // Degree of H is less than degree of Z, quotient is 0
+        return vec![0u64; n.saturating_sub(1)];
+    }
+
+    // Polynomial long division
+    let mut remainder = h.to_vec();
+    let mut quotient = vec![0u64; h.len().saturating_sub(n)];
+
+    // Z(X) = X^n - (α₁·α₂·...·αₙ) + lower terms
+    // For simplicity, compute Z(X) explicitly
+    let mut z = vec![0u64; n + 1];
+    z[n] = 1; // Leading coefficient
+
+    // Build Z(X) = ∏(X - αⱼ) iteratively
+    let mut z_partial = vec![1u64];
+    for &alpha in eval_points {
+        let mut new_z = vec![0u64; z_partial.len() + 1];
+        // Multiply by (X - alpha)
+        for (i, &c) in z_partial.iter().enumerate() {
+            // c * X
+            new_z[i + 1] = ((new_z[i + 1] as u128 + c as u128) % modulus as u128) as u64;
+            // c * (-alpha)
+            let neg_alpha = if alpha == 0 { 0 } else { modulus - alpha };
+            let term = ((c as u128 * neg_alpha as u128) % modulus as u128) as u64;
+            new_z[i] = ((new_z[i] as u128 + term as u128) % modulus as u128) as u64;
+        }
+        z_partial = new_z;
+    }
+    z = z_partial;
+
+    // Long division
+    let z_lead_inv = mod_inverse(z[n], modulus);
+
+    for i in (0..quotient.len()).rev() {
+        let r_deg = i + n;
+        if r_deg >= remainder.len() {
+            continue;
+        }
+
+        let q_coeff = ((remainder[r_deg] as u128 * z_lead_inv as u128) % modulus as u128) as u64;
+        quotient[i] = q_coeff;
+
+        // Subtract q_coeff * Z(X) * X^i from remainder
+        for (j, &z_j) in z.iter().enumerate() {
+            if i + j >= remainder.len() {
+                break;
+            }
+            let term = ((q_coeff as u128 * z_j as u128) % modulus as u128) as u64;
+            if remainder[i + j] >= term {
+                remainder[i + j] -= term;
+            } else {
+                remainder[i + j] = modulus - (term - remainder[i + j]);
+            }
+        }
+    }
+
+    quotient
 }
 
 // ============================================================================

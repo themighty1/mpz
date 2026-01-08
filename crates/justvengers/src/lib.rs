@@ -63,6 +63,10 @@ pub mod verifier;
 pub mod vole;
 pub mod jv_optimized;
 
+/// KZG polynomial commitment module (requires `kzg` feature).
+#[cfg(feature = "kzg")]
+pub mod kzg;
+
 // Re-exports for convenience
 pub use prover::{
     CommitmentMessage, DisclosureMessage, LpzkProofMessage, OpenMessage, ProverError,
@@ -84,7 +88,8 @@ pub use vole::{VoleProvider, VoleProviderError, VoleStats};
 pub use protocol::{run_prover, run_prover_with_vole, run_verifier, run_protocol as run_protocol_async, ProtocolError as AsyncProtocolError};
 pub use jv_optimized::{
     JVProver, JVVerifier, JVProverPhase, JVVerifierPhase,
-    JVSetupMessage, JVCommitmentMessage, JVDisclosureMessage, JVOpenMessage, JVLpzkProofMessage,
+    JVSetupMessage, JVCommitmentMessage, JVDisclosureMessage, JVOpenMessage,
+    JVLpzkProofMessage, AggregatedLpzkProofMessage,
     JVProverError, JVVerifierError, JVProtocolError,
     run_jv_protocol, estimate_communication, CommunicationEstimate,
 };
