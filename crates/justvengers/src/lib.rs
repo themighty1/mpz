@@ -56,9 +56,12 @@
 #![deny(clippy::all)]
 
 pub mod prover;
+pub mod protocol;
 pub mod soldering;
 pub mod topology;
 pub mod verifier;
+pub mod vole;
+pub mod jv_optimized;
 
 // Re-exports for convenience
 pub use prover::{
@@ -70,12 +73,20 @@ pub use topology::{
     UniversalHash, WireId,
 };
 pub use soldering::{
-    SolderingChallengeMessage, SolderingCommitMessage, SolderingConstraint, SolderingProver,
-    SolderingRevealMessage, SolderingVerifier,
+    AggregatedSolderingReveal, SolderingChallengeMessage, SolderingCommitMessage,
+    SolderingConstraint, SolderingProver, SolderingRevealMessage, SolderingVerifier,
 };
 pub use verifier::{
     BatchVerifier, SetupMessage, SingleRepVerifier, VerifierError, VerifierMessage, VerifierPhase,
     VerifierState,
+};
+pub use vole::{VoleProvider, VoleProviderError, VoleStats};
+pub use protocol::{run_prover, run_prover_with_vole, run_verifier, run_protocol as run_protocol_async, ProtocolError as AsyncProtocolError};
+pub use jv_optimized::{
+    JVProver, JVVerifier, JVProverPhase, JVVerifierPhase,
+    JVSetupMessage, JVCommitmentMessage, JVDisclosureMessage, JVOpenMessage, JVLpzkProofMessage,
+    JVProverError, JVVerifierError, JVProtocolError,
+    run_jv_protocol, estimate_communication, CommunicationEstimate,
 };
 
 /// Protocol parameters for Justvengers.
@@ -263,6 +274,121 @@ pub fn run_protocol_with_soldering<const R: usize>(
     let mut prover: ProverState<R> = ProverState::new(active_branch, modulus);
     let mut circuit_clone = circuit.clone();
     prover.setup(&mut circuit_clone, inputs_per_rep)
+        .map_err(|_| ProtocolError::ProverError)?;
+
+    // Setup soldering on prover (validates constraints)
+    prover.setup_soldering(soldering_constraints.to_vec(), &mut rng)
+        .map_err(|_| ProtocolError::SolderingError)?;
+
+    // Initialize verifier
+    let mut verifier: VerifierState<R> = VerifierState::new(modulus, &mut rng);
+    let setup_msg = verifier.setup(circuits, &mut rng)
+        .map_err(|_| ProtocolError::VerifierError)?;
+
+    // Setup soldering on verifier
+    verifier.setup_soldering(soldering_constraints.to_vec())
+        .map_err(|_| ProtocolError::VerifierError)?;
+
+    // Phase 1: Prover commits
+    let commitment = prover.commit(&setup_msg.eval_points)
+        .map_err(|_| ProtocolError::ProverError)?;
+
+    // Phase 1.5: Prover commits soldering
+    let soldering_commit = prover.commit_soldering()
+        .map_err(|_| ProtocolError::ProverError)?;
+
+    // Phase 2: Verifier sends challenge χ
+    let chi_msg = verifier.receive_commitment(commitment)
+        .map_err(|_| ProtocolError::VerifierError)?;
+    let chi = match chi_msg {
+        VerifierMessage::ChallengeChi(c) => c,
+        _ => return Err(ProtocolError::ProtocolViolation),
+    };
+
+    // Phase 2.5: Verifier sends soldering challenge
+    let soldering_challenge = if let Some(commit) = soldering_commit {
+        verifier.receive_soldering_commit(commit, &mut rng)
+            .map_err(|_| ProtocolError::VerifierError)?
+    } else {
+        None
+    };
+
+    // Phase 3: Prover discloses
+    let disclosure = prover.disclose(chi, verifier.topology_vectors())
+        .map_err(|_| ProtocolError::ProverError)?;
+
+    // Phase 3.5: Prover reveals soldering
+    let soldering_reveal = if let Some(ref challenge) = soldering_challenge {
+        prover.reveal_soldering(challenge)
+            .map_err(|_| ProtocolError::ProverError)?
+    } else {
+        None
+    };
+
+    // Verify soldering if present
+    if let Some(ref reveal) = soldering_reveal {
+        let soldering_ok = verifier.verify_soldering(reveal)
+            .map_err(|_| ProtocolError::VerifierError)?;
+        if !soldering_ok {
+            return Err(ProtocolError::SolderingError);
+        }
+    }
+
+    // Phase 4: Verifier sends challenge ρ
+    let rho_msg = verifier.receive_disclosure(disclosure, &mut rng)
+        .map_err(|_| ProtocolError::VerifierError)?;
+    let rho = match rho_msg {
+        VerifierMessage::ChallengeRho(r) => r,
+        _ => return Err(ProtocolError::ProtocolViolation),
+    };
+
+    // Phase 5: Prover opens
+    let open_msg = prover.open(rho, verifier.topology_vectors())
+        .map_err(|_| ProtocolError::ProverError)?;
+    verifier.receive_open(open_msg)
+        .map_err(|_| ProtocolError::VerifierError)?;
+
+    // Phase 6: Prover sends LPZK proof
+    let lpzk_proof = prover.prove_multiplications()
+        .map_err(|_| ProtocolError::ProverError)?;
+
+    // Final verification
+    let result = verifier.verify_multiplications(lpzk_proof)
+        .map_err(|_| ProtocolError::VerifierError)?;
+
+    Ok(result)
+}
+
+/// Runs the full JV protocol with soldering using per-repetition active branches.
+///
+/// This variant allows each repetition j to use a different branch id_j,
+/// as described in the JV paper Section 4.3.
+pub fn run_protocol_with_soldering_per_rep<const R: usize>(
+    circuits: &CircuitBatch,
+    active_branches: &[usize],
+    inputs_per_rep: &[Vec<u64>],
+    soldering_constraints: &[SolderingConstraint],
+    modulus: u64,
+) -> Result<bool, ProtocolError> {
+    use rand::SeedableRng;
+    let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
+
+    // Verify inputs
+    if inputs_per_rep.len() != R {
+        return Err(ProtocolError::InvalidInputs);
+    }
+    if active_branches.len() != R {
+        return Err(ProtocolError::InvalidInputs);
+    }
+    for &branch in active_branches {
+        if branch >= circuits.num_branches() {
+            return Err(ProtocolError::InvalidBranch);
+        }
+    }
+
+    // Initialize prover with per-rep branches
+    let mut prover: ProverState<R> = ProverState::new_per_rep(active_branches.to_vec(), modulus);
+    prover.setup_per_rep(circuits, inputs_per_rep)
         .map_err(|_| ProtocolError::ProverError)?;
 
     // Setup soldering on prover (validates constraints)
@@ -548,7 +674,7 @@ mod tests {
 
             // Prover opens
             let open_msg = prover.open(rho, verifier.topology_vectors()).unwrap();
-            assert_eq!(open_msg.active_branch, 0);
+            assert!(open_msg.active_branches.iter().all(|&b| b == 0));
 
             // Verifier receives open
             verifier.receive_open(open_msg).unwrap();

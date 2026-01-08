@@ -23,7 +23,7 @@ pub mod ntt;
 pub mod poly;
 
 pub use ahe::{BgvParams, Ciphertext, KeyPair, ParamSet, PublicKey, SecretKey};
-pub use itmac::{GlobalKey, ItMac, ItMacBatch, ItMacField, ProverShare, VerifierShare, VolePool};
+pub use itmac::{GlobalKey, ItMac, ItMacBatch, ItMacField, ProverShare, VerifierShare, VolePool, VoleSource};
 pub use itpac::{EncryptedPowers, ItPac, ItPacGenerator, ItPacVerifier};
 pub use ntt::{Ntt, NttField};
 pub use poly::Poly;

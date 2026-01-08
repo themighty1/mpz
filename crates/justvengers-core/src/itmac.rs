@@ -159,6 +159,15 @@ impl<F: ItMacField> ItMac<F> {
         }
     }
 
+    /// Creates an IT-MAC from pre-computed shares.
+    ///
+    /// This is used by VOLE providers that generate correlations externally.
+    /// The caller is responsible for ensuring the shares are consistent:
+    /// m = k + x·Δ
+    pub fn from_shares(prover: ProverShare<F>, verifier: VerifierShare<F>) -> Self {
+        Self { prover, verifier }
+    }
+
     /// Returns the committed value.
     pub fn value(&self) -> F {
         self.prover.value
@@ -337,6 +346,51 @@ impl<F: ItMacField> ItMacBatch<F> {
     /// Verifies all commitments in the batch.
     pub fn verify_all(&self, global_key: &GlobalKey<F>) -> bool {
         self.macs.iter().all(|m| m.verify(global_key))
+    }
+}
+
+/// Trait for VOLE sources that supply random IT-MAC correlations.
+///
+/// A VoleSource abstracts the source of VOLE correlations. Implementations
+/// are backed by OT protocols (IKNP, Silent OT, Ferret, IdealRCOT, etc.)
+/// and handle OT→VOLE conversion internally.
+///
+/// The source is injected as a dependency into protocols that need VOLEs.
+/// OT is the source's internal implementation detail - protocols don't need
+/// to know how VOLEs are generated.
+pub trait VoleSource<F: ItMacField> {
+    /// Error type for VOLE operations.
+    type Error: std::fmt::Debug;
+
+    /// Returns the global key (verifier's Δ).
+    fn global_key(&self) -> &GlobalKey<F>;
+
+    /// Returns the number of available VOLE correlations.
+    fn available(&self) -> usize;
+
+    /// Requests `count` new VOLE correlations to be generated.
+    ///
+    /// This may trigger OT operations depending on the backend.
+    /// The correlations become available after `flush()` is called.
+    fn request(&mut self, count: usize) -> Result<(), Self::Error>;
+
+    /// Flushes pending requests, making requested VOLEs available.
+    ///
+    /// This performs OT→VOLE conversion using the backend OT protocol.
+    fn flush(&mut self) -> Result<(), Self::Error>;
+
+    /// Takes `count` VOLE correlations from the pool.
+    ///
+    /// Returns random IT-MACs [u₁], ..., [uₙ] where each uᵢ is uniform random.
+    /// These can be used to commit to values via the standard VOLE commitment:
+    /// to commit to x, send (x - u) and compute [x] = [u] + (x - u).
+    fn take(&mut self, count: usize) -> Result<Vec<ItMac<F>>, Self::Error>;
+
+    /// Convenience method: request, flush, and take in one call.
+    fn generate(&mut self, count: usize) -> Result<Vec<ItMac<F>>, Self::Error> {
+        self.request(count)?;
+        self.flush()?;
+        self.take(count)
     }
 }
 

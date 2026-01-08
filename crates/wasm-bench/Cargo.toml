@@ -39,6 +39,9 @@ aes = { workspace = true }
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chromiumoxide = { version = "0.7", features = ["tokio-runtime"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "net", "io-util"] }

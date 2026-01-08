@@ -14,6 +14,8 @@ use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 mod garble;
 #[cfg(target_arch = "wasm32")]
+mod jv;
+#[cfg(target_arch = "wasm32")]
 mod ot;
 #[cfg(target_arch = "wasm32")]
 mod zk;
@@ -21,6 +23,8 @@ mod zk;
 // Re-export all wasm_bindgen functions
 #[cfg(target_arch = "wasm32")]
 pub use garble::*;
+#[cfg(target_arch = "wasm32")]
+pub use jv::*;
 #[cfg(target_arch = "wasm32")]
 pub use ot::*;
 #[cfg(target_arch = "wasm32")]

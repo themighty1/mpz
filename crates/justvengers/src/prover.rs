@@ -1,5 +1,22 @@
 //! Prover implementation for Justvengers ZK protocol.
 //!
+//! # Communication Complexity Note
+//!
+//! **This module implements the "Batchman-style" O(RC) communication approach.**
+//!
+//! The DisclosureMessage sends `masked_values` which contains all R×C witness values.
+//! This results in O(RC) communication where R is repetitions and C is circuit size.
+//!
+//! For the optimized O(R+B+C) JustVengers protocol that uses polynomial encoding
+//! via IT-PAC, see the `jv_optimized` module. The key difference:
+//! - Batchman (this module): sends R×C individual masked values
+//! - JustVengers (jv_optimized): encodes R values per wire as polynomial, sends O(C)
+//!   polynomial commitments + O(R) vanishing polynomial coefficients
+//!
+//! We keep both implementations as they have different trade-offs:
+//! - Batchman: simpler, no AHE overhead, good for small R
+//! - JustVengers: better asymptotic complexity, requires AHE setup
+//!
 //! Implements the 5-phase prover from the Justvengers paper:
 //!
 //! 1. **Initialization**: Receive encrypted powers and setup VOLE pool
@@ -36,8 +53,9 @@ use mpz_fields::Field;
 /// Prover state during protocol execution.
 #[derive(Clone, Debug)]
 pub struct ProverState<const R: usize> {
-    /// The active branch index b* ∈ [0, B).
-    active_branch: usize,
+    /// The active branch indices, one per repetition: id_j ∈ [0, B) for j ∈ [R].
+    /// Each repetition can execute a different branch (as per JV paper Section 4.3).
+    active_branches: Vec<usize>,
     /// Extended witnesses for all R repetitions.
     witnesses: Vec<ExtendedWitness>,
     /// Field modulus.
@@ -72,7 +90,7 @@ pub enum ProverPhase {
 }
 
 /// Messages sent by the prover.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ProverMessage {
     /// Commitment message: encrypted polynomial evaluations.
     Commitment(CommitmentMessage),
@@ -85,7 +103,7 @@ pub enum ProverMessage {
 }
 
 /// Commitment phase message.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct CommitmentMessage {
     /// Number of IT-PAC commitments (one per witness component).
     pub num_commitments: usize,
@@ -94,7 +112,7 @@ pub struct CommitmentMessage {
 }
 
 /// Disclosure phase message.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DisclosureMessage {
     /// Evaluation points α₁, ..., αᵣ used for interpolation.
     pub eval_points: Vec<u64>,
@@ -105,10 +123,10 @@ pub struct DisclosureMessage {
 }
 
 /// Open phase message.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OpenMessage {
-    /// Active branch index b*.
-    pub active_branch: usize,
+    /// Active branch indices, one per repetition: id_j ∈ [0, B) for j ∈ [R].
+    pub active_branches: Vec<usize>,
     /// Universal hash proof component.
     pub hash_proof: u64,
     /// Vanishing polynomial coefficients for non-active branches.
@@ -116,7 +134,7 @@ pub struct OpenMessage {
 }
 
 /// LPZK proof message for multiplication verification.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LpzkProofMessage {
     /// Masked multiplication products.
     pub masked_products: Vec<u64>,
@@ -125,14 +143,17 @@ pub struct LpzkProofMessage {
 }
 
 impl<const R: usize> ProverState<R> {
-    /// Creates a new prover for the given branch.
+    /// Creates a new prover with a single active branch for all repetitions.
+    ///
+    /// This is a convenience constructor for the common case where all repetitions
+    /// execute the same branch.
     ///
     /// # Arguments
-    /// * `active_branch` - The branch index b* ∈ [0, B) being executed
+    /// * `active_branch` - The branch index b* ∈ [0, B) to use for all repetitions
     /// * `modulus` - The field modulus p
     pub fn new(active_branch: usize, modulus: u64) -> Self {
         Self {
-            active_branch,
+            active_branches: vec![active_branch; R],
             witnesses: Vec::new(),
             modulus,
             phase: ProverPhase::Init,
@@ -143,9 +164,47 @@ impl<const R: usize> ProverState<R> {
         }
     }
 
-    /// Returns the active branch index.
+    /// Creates a new prover with per-repetition active branches.
+    ///
+    /// As per JV paper Section 4.3, each repetition j can execute a different
+    /// branch id_j ∈ [0, B).
+    ///
+    /// # Arguments
+    /// * `active_branches` - Branch indices, one per repetition (must have length R)
+    /// * `modulus` - The field modulus p
+    ///
+    /// # Panics
+    /// Panics if `active_branches.len() != R`
+    pub fn new_per_rep(active_branches: Vec<usize>, modulus: u64) -> Self {
+        assert_eq!(
+            active_branches.len(),
+            R,
+            "active_branches must have length R={}, got {}",
+            R,
+            active_branches.len()
+        );
+        Self {
+            active_branches,
+            witnesses: Vec::new(),
+            modulus,
+            phase: ProverPhase::Init,
+            eval_points: None,
+            #[cfg(feature = "ntt")]
+            intt_context: None,
+            soldering_prover: None,
+        }
+    }
+
+    /// Returns the active branch index for the first repetition.
+    ///
+    /// For backwards compatibility. Use `active_branches()` to get all per-rep branches.
     pub fn active_branch(&self) -> usize {
-        self.active_branch
+        self.active_branches[0]
+    }
+
+    /// Returns all active branch indices, one per repetition.
+    pub fn active_branches(&self) -> &[usize] {
+        &self.active_branches
     }
 
     /// Returns the current phase.
@@ -160,8 +219,8 @@ impl<const R: usize> ProverState<R> {
 
     /// Initializes the prover with the circuit and inputs.
     ///
-    /// Evaluates the circuit R times with the given inputs to generate
-    /// the extended witnesses.
+    /// Evaluates the same circuit R times with the given inputs to generate
+    /// the extended witnesses. Use `setup_per_rep()` for per-repetition circuits.
     pub fn setup(&mut self, circuit: &mut Circuit, inputs_per_rep: &[Vec<u64>]) -> Result<(), ProverError> {
         if self.phase != ProverPhase::Init {
             return Err(ProverError::InvalidPhase);
@@ -175,6 +234,56 @@ impl<const R: usize> ProverState<R> {
         self.witnesses = inputs_per_rep
             .iter()
             .map(|inputs| circuit.evaluate(inputs, self.modulus))
+            .collect();
+
+        self.phase = ProverPhase::Setup;
+        Ok(())
+    }
+
+    /// Initializes the prover with per-repetition circuits from a batch.
+    ///
+    /// For each repetition j, evaluates `circuits[active_branches[j]]` with
+    /// `inputs_per_rep[j]`. This supports the JV paper's per-repetition
+    /// branch selection (id_j ∈ [B] for each j ∈ [R]).
+    ///
+    /// # Arguments
+    /// * `circuits` - The circuit batch containing all B branches
+    /// * `inputs_per_rep` - Input vectors, one per repetition
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - Not in Init phase
+    /// - `inputs_per_rep.len() != R`
+    /// - Any `active_branches[j] >= circuits.num_circuits()`
+    pub fn setup_per_rep(
+        &mut self,
+        circuits: &crate::CircuitBatch,
+        inputs_per_rep: &[Vec<u64>],
+    ) -> Result<(), ProverError> {
+        if self.phase != ProverPhase::Init {
+            return Err(ProverError::InvalidPhase);
+        }
+
+        if inputs_per_rep.len() != R {
+            return Err(ProverError::WrongRepetitionCount);
+        }
+
+        // Validate all active branches are valid
+        for &branch_idx in &self.active_branches {
+            if branch_idx >= circuits.num_branches() {
+                return Err(ProverError::InvalidBranch);
+            }
+        }
+
+        // Evaluate each repetition's circuit with its inputs
+        self.witnesses = self
+            .active_branches
+            .iter()
+            .zip(inputs_per_rep.iter())
+            .map(|(&branch_idx, inputs)| {
+                let mut circuit = circuits.get(branch_idx).unwrap().clone();
+                circuit.evaluate(inputs, self.modulus)
+            })
             .collect();
 
         self.phase = ProverPhase::Setup;
@@ -277,6 +386,7 @@ impl<const R: usize> ProverState<R> {
     /// Generates disclosure message after receiving challenge χ.
     ///
     /// Computes topology vector inner products and masked values.
+    /// Uses per-repetition active branches: for rep j, uses topology_vectors[active_branches[j]].
     pub fn disclose(
         &mut self,
         chi: u64,
@@ -286,12 +396,12 @@ impl<const R: usize> ProverState<R> {
             return Err(ProverError::InvalidPhase);
         }
 
-        // Use the active branch's topology vector
-        if self.active_branch >= topology_vectors.len() {
-            return Err(ProverError::InvalidBranch);
+        // Validate all active branches are within bounds
+        for &branch_idx in &self.active_branches {
+            if branch_idx >= topology_vectors.len() {
+                return Err(ProverError::InvalidBranch);
+            }
         }
-
-        let active_tv = &topology_vectors[self.active_branch];
 
         // Pre-allocate with capacity to avoid reallocations
         let total_witness_values: usize = self.witnesses.iter().map(|w| w.len()).sum();
@@ -300,8 +410,12 @@ impl<const R: usize> ProverState<R> {
 
         // Combined loop: compute topology products and masked values in one pass
         // Uses iter() instead of to_vec() to avoid allocation per witness
-        for witness in &self.witnesses {
-            // Compute ⟨t_b*, w^(r)⟩ using to_vec() only once
+        // Each repetition j uses its own active branch: topology_vectors[active_branches[j]]
+        for (j, witness) in self.witnesses.iter().enumerate() {
+            // Get topology vector for this repetition's active branch
+            let active_tv = &topology_vectors[self.active_branches[j]];
+
+            // Compute ⟨t_{id_j}, w^(j)⟩ using to_vec() only once
             let w = witness.to_vec();
             let product = active_tv.inner_product(&w);
             topology_products.push(product);
@@ -329,6 +443,7 @@ impl<const R: usize> ProverState<R> {
     /// Generates open message after receiving challenge ρ.
     ///
     /// Proves membership in the set of valid topology vectors using universal hash.
+    /// For per-rep active branches, aggregates hash proofs across all repetitions.
     pub fn open(
         &mut self,
         rho: u64,
@@ -341,17 +456,25 @@ impl<const R: usize> ProverState<R> {
         // Compute universal hash of topology vectors
         let _hash = UniversalHash::compute(topology_vectors, rho, self.modulus);
 
-        // For the active branch, compute hash proof
-        // This is ρ^{b*} · ⟨t_b*, w⟩
-        let w = self.witnesses[0].to_vec();
-        let active_tv = &topology_vectors[self.active_branch];
-        let tv_product = active_tv.inner_product(&w);
+        // For per-rep active branches, compute aggregate hash proof
+        // Sum of ρ^{id_j} · ⟨t_{id_j}, w^(j)⟩ for each repetition j
+        let mut hash_proof = 0u128;
+        for (j, witness) in self.witnesses.iter().enumerate() {
+            let branch_idx = self.active_branches[j];
+            let w = witness.to_vec();
+            let active_tv = &topology_vectors[branch_idx];
+            let tv_product = active_tv.inner_product(&w);
 
-        let mut rho_power = 1u128;
-        for _ in 0..self.active_branch {
-            rho_power = (rho_power * rho as u128) % self.modulus as u128;
+            // Compute ρ^{id_j}
+            let mut rho_power = 1u128;
+            for _ in 0..branch_idx {
+                rho_power = (rho_power * rho as u128) % self.modulus as u128;
+            }
+
+            // Add contribution: ρ^{id_j} · ⟨t_{id_j}, w^(j)⟩
+            let contrib = (rho_power * tv_product as u128) % self.modulus as u128;
+            hash_proof = (hash_proof + contrib) % self.modulus as u128;
         }
-        let hash_proof = ((rho_power * tv_product as u128) % self.modulus as u128) as u64;
 
         // Generate vanishing polynomial coefficients for non-active branches
         // These prove that f(αᵢ) = 0 for other branches
@@ -360,8 +483,8 @@ impl<const R: usize> ProverState<R> {
         self.phase = ProverPhase::Opened;
 
         Ok(OpenMessage {
-            active_branch: self.active_branch,
-            hash_proof,
+            active_branches: self.active_branches.clone(),
+            hash_proof: hash_proof as u64,
             vanishing_coeffs,
         })
     }
@@ -396,6 +519,94 @@ impl<const R: usize> ProverState<R> {
                 // 2. P uses VOLE correlation to prove consistency
                 masked_products.push(c);
                 mac_tags.push(0); // Placeholder
+            }
+        }
+
+        self.phase = ProverPhase::Done;
+
+        Ok(LpzkProofMessage {
+            masked_products,
+            mac_tags,
+        })
+    }
+
+    /// Generates LPZK proof for multiplication verification using a VOLE source.
+    ///
+    /// This is the full implementation that uses real VOLE correlations from
+    /// the injected VoleSource. The source handles OT→VOLE conversion internally.
+    ///
+    /// # Arguments
+    /// * `vole_source` - Source of VOLE correlations (e.g., `VoleProvider` backed by OT)
+    ///
+    /// # Type Parameters
+    /// * `F` - IT-MAC field type (must be compatible with u64 modulus)
+    /// * `V` - VoleSource implementation
+    ///
+    /// # Returns
+    /// LPZK proof message with masked products and MAC tags
+    pub fn prove_multiplications_with_voles<F, V>(
+        &mut self,
+        vole_source: &mut V,
+    ) -> Result<LpzkProofMessage, ProverError>
+    where
+        F: mpz_justvengers_core::ItMacField + From<u64> + Into<u64>,
+        V: mpz_justvengers_core::VoleSource<F>,
+    {
+        if self.phase != ProverPhase::Opened {
+            return Err(ProverError::InvalidPhase);
+        }
+
+        // Count total multiplications needed
+        let total_mults: usize = self.witnesses.iter().map(|w| w.num_mults()).sum();
+
+        // Request and generate VOLE correlations
+        // Each multiplication needs one VOLE for the masking
+        vole_source
+            .request(total_mults)
+            .map_err(|_| ProverError::VolePoolExhausted)?;
+        vole_source
+            .flush()
+            .map_err(|_| ProverError::VolePoolExhausted)?;
+        let voles = vole_source
+            .take(total_mults)
+            .map_err(|_| ProverError::VolePoolExhausted)?;
+
+        let mut masked_products = Vec::with_capacity(total_mults);
+        let mut mac_tags = Vec::with_capacity(total_mults);
+
+        let mut vole_idx = 0;
+        for witness in &self.witnesses {
+            for i in 0..witness.num_mults() {
+                let a = witness.mult_lefts[i];
+                let b = witness.mult_rights[i];
+                let c = witness.mult_outputs[i];
+
+                // Verify locally: c = a * b
+                let expected = ((a as u128 * b as u128) % self.modulus as u128) as u64;
+                if c != expected {
+                    return Err(ProverError::InvalidMultiplication);
+                }
+
+                // LPZK protocol:
+                // 1. Get random VOLE correlation [u] where:
+                //    - Prover has (u, m_u) where m_u = k_u + u·Δ
+                //    - Verifier has k_u
+                let vole = &voles[vole_idx];
+                vole_idx += 1;
+
+                // 2. Prover computes masked product: c - u
+                let u: u64 = vole.value().into();
+                let masked = if c >= u {
+                    c - u
+                } else {
+                    self.modulus - (u - c)
+                };
+
+                // 3. Prover reveals MAC tag m_u (for verification)
+                let mac_tag: u64 = vole.prover_share().mac().into();
+
+                masked_products.push(masked);
+                mac_tags.push(mac_tag);
             }
         }
 
@@ -546,7 +757,7 @@ impl<const R: usize> ProverState<R> {
 
         // Create and setup soldering prover
         let mut soldering = SolderingProver::new(self.modulus);
-        soldering.setup(constraints, input_polys, output_polys, eval_points, rng);
+        soldering.setup(constraints, input_polys, output_polys, eval_points, R, rng);
 
         self.soldering_prover = Some(soldering);
         Ok(())
@@ -895,6 +1106,109 @@ mod tests {
 
         // LPZK proof
         let _proof_msg = prover.prove_multiplications().unwrap();
+
+        assert_eq!(prover.phase(), &ProverPhase::Done);
+    }
+
+    /// Test field compatible with IT-MAC and u64 conversion.
+    #[derive(Copy, Clone, Debug, Default, PartialEq)]
+    struct VoleTestField(u64);
+
+    impl std::ops::Add for VoleTestField {
+        type Output = Self;
+        fn add(self, rhs: Self) -> Self {
+            Self((self.0 + rhs.0) % TEST_MODULUS)
+        }
+    }
+
+    impl std::ops::Sub for VoleTestField {
+        type Output = Self;
+        fn sub(self, rhs: Self) -> Self {
+            Self((self.0 + TEST_MODULUS - rhs.0) % TEST_MODULUS)
+        }
+    }
+
+    impl std::ops::Mul for VoleTestField {
+        type Output = Self;
+        fn mul(self, rhs: Self) -> Self {
+            Self((self.0 as u128 * rhs.0 as u128 % TEST_MODULUS as u128) as u64)
+        }
+    }
+
+    impl mpz_justvengers_core::ItMacField for VoleTestField {
+        fn zero() -> Self {
+            Self(0)
+        }
+        fn one() -> Self {
+            Self(1)
+        }
+        fn random<Rng: rand::Rng>(rng: &mut Rng) -> Self {
+            Self(rng.random_range(0..TEST_MODULUS))
+        }
+        fn neg(self) -> Self {
+            if self.0 == 0 {
+                Self(0)
+            } else {
+                Self(TEST_MODULUS - self.0)
+            }
+        }
+    }
+
+    impl From<u64> for VoleTestField {
+        fn from(v: u64) -> Self {
+            Self(v % TEST_MODULUS)
+        }
+    }
+
+    impl From<VoleTestField> for u64 {
+        fn from(v: VoleTestField) -> u64 {
+            v.0
+        }
+    }
+
+    #[test]
+    fn test_prover_with_vole_source() {
+        use crate::vole::VoleProvider;
+        use mpz_ot_core::ideal::rcot::IdealRCOT;
+
+        let mut circuit = Circuit::new();
+        let x = circuit.add_input();
+        let y = circuit.add_input();
+        circuit.add_mul(x, y);
+
+        let mut prover: ProverState<2> = ProverState::new(0, TEST_MODULUS);
+
+        // Setup
+        let inputs = vec![vec![3, 4], vec![5, 6]];
+        prover.setup(&mut circuit, &inputs).unwrap();
+
+        // Commit
+        let eval_points = vec![1, 2];
+        let _commit_msg = prover.commit(&eval_points).unwrap();
+
+        // Disclose
+        let tv = crate::topology::TopologyVector::new(vec![1, 2, 3, 4, 5], 7, TEST_MODULUS);
+        let topology_vectors = vec![tv];
+
+        let chi = 42;
+        let _disclose_msg = prover.disclose(chi, &topology_vectors).unwrap();
+
+        // Open
+        let rho = 13;
+        let _open_msg = prover.open(rho, &topology_vectors).unwrap();
+
+        // LPZK proof with VOLE source backed by IdealRCOT
+        let rcot = IdealRCOT::default();
+        let mut vole_source = VoleProvider::<VoleTestField, _>::new(rcot);
+        let proof_msg = prover.prove_multiplications_with_voles(&mut vole_source).unwrap();
+
+        // Should have 2 multiplications (one per repetition)
+        assert_eq!(proof_msg.masked_products.len(), 2);
+        assert_eq!(proof_msg.mac_tags.len(), 2);
+
+        // MAC tags should be non-zero (real VOLE values)
+        // Note: there's a small probability they could be zero, but extremely unlikely
+        assert!(proof_msg.mac_tags.iter().any(|&t| t != 0), "MAC tags should have non-zero values");
 
         assert_eq!(prover.phase(), &ProverPhase::Done);
     }

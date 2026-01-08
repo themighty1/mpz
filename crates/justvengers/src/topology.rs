@@ -437,7 +437,7 @@ impl TopologyMatrix {
 ///
 /// This compresses the matrix to a single vector while maintaining
 /// soundness through the Schwartz-Zippel lemma.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TopologyVector {
     /// Coefficients t[j] = Σᵢ χⁱ · T[i,j]
     coeffs: Vec<u64>,

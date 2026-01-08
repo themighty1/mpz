@@ -83,7 +83,7 @@ pub enum VerifierPhase {
 }
 
 /// Messages sent by the verifier.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum VerifierMessage {
     /// Setup message with encrypted powers.
     Setup(SetupMessage),
@@ -96,7 +96,7 @@ pub enum VerifierMessage {
 }
 
 /// Setup message from verifier.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SetupMessage {
     /// Maximum polynomial degree supported.
     pub max_degree: usize,
@@ -291,9 +291,11 @@ impl<const R: usize> VerifierState<R> {
             return Err(VerifierError::InvalidPhase);
         }
 
-        // Verify branch is valid
-        if open_msg.active_branch >= self.topology_vectors.len() {
-            return Err(VerifierError::InvalidBranch);
+        // Verify all branches are valid (per-rep active branches)
+        for &branch_idx in &open_msg.active_branches {
+            if branch_idx >= self.topology_vectors.len() {
+                return Err(VerifierError::InvalidBranch);
+            }
         }
 
         // Verify universal hash proof
@@ -301,7 +303,7 @@ impl<const R: usize> VerifierState<R> {
         let hash = UniversalHash::compute(&self.topology_vectors, rho, self.modulus);
 
         // The verification would check:
-        // ρ^{b*} · ⟨t_b*, w⟩ = ⟨h, w⟩
+        // Sum of ρ^{id_j} · ⟨t_{id_j}, w^(j)⟩ = ⟨h, w⟩
         //
         // Since we don't have the full witness, we verify the hash_proof
         // matches the expected structure
@@ -382,7 +384,7 @@ impl<const R: usize> VerifierState<R> {
         });
 
         let mut soldering = SolderingVerifier::new(self.modulus);
-        soldering.setup(constraints, eval_points);
+        soldering.setup(constraints, eval_points, R);
         self.soldering_verifier = Some(soldering);
 
         Ok(())
@@ -419,6 +421,20 @@ impl<const R: usize> VerifierState<R> {
         }
     }
 
+    /// Receives and verifies soldering reveal message.
+    ///
+    /// Alias for `verify_soldering` for protocol layer consistency.
+    pub fn receive_soldering_reveal(
+        &mut self,
+        reveal: &SolderingRevealMessage,
+    ) -> Result<(), VerifierError> {
+        let ok = self.verify_soldering(reveal)?;
+        if !ok {
+            return Err(VerifierError::SolderingVerificationFailed);
+        }
+        Ok(())
+    }
+
     /// Returns whether soldering is configured.
     pub fn has_soldering(&self) -> bool {
         self.soldering_verifier.is_some()
@@ -451,6 +467,8 @@ pub enum VerifierError {
     MultiplicationProofFailed,
     /// Soldering constraint verification failed.
     SolderingVerificationFailed,
+    /// Protocol phase error with description.
+    Phase(String),
 }
 
 /// Simplified verifier for single-repetition proofs.
@@ -703,7 +721,7 @@ mod tests {
 
         // Receive open
         let open_msg = OpenMessage {
-            active_branch: 0,
+            active_branches: vec![0, 0], // R=2, both reps use branch 0
             hash_proof: 42,
             vanishing_coeffs: vec![],
         };
@@ -761,7 +779,7 @@ mod tests {
 
         // Try to open with invalid branch
         let open_msg = OpenMessage {
-            active_branch: 99, // Invalid
+            active_branches: vec![99], // Invalid branch index
             hash_proof: 42,
             vanishing_coeffs: vec![],
         };

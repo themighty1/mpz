@@ -9,9 +9,16 @@ license = "MIT OR Apache-2.0"
 mpz-core = { path = "../core" }
 mpz-fields = { path = "../fields" }
 mpz-justvengers-core = { path = "../justvengers-core" }
+mpz-ot-core = { path = "../ot-core" }
+mpz-memory-core = { path = "../memory-core" }
+mpz-common = { path = "../common" }
+serio = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+bincode = { workspace = true }
 rand = { workspace = true }
+rand_chacha = { workspace = true }
+futures = { workspace = true }
 
 [features]
 default = ["ntt"]
@@ -22,7 +29,10 @@ rand = { workspace = true }
 mpz-core = { path = "../core" }
 mpz-fields = { path = "../fields" }
 mpz-justvengers-core = { path = "../justvengers-core" }
+mpz-common = { path = "../common", features = ["test-utils"] }
 criterion = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
 
 [[bench]]
 name = "e2e_bench"
@@ -30,6 +40,10 @@ harness = false
 
 [[bench]]
 name = "prover"
+harness = false
+
+[[bench]]
+name = "vm_bench"
 harness = false
 
 [[bin]]

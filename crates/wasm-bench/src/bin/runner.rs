@@ -35,6 +35,8 @@ const ALL_GROUPS: &[&str] = &[
     "zk_verifier",
     "garble",
     "ferret_sender",
+    "jv_prover",
+    "jv_vm_prover",
 ];
 
 /// All available benchmarks
@@ -66,6 +68,19 @@ const ALL_BENCHMARKS: &[&str] = &[
     "ferret_sender/100k",
     "ferret_sender/1m",
     "ferret_sender/10m",
+    "jv_prover/5x5x100",
+    "jv_prover/5x5x1000",
+    "jv_prover/10x10x100",
+    "jv_prover/10x10x1000",
+    "jv_prover/100x100x100",
+    "jv_prover/100x100x10k",
+    "jv_prover/100x100x100k",
+    "jv_vm_prover/10",
+    "jv_vm_prover/100",
+    "jv_vm_prover/1000",
+    "jv_vm_prover/10000",
+    "jv_vm_prover/25000",
+    "jv_vm_prover/100000",
 ];
 
 /// Get all benchmarks in a group
@@ -81,7 +96,7 @@ fn benchmarks_in_group(group: &str) -> Vec<&'static str> {
 /// Check if a benchmark is multi-threaded (uses concurrency parameter)
 fn is_mt_benchmark(name: &str) -> bool {
     // MT groups: all benchmarks in these groups are MT
-    let mt_groups = ["zk_prover", "zk_verifier", "garble", "ferret_sender"];
+    let mt_groups = ["zk_prover", "zk_verifier", "garble", "ferret_sender", "jv_prover", "jv_vm_prover"];
     for group in mt_groups {
         if name.starts_with(&format!("{}/", group)) {
             // Exclude specific ST benchmarks
