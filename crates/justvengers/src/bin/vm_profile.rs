@@ -451,6 +451,10 @@ fn main() {
             let (inputs, branches, final_acc) = generate_vm_inputs_per_rep(1000);
             impl_profile!(1000, circuits, branches, inputs, soldering, iters, final_acc, protocol_only);
         }
+        3000 => {
+            let (inputs, branches, final_acc) = generate_vm_inputs_per_rep(3000);
+            impl_profile!(3000, circuits, branches, inputs, soldering, iters, final_acc, protocol_only);
+        }
         10000 => {
             let (inputs, branches, final_acc) = generate_vm_inputs_per_rep(10000);
             impl_profile!(10000, circuits, branches, inputs, soldering, iters, final_acc, protocol_only);
@@ -464,7 +468,7 @@ fn main() {
             impl_profile!(50000, circuits, branches, inputs, soldering, iters, final_acc, protocol_only);
         }
         _ => {
-            eprintln!("Unsupported REPS value: {}. Supported: 100, 1000, 10000, 25000, 50000", reps);
+            eprintln!("Unsupported REPS value: {}. Supported: 100, 1000, 3000, 10000, 25000, 50000", reps);
             std::process::exit(1);
         }
     }

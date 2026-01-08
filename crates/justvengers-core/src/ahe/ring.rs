@@ -19,6 +19,96 @@ pub struct RingPoly {
     q: u64,
 }
 
+/// Barrett reduction for modulus q.
+/// For a product a*b where a,b < q, computes (a*b) mod q without division.
+#[derive(Clone, Copy, Debug)]
+struct BarrettReducer {
+    q: u64,
+    q_128: u128,
+    /// μ = floor(2^(2*k) / q) where k = 64, stored as 128-bit
+    /// For 64-bit q, we use μ = floor(2^128 / q)
+    mu_lo: u64,
+    mu_hi: u64,
+}
+
+impl BarrettReducer {
+    /// Creates a new Barrett reducer for modulus q.
+    fn new(q: u64) -> Self {
+        // Compute μ = floor(2^128 / q)
+        // This is a 128-bit value, but we can compute it as:
+        // 2^128 / q = (2^128 - 1) / q + adjustment
+        //
+        // For simplicity, we compute this using 128-bit division once
+        // during precomputation (which is fast since it's only done once)
+        let q_128 = q as u128;
+
+        // μ = floor(2^128 / q)
+        // We can't represent 2^128 directly, so use: floor((2^128 - 1) / q) + 1 if exact
+        // Or approximate: we know 2^128 = q * floor(2^128/q) + (2^128 mod q)
+        // Let's compute floor(2^128 / q) = floor((2^64 * 2^64) / q)
+        //
+        // Using: 2^128 = (2^64)^2, and q fits in 64 bits
+        // floor(2^128 / q) = floor(2^64 * 2^64 / q)
+        //                  = floor(2^64 * (2^64 / q + (2^64 mod q)/q))
+        //                  = 2^64 * floor(2^64 / q) + floor(2^64 * ((2^64 mod q)/q))
+        //
+        // Simpler: compute directly using 128-bit arithmetic
+        // u128::MAX / q gives us floor((2^128 - 1) / q)
+        let mu = u128::MAX / q_128;
+        // This is slightly less than floor(2^128 / q), but close enough
+        // The difference is at most 1, which we handle with correction steps
+
+        Self {
+            q,
+            q_128,
+            mu_lo: mu as u64,
+            mu_hi: (mu >> 64) as u64,
+        }
+    }
+
+    /// Reduces a 128-bit value modulo q using Barrett reduction.
+    #[inline(always)]
+    fn reduce(&self, a: u128) -> u64 {
+        // Barrett reduction: q_hat = floor(a * μ / 2^128)
+        // Then r = a - q_hat * q, with corrections if needed
+
+        // For small a (< 2^64), use 64-bit modulo (single div instruction)
+        if a < (1u128 << 64) {
+            return (a as u64) % self.q;
+        }
+
+        // Compute floor(a * μ / 2^128)
+        // a * μ is up to 256 bits, we need the top 128 bits (shifted right by 128)
+        let a_lo = a as u64;
+        let a_hi = (a >> 64) as u64;
+
+        // μ = mu_hi * 2^64 + mu_lo
+        // a * μ = (a_hi * 2^64 + a_lo) * (mu_hi * 2^64 + mu_lo)
+        //       = a_hi * mu_hi * 2^128 + (a_hi * mu_lo + a_lo * mu_hi) * 2^64 + a_lo * mu_lo
+        //
+        // We need floor(a * μ / 2^128) = a_hi * mu_hi + floor((a_hi * mu_lo + a_lo * mu_hi + a_lo * mu_lo / 2^64) / 2^64)
+
+        let t0 = (a_lo as u128) * (self.mu_lo as u128); // 128 bits
+        let t1 = (a_lo as u128) * (self.mu_hi as u128); // 128 bits
+        let t2 = (a_hi as u128) * (self.mu_lo as u128); // 128 bits
+        let t3 = (a_hi as u128) * (self.mu_hi as u128); // 128 bits
+
+        // Sum the middle terms
+        let mid = t1 + t2 + (t0 >> 64);
+        let q_hat = t3 + (mid >> 64);
+
+        // r = a - q_hat * q
+        let r = a.wrapping_sub(q_hat.wrapping_mul(self.q_128));
+
+        // r should be in [0, 3q) typically, correct if needed
+        let mut r = r;
+        if r >= self.q_128 { r -= self.q_128; }
+        if r >= self.q_128 { r -= self.q_128; }
+        if r >= self.q_128 { r -= self.q_128; }
+        r as u64
+    }
+}
+
 impl RingPoly {
     /// Creates a new ring polynomial with given coefficients.
     ///
@@ -87,17 +177,19 @@ impl RingPoly {
         assert_eq!(self.q, other.q, "moduli must match");
         assert_eq!(self.coeffs.len(), other.coeffs.len(), "dimensions must match");
 
+        // For addition, a + b < 2q, so we just need a conditional subtract
+        let q = self.q;
         let coeffs: Vec<u64> = self
             .coeffs
             .iter()
             .zip(other.coeffs.iter())
             .map(|(&a, &b)| {
-                let sum = (a as u128) + (b as u128);
-                (sum % self.q as u128) as u64
+                let sum = a + b;
+                if sum >= q { sum - q } else { sum }
             })
             .collect();
 
-        Self { coeffs, q: self.q }
+        Self { coeffs, q }
     }
 
     /// Subtracts two polynomials coefficient-wise.
@@ -105,6 +197,11 @@ impl RingPoly {
         assert_eq!(self.q, other.q, "moduli must match");
         assert_eq!(self.coeffs.len(), other.coeffs.len(), "dimensions must match");
 
+        // Since a, b are already reduced to [0, q), we have:
+        // a - b in [-(q-1), q-1]
+        // If a >= b: result is a - b (already in [0, q))
+        // If a < b: result is q - (b - a) = q + a - b (in [1, q))
+        let q = self.q;
         let coeffs: Vec<u64> = self
             .coeffs
             .iter()
@@ -113,12 +210,12 @@ impl RingPoly {
                 if a >= b {
                     a - b
                 } else {
-                    self.q - (b - a) % self.q
+                    q - (b - a)
                 }
             })
             .collect();
 
-        Self { coeffs, q: self.q }
+        Self { coeffs, q }
     }
 
     /// Negates all coefficients.
@@ -135,10 +232,11 @@ impl RingPoly {
     /// Multiplies by a scalar.
     pub fn scalar_mul(&self, scalar: u64) -> Self {
         let s = scalar % self.q;
+        let reducer = BarrettReducer::new(self.q);
         let coeffs: Vec<u64> = self
             .coeffs
             .iter()
-            .map(|&c| ((c as u128 * s as u128) % self.q as u128) as u64)
+            .map(|&c| reducer.reduce((c as u128) * (s as u128)))
             .collect();
 
         Self { coeffs, q: self.q }
@@ -153,9 +251,10 @@ impl RingPoly {
         assert_eq!(self.coeffs.len(), other.coeffs.len(), "dimensions must match");
 
         let n = self.coeffs.len();
+        let q = self.q;
         let mut result = vec![0i128; n];
 
-        // Schoolbook multiplication
+        // Schoolbook multiplication - accumulate in i128
         for (i, &a) in self.coeffs.iter().enumerate() {
             for (j, &b) in other.coeffs.iter().enumerate() {
                 let prod = (a as i128) * (b as i128);
@@ -170,16 +269,23 @@ impl RingPoly {
             }
         }
 
-        // Reduce to [0, q)
+        // Reduce to [0, q) - use Barrett for positive, handle negative separately
+        let reducer = BarrettReducer::new(q);
         let coeffs: Vec<u64> = result
             .iter()
             .map(|&c| {
-                let c_mod = c.rem_euclid(self.q as i128);
-                c_mod as u64
+                if c >= 0 {
+                    reducer.reduce(c as u128)
+                } else {
+                    // For negative c: c mod q = q - ((-c) mod q) if c is not divisible by q
+                    let pos = (-c) as u128;
+                    let r = reducer.reduce(pos);
+                    if r == 0 { 0 } else { q - r }
+                }
             })
             .collect();
 
-        Self { coeffs, q: self.q }
+        Self { coeffs, q }
     }
 
     /// Multiplies two polynomials using NTT (faster for large n).
