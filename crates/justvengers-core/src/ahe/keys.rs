@@ -36,7 +36,7 @@ impl SecretKey {
 /// The public key is (a, b) where:
 /// - a is a uniformly random polynomial
 /// - b = -a·s + e for small error e
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PublicKey {
     /// Random polynomial a.
     a: RingPoly,

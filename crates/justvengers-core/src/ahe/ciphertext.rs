@@ -9,7 +9,7 @@ use rand::Rng;
 
 use super::keys::{PublicKey, SecretKey};
 use super::params::BgvParams;
-use super::ring::RingPoly;
+use super::ring::{BarrettReducer, RingPoly};
 use super::sample::{sample_ternary, DiscreteGaussian};
 
 /// A BGV ciphertext encrypting a message.
@@ -18,7 +18,7 @@ use super::sample::{sample_ternary, DiscreteGaussian};
 /// c0 + c1·s ≈ Δ·m (mod q)
 ///
 /// where Δ = ⌊q/t⌋ is the scaling factor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Ciphertext {
     /// First ciphertext component.
     c0: RingPoly,
@@ -217,6 +217,19 @@ impl Ciphertext {
         Self {
             c0: self.c0.scalar_mul(scalar),
             c1: self.c1.scalar_mul(scalar),
+            params: self.params,
+        }
+    }
+
+    /// Multiplies a ciphertext by a scalar using a precomputed Barrett reducer.
+    ///
+    /// This is faster when performing many scalar multiplications with the same modulus,
+    /// as the reducer computation (128-bit division) is done once and reused.
+    #[inline]
+    pub fn scalar_mul_with_reducer(&self, scalar: u64, reducer: &BarrettReducer) -> Self {
+        Self {
+            c0: self.c0.scalar_mul_with_reducer(scalar, reducer),
+            c1: self.c1.scalar_mul_with_reducer(scalar, reducer),
             params: self.params,
         }
     }

@@ -20,7 +20,7 @@ mod ciphertext;
 mod sample;
 
 pub use params::{BgvParams, ParamSet};
-pub use ring::RingPoly;
+pub use ring::{BarrettReducer, RingPoly};
 pub use keys::{SecretKey, PublicKey, KeyPair};
 pub use ciphertext::Ciphertext;
 pub use sample::DiscreteGaussian;

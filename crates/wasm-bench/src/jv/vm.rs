@@ -6,15 +6,23 @@
 //! - 97 multiplications per circuit
 //! - State soldering across repetitions
 //! - Random active branch per repetition
+//!
+//! Uses IT-PAC polynomial commitment and pre-setup prover pattern
+//! for efficient benchmarking.
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
 #[cfg(target_arch = "wasm32")]
 use mpz_justvengers::{
-    Circuit, CircuitBatch, ProverState, SolderingConstraint, VerifierState, VerifierMessage,
+    Circuit, CircuitBatch, SolderingConstraint,
     topology::TopologyVector,
     soldering::SolderingChallengeMessage,
+    // JustVengers O(R+B+C) optimized prover with IT-PAC
+    JVProver, JVVerifier, JVSetupMessage, GoldilocksItMac,
+    extract_verifier_shares_from_pool,
+    // Re-exported from justvengers-core
+    VolePool, GlobalKey,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -36,14 +44,21 @@ const STATE_SIZE: usize = 32;
 #[cfg(target_arch = "wasm32")]
 const NUM_INPUTS: usize = STATE_SIZE * 2 + 1;
 
+/// Recorded verifier messages for JV protocol replay with IT-PAC.
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone)]
-struct RecordedVerifierMessages {
-    eval_points: Vec<u64>,
+struct JVRecordedMessages {
+    /// Full setup message including encrypted powers for IT-PAC
+    setup_msg: JVSetupMessage,
+    /// Global key for VOLE generation
+    global_key: GlobalKey<GoldilocksItMac>,
+    /// Circuit size for VOLE pool generation
+    circuit_size: usize,
     chi: u64,
     topology_vectors: Vec<TopologyVector>,
     soldering_challenge: Option<SolderingChallengeMessage>,
     rho: u64,
+    gamma: u64,
 }
 
 /// Creates a VM circuit for a specific opcode.
@@ -143,94 +158,134 @@ fn generate_vm_inputs_per_rep(num_repetitions: usize) -> (Vec<Vec<u64>>, Vec<usi
     (inputs, active_branches, final_acc)
 }
 
+/// Records JV verifier messages for replay benchmarking with IT-PAC.
 #[cfg(target_arch = "wasm32")]
-fn record_verifier_messages_per_rep<const R: usize>(
+fn jv_record_verifier_messages<const R: usize>(
     circuits: &CircuitBatch,
     active_branches: &[usize],
     inputs_per_rep: &[Vec<u64>],
     soldering_constraints: &[SolderingConstraint],
-) -> RecordedVerifierMessages {
-    let mut rng = Prg::new();
+) -> JVRecordedMessages {
+    let mut rng = Prg::from_seed(Block::ZERO);
 
-    let mut prover: ProverState<R> = ProverState::new_per_rep(active_branches.to_vec(), MODULUS);
-    prover.setup_per_rep(circuits, inputs_per_rep).unwrap();
+    // Use JVProver with IT-PAC
+    let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    prover.setup(circuits, inputs_per_rep).unwrap();
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
-    let mut verifier: VerifierState<R> = VerifierState::new(MODULUS, &mut rng);
+    let mut verifier = JVVerifier::<R>::new(MODULUS, &mut rng);
     let setup_msg = verifier.setup(circuits, &mut rng).unwrap();
     verifier.setup_soldering(soldering_constraints.to_vec()).unwrap();
 
-    let eval_points = setup_msg.eval_points.clone();
     let topology_vectors = verifier.topology_vectors().to_vec();
 
-    let commitment = prover.commit(&setup_msg.eval_points).unwrap();
+    // Create VOLE pool for IT-PAC commitments
+    let circuit_size = circuits.get(0).map(|c| c.num_wires()).unwrap_or(10);
+    let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
+
+    // Extract verifier shares before passing pool to prover
+    let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
+    verifier.set_verifier_local_keys(verifier_shares);
+
+    // P → V: CommitmentMessage (IT-PAC ciphertexts)
+    let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
     let soldering_commit = prover.commit_soldering().unwrap();
 
-    let chi_msg = verifier.receive_commitment(commitment).unwrap();
-    let chi = match chi_msg {
-        VerifierMessage::ChallengeChi(c) => c,
-        _ => panic!("expected chi"),
-    };
+    // V → P: ChallengeChi
+    let chi = verifier.receive_commitment(commitment).unwrap();
 
+    // V → P: SolderingChallengeMessage (optional)
     let soldering_challenge = if let Some(commit) = soldering_commit {
         verifier.receive_soldering_commit(commit, &mut rng).unwrap()
     } else {
         None
     };
 
+    // P → V: DisclosureMessage
     let disclosure = prover.disclose(chi, verifier.topology_vectors()).unwrap();
 
+    // P → V: AggregatedSolderingReveal (optional)
     if let Some(ref challenge) = soldering_challenge {
-        let _ = prover.reveal_soldering(challenge).unwrap();
+        let reveal = prover.reveal_soldering_aggregated(challenge).unwrap();
+        if let Some(ref rev) = reveal {
+            verifier.receive_soldering_reveal_aggregated(rev).unwrap();
+        }
     }
 
-    let rho_msg = verifier.receive_disclosure(disclosure, &mut rng).unwrap();
-    let rho = match rho_msg {
-        VerifierMessage::ChallengeRho(r) => r,
-        _ => panic!("expected rho"),
-    };
+    // V → P: ChallengeRho
+    let rho = verifier.receive_disclosure(disclosure, &mut rng).unwrap();
 
+    // P → V: OpenMessage
     let open_msg = prover.open(rho, verifier.topology_vectors()).unwrap();
     verifier.receive_open(open_msg).unwrap();
 
-    let lpzk_proof = prover.prove_multiplications().unwrap();
-    let result = verifier.verify_multiplications(lpzk_proof).unwrap();
-    assert!(result, "Protocol verification failed during recording");
+    // P → V: IT-PAC Opening
+    let itpac_open_msg = prover.open_itpac().unwrap();
+    assert!(verifier.verify_itpac_opening(&itpac_open_msg), "IT-PAC verification failed");
 
-    RecordedVerifierMessages {
-        eval_points,
+    // P → V: AggregatedLpzkProofMessage
+    let gamma = verifier.generate_lpzk_challenge(&mut rng);
+    let lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
+    let result = verifier.verify_multiplications_aggregated(lpzk_proof, gamma).unwrap();
+    assert!(result, "JV Protocol verification failed during recording");
+
+    JVRecordedMessages {
+        setup_msg,
+        global_key: verifier.global_key().clone(),
+        circuit_size,
         chi,
         topology_vectors,
         soldering_challenge,
         rho,
+        gamma,
     }
 }
 
+/// Pre-setup prover for efficient cloning during benchmark.
 #[cfg(target_arch = "wasm32")]
-fn run_prover_with_replay_per_rep<const R: usize>(
-    circuits: &CircuitBatch,
-    active_branches: &[usize],
-    inputs_per_rep: &[Vec<u64>],
-    soldering_constraints: &[SolderingConstraint],
-    recorded: &RecordedVerifierMessages,
-) {
-    let mut rng = Prg::new();
+struct PreSetupProver<const R: usize> {
+    prover: JVProver<R>,
+}
 
-    let mut prover: ProverState<R> = ProverState::new_per_rep(active_branches.to_vec(), MODULUS);
-    prover.setup_per_rep(circuits, inputs_per_rep).unwrap();
-    prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
-
-    let _commitment = prover.commit(&recorded.eval_points).unwrap();
-    let _soldering_commit = prover.commit_soldering().unwrap();
-
-    let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
-
-    if let Some(ref challenge) = recorded.soldering_challenge {
-        let _ = prover.reveal_soldering(challenge).unwrap();
+#[cfg(target_arch = "wasm32")]
+impl<const R: usize> PreSetupProver<R> {
+    fn new(
+        circuits: &CircuitBatch,
+        active_branches: &[usize],
+        inputs_per_rep: &[Vec<u64>],
+        soldering_constraints: &[SolderingConstraint],
+    ) -> Self {
+        let mut rng = Prg::from_seed(Block::ZERO);
+        let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+        prover.setup(circuits, inputs_per_rep).unwrap();
+        prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
+        Self { prover }
     }
 
-    let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
-    let _lpzk_proof = prover.prove_multiplications().unwrap();
+    fn run_iteration(&self, recorded: &JVRecordedMessages) {
+        let mut rng = Prg::from_seed(Block::ZERO);
+        let mut prover = self.prover.clone();
+
+        // Create VOLE pool for IT-PAC commitments
+        let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
+
+        // P → V: CommitmentMessage (IT-PAC ciphertexts)
+        let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
+        let _soldering_commit = prover.commit_soldering().unwrap();
+
+        let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
+
+        if let Some(ref challenge) = recorded.soldering_challenge {
+            let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
+        }
+
+        let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
+
+        // IT-PAC opening
+        let _itpac_open_msg = prover.open_itpac().unwrap();
+
+        let _lpzk_proof = prover.prove_multiplications_aggregated(recorded.gamma).unwrap();
+    }
 }
 
 /// Benchmark VM-style JV prover with per-rep active branches.
@@ -294,13 +349,16 @@ fn run_vm_bench(n: u32, reps: usize) -> Result<BenchResult, String> {
             const R: usize = $r;
             let (inputs, branches, final_acc) = generate_vm_inputs_per_rep(R);
 
-            // Record phase (not timed)
-            let recorded = record_verifier_messages_per_rep::<R>(
+            // Record verifier messages (not timed)
+            let recorded = jv_record_verifier_messages::<R>(
                 &circuits,
                 &branches,
                 &inputs,
                 &soldering,
             );
+
+            // Pre-setup prover once (setup is not part of benchmark)
+            let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
 
             web_sys::console::log_1(
                 &format!(
@@ -315,13 +373,8 @@ fn run_vm_bench(n: u32, reps: usize) -> Result<BenchResult, String> {
             for i in 0..n {
                 let start = performance.now();
 
-                run_prover_with_replay_per_rep::<R>(
-                    &circuits,
-                    &branches,
-                    &inputs,
-                    &soldering,
-                    &recorded,
-                );
+                // Clone pre-setup prover and run iteration
+                pre_setup.run_iteration(&recorded);
 
                 total_elapsed_ms += performance.now() - start;
 

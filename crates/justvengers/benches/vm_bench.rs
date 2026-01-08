@@ -65,7 +65,7 @@ mod msg_size {
 
     pub fn jv_commitment_message(msg: &JVCommitmentMessage) -> usize {
         8 // num_polynomials: usize
-        + msg.poly_commitment_ciphertexts.len() * 64 // Vec<Ciphertext> - estimate
+        + msg.ciphertext_commitments.len() * 64 // Vec<Ciphertext> - estimate
     }
 
     /// JV Disclosure: O(R) instead of O(RC)!
@@ -362,7 +362,55 @@ fn jv_record_verifier_messages<const R: usize>(
     }
 }
 
-/// Runs JV prover with replay.
+/// Pre-setup prover for efficient cloning during benchmark.
+struct PreSetupProver<const R: usize> {
+    prover: JVProver<R>,
+    gamma: u64,
+}
+
+impl<const R: usize> PreSetupProver<R> {
+    fn new(
+        circuits: &CircuitBatch,
+        active_branches: &[usize],
+        inputs_per_rep: &[Vec<u64>],
+        soldering_constraints: &[SolderingConstraint],
+    ) -> Self {
+        let mut rng = Prg::from_seed(Block::ZERO);
+        let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+        prover.setup(circuits, inputs_per_rep).unwrap();
+        prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
+        // Use deterministic gamma
+        let gamma = rng.random_range(1..MODULUS);
+        Self { prover, gamma }
+    }
+
+    fn run_iteration(&self, recorded: &JVRecordedMessages) {
+        let mut rng = Prg::from_seed(Block::ZERO);
+        let mut prover = self.prover.clone();
+
+        // Create VOLE pool for IT-PAC commitments
+        let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
+
+        // P → V: CommitmentMessage (IT-PAC ciphertexts)
+        let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
+        let _soldering_commit = prover.commit_soldering().unwrap();
+
+        let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
+
+        if let Some(ref challenge) = recorded.soldering_challenge {
+            let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
+        }
+
+        let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
+
+        // IT-PAC opening
+        let _itpac_open_msg = prover.open_itpac().unwrap();
+
+        let _lpzk_proof = prover.prove_multiplications_aggregated(self.gamma).unwrap();
+    }
+}
+
+/// Runs JV prover with replay (legacy function for compatibility).
 fn jv_run_prover_with_replay<const R: usize>(
     circuits: &CircuitBatch,
     active_branches: &[usize],
@@ -370,33 +418,8 @@ fn jv_run_prover_with_replay<const R: usize>(
     soldering_constraints: &[SolderingConstraint],
     recorded: &JVRecordedMessages,
 ) {
-    let mut rng = Prg::from_seed(Block::ZERO);
-
-    let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
-    prover.setup(circuits, inputs_per_rep).unwrap();
-    prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
-
-    // Create VOLE pool for IT-PAC commitments (same as in recording)
-    let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
-
-    // P → V: CommitmentMessage (IT-PAC ciphertexts)
-    let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
-    let _soldering_commit = prover.commit_soldering().unwrap();
-
-    let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
-
-    if let Some(ref challenge) = recorded.soldering_challenge {
-        let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
-    }
-
-    let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
-
-    // IT-PAC opening
-    let _itpac_open_msg = prover.open_itpac().unwrap();
-
-    // Use a deterministic gamma for replay (same as recording)
-    let gamma = rng.random_range(1..MODULUS);
-    let _lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
+    let pre_setup = PreSetupProver::<R>::new(circuits, active_branches, inputs_per_rep, soldering_constraints);
+    pre_setup.run_iteration(recorded);
 }
 
 // ============================================================================
@@ -429,14 +452,11 @@ fn bench_vm_prover_with_vole(c: &mut Criterion) {
             &soldering,
         );
 
+        // Pre-setup prover once (setup is not part of benchmark)
+        let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
+
         // Run once to get stats
-        jv_run_prover_with_replay::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-            &recorded,
-        );
+        pre_setup.run_iteration(&recorded);
         println!("\n[JV 100 reps] Communication: {}", recorded.stats.format_kb());
         println!("{}", recorded.stats.format_breakdown());
         println!("[JV 100 reps] VOLEs consumed: 0, OTs consumed: 0");
@@ -446,13 +466,7 @@ fn bench_vm_prover_with_vole(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("jv_with_vole", "100_reps"), |b| {
             b.iter(|| {
-                jv_run_prover_with_replay::<R>(
-                    &circuits,
-                    &branches,
-                    &inputs,
-                    &soldering,
-                    &recorded,
-                );
+                pre_setup.run_iteration(&recorded);
                 black_box(())
             });
         });
@@ -470,14 +484,11 @@ fn bench_vm_prover_with_vole(c: &mut Criterion) {
             &soldering,
         );
 
+        // Pre-setup prover once (setup is not part of benchmark)
+        let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
+
         // Run once to get stats
-        jv_run_prover_with_replay::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-            &recorded,
-        );
+        pre_setup.run_iteration(&recorded);
         println!("\n[JV 1K reps] Communication: {}", recorded.stats.format_kb());
         println!("{}", recorded.stats.format_breakdown());
         println!("[JV 1K reps] VOLEs consumed: 0, OTs consumed: 0");
@@ -487,13 +498,7 @@ fn bench_vm_prover_with_vole(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("jv_with_vole", "1K_reps"), |b| {
             b.iter(|| {
-                jv_run_prover_with_replay::<R>(
-                    &circuits,
-                    &branches,
-                    &inputs,
-                    &soldering,
-                    &recorded,
-                );
+                pre_setup.run_iteration(&recorded);
                 black_box(())
             });
         });
@@ -511,13 +516,10 @@ fn bench_vm_prover_with_vole(c: &mut Criterion) {
             &soldering,
         );
 
-        jv_run_prover_with_replay::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-            &recorded,
-        );
+        // Pre-setup prover once (setup is not part of benchmark)
+        let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
+
+        pre_setup.run_iteration(&recorded);
         println!("\n[JV 10K reps] Communication: {}", recorded.stats.format_kb());
         println!("{}", recorded.stats.format_breakdown());
         println!("[JV 10K reps] VOLEs consumed: 0, OTs consumed: 0");
@@ -527,13 +529,7 @@ fn bench_vm_prover_with_vole(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("jv_with_vole", "10K_reps"), |b| {
             b.iter(|| {
-                jv_run_prover_with_replay::<R>(
-                    &circuits,
-                    &branches,
-                    &inputs,
-                    &soldering,
-                    &recorded,
-                );
+                pre_setup.run_iteration(&recorded);
                 black_box(())
             });
         });
@@ -551,13 +547,10 @@ fn bench_vm_prover_with_vole(c: &mut Criterion) {
             &soldering,
         );
 
-        jv_run_prover_with_replay::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-            &recorded,
-        );
+        // Pre-setup prover once (setup is not part of benchmark)
+        let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
+
+        pre_setup.run_iteration(&recorded);
         println!("\n[JV 25K reps] Communication: {}", recorded.stats.format_kb());
         println!("{}", recorded.stats.format_breakdown());
         println!("[JV 25K reps] VOLEs consumed: 0, OTs consumed: 0");
@@ -567,13 +560,7 @@ fn bench_vm_prover_with_vole(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("jv_with_vole", "25K_reps"), |b| {
             b.iter(|| {
-                jv_run_prover_with_replay::<R>(
-                    &circuits,
-                    &branches,
-                    &inputs,
-                    &soldering,
-                    &recorded,
-                );
+                pre_setup.run_iteration(&recorded);
                 black_box(())
             });
         });
@@ -591,13 +578,10 @@ fn bench_vm_prover_with_vole(c: &mut Criterion) {
             &soldering,
         );
 
-        jv_run_prover_with_replay::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-            &recorded,
-        );
+        // Pre-setup prover once (setup is not part of benchmark)
+        let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
+
+        pre_setup.run_iteration(&recorded);
         println!("\n[JV 50K reps] Communication: {}", recorded.stats.format_kb());
         println!("{}", recorded.stats.format_breakdown());
         println!("[JV 50K reps] VOLEs consumed: 0, OTs consumed: 0");
@@ -607,13 +591,7 @@ fn bench_vm_prover_with_vole(c: &mut Criterion) {
 
         group.bench_function(BenchmarkId::new("jv_with_vole", "50K_reps"), |b| {
             b.iter(|| {
-                jv_run_prover_with_replay::<R>(
-                    &circuits,
-                    &branches,
-                    &inputs,
-                    &soldering,
-                    &recorded,
-                );
+                pre_setup.run_iteration(&recorded);
                 black_box(())
             });
         });

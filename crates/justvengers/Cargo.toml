@@ -49,3 +49,15 @@ harness = false
 [[bin]]
 name = "prover_profile"
 path = "src/bin/prover_profile.rs"
+
+[[bin]]
+name = "vm_profile"
+path = "src/bin/vm_profile.rs"
+
+[[bin]]
+name = "verifier_setup"
+path = "src/bin/verifier_setup.rs"
+
+[[bin]]
+name = "prover_bench"
+path = "src/bin/prover_bench.rs"

@@ -85,6 +85,7 @@ pub use verifier::{
     VerifierState,
 };
 pub use vole::{VoleProvider, VoleProviderError, VoleStats};
+pub use mpz_justvengers_core::{VolePool, GlobalKey};
 pub use protocol::{run_prover, run_prover_with_vole, run_verifier, run_protocol as run_protocol_async, ProtocolError as AsyncProtocolError};
 pub use jv_optimized::{
     JVProver, JVVerifier, JVProverPhase, JVVerifierPhase,

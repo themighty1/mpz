@@ -3,7 +3,7 @@
 //! Parameters determine security level, noise budget, and performance.
 
 /// BGV encryption parameters.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BgvParams {
     /// Ring dimension (must be power of 2).
     /// The ring is R = Z[X]/(X^n + 1).

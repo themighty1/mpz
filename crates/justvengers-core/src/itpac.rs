@@ -25,13 +25,13 @@
 
 use rand::Rng;
 
-use crate::ahe::{BgvParams, Ciphertext, KeyPair, PublicKey, SecretKey};
+use crate::ahe::{BarrettReducer, BgvParams, Ciphertext, KeyPair, PublicKey, SecretKey};
 use crate::itmac::{GlobalKey, ItMac, ItMacField, VolePool};
 
 /// Encrypted powers of Λ sent by verifier.
 ///
 /// These ciphertexts allow P to homomorphically evaluate polynomials at Λ.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct EncryptedPowers {
     /// ⟦Λ^i⟧ for i = 1, ..., max_degree
     powers: Vec<Ciphertext>,
@@ -111,16 +111,20 @@ impl EncryptedPowers {
             return None;
         }
 
+        // Pre-compute Barrett reducer once for all scalar multiplications.
+        // This avoids recomputing the expensive 128-bit division for each call.
+        let reducer = BarrettReducer::new(self.params.q);
+
         // Start with c₀ (as a constant added to the encrypted evaluation)
         // and accumulate c₁⟦Λ⟧ + c₂⟦Λ²⟧ + ...
 
         // Initialize accumulator with c₁⟦Λ⟧
-        let mut result = self.powers[0].scalar_mul(coeffs[1] % t);
+        let mut result = self.powers[0].scalar_mul_with_reducer(coeffs[1] % t, &reducer);
 
         // Add remaining terms c₂⟦Λ²⟧ + ...
         for (i, &coeff) in coeffs.iter().enumerate().skip(2) {
             if coeff != 0 {
-                let term = self.powers[i - 1].scalar_mul(coeff % t);
+                let term = self.powers[i - 1].scalar_mul_with_reducer(coeff % t, &reducer);
                 result = result + term;
             }
         }
@@ -383,6 +387,14 @@ impl<F: ItMacField> ItPacGenerator<F> {
     pub fn remaining(&self) -> usize {
         self.vole_pool.remaining()
     }
+
+    /// Returns a mutable reference to the VOLE pool.
+    ///
+    /// This allows direct access to the pool for additional IT-MAC operations,
+    /// such as committing to input polynomial coefficients (paper Step 9).
+    pub fn vole_pool_mut(&mut self) -> &mut VolePool<F> {
+        &mut self.vole_pool
+    }
 }
 
 /// Batch of IT-PAC commitments.
@@ -420,6 +432,7 @@ impl<F: ItMacField> ItPacBatch<F> {
     }
 
     /// Computes linear combination: [Σ cᵢ·fᵢ(·)].
+    #[cfg(test)]
     pub fn linear_combination(&self, coeffs: &[u64], modulus: u64) -> Option<ItPac<F>> {
         if coeffs.len() != self.pacs.len() || self.pacs.is_empty() {
             return None;

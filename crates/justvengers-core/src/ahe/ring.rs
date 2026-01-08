@@ -11,7 +11,7 @@ use super::params::BgvParams;
 ///
 /// Coefficients are stored in coefficient form, with index i corresponding
 /// to the coefficient of X^i.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RingPoly {
     /// Coefficients in Z_q, length exactly n.
     coeffs: Vec<u64>,
@@ -24,7 +24,7 @@ pub struct RingPoly {
 /// Barrett reduction for modulus q.
 /// For a product a*b where a,b < q, computes (a*b) mod q without division.
 #[derive(Clone, Copy, Debug)]
-struct BarrettReducer {
+pub struct BarrettReducer {
     q: u64,
     q_128: u128,
     /// μ = floor(2^(2*k) / q) where k = 64, stored as 128-bit
@@ -35,7 +35,7 @@ struct BarrettReducer {
 
 impl BarrettReducer {
     /// Creates a new Barrett reducer for modulus q.
-    fn new(q: u64) -> Self {
+    pub fn new(q: u64) -> Self {
         // Compute μ = floor(2^128 / q)
         // This is a 128-bit value, but we can compute it as:
         // 2^128 / q = (2^128 - 1) / q + adjustment
@@ -70,7 +70,7 @@ impl BarrettReducer {
 
     /// Reduces a 128-bit value modulo q using Barrett reduction.
     #[inline(always)]
-    fn reduce(&self, a: u128) -> u64 {
+    pub fn reduce(&self, a: u128) -> u64 {
         // Barrett reduction: q_hat = floor(a * μ / 2^128)
         // Then r = a - q_hat * q, with corrections if needed
 
@@ -247,6 +247,16 @@ impl RingPoly {
     pub fn scalar_mul(&self, scalar: u64) -> Self {
         let s = scalar % self.q;
         let reducer = BarrettReducer::new(self.q);
+        self.scalar_mul_with_reducer(s, &reducer)
+    }
+
+    /// Multiplies by a scalar using a precomputed Barrett reducer.
+    ///
+    /// This is faster when performing many scalar multiplications with the same modulus,
+    /// as the reducer computation (which involves a 128-bit division) is done once.
+    #[inline]
+    pub fn scalar_mul_with_reducer(&self, scalar: u64, reducer: &BarrettReducer) -> Self {
+        let s = scalar % self.q;
         let coeffs: Vec<u64> = self
             .coeffs
             .iter()

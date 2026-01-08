@@ -31,7 +31,8 @@ pub trait ItMacField:
 /// Global key held by the verifier.
 ///
 /// This is the secret Δ used in all IT-MAC computations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "F: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct GlobalKey<F: ItMacField> {
     delta: F,
 }
