@@ -1,9 +1,9 @@
 //! VM-style benchmark for Justvengers prover with per-rep active branches.
 //!
 //! Simulates a simple VM with:
-//! - 30 opcodes (branches)
-//! - 32-element state vectors
-//! - 97 multiplications per circuit
+//! - 60 opcodes (branches)
+//! - 16-element state vectors
+//! - ~49 multiplications per circuit
 //! - State soldering across repetitions
 //!
 //! Run with: cargo bench -p mpz-justvengers --bench vm_bench
@@ -25,8 +25,8 @@ use mpz_fields::goldilocks::GOLDILOCKS;
 use rand::{Rng, SeedableRng};
 
 const MODULUS: u64 = GOLDILOCKS;
-const NUM_BRANCHES: usize = 30;
-const STATE_SIZE: usize = 32;
+const NUM_BRANCHES: usize = 60;
+const STATE_SIZE: usize = 16;
 const NUM_INPUTS: usize = STATE_SIZE * 2 + 1; // old_state + new_state + op
 
 // Message size computation helpers
@@ -75,8 +75,11 @@ mod msg_size {
     }
 
     pub fn jv_open_message(msg: &JVOpenMessage) -> usize {
-        msg.active_branches.len() // Vec<u8> - 1 byte each
-        + 8 // hash_proof: u64
+        // MK polynomial proofs for branch hiding
+        msg.mk_polynomials.len() * 8 * 16 // Estimate: each polynomial ~16 coefficients
+        + 8 * 4 // mk_binary_proof fields
+        + 8 * 4 // mk_sum_proof fields
+        + 8 * 4 // mk_hash_proof fields
     }
 
     pub fn aggregated_lpzk_proof_message(msg: &AggregatedLpzkProofMessage) -> usize {
@@ -87,8 +90,8 @@ mod msg_size {
 
 /// Creates a VM circuit for a specific opcode.
 ///
-/// Inputs: old_state[32] + new_state[32] + op = 65 inputs
-/// Mults: ~65 constraint checks + 32 identity mults = 97 total
+/// Inputs: old_state[16] + new_state[16] + op = 33 inputs
+/// Mults: ~33 constraint checks + 16 identity mults = ~49 total
 fn create_vm_circuit(op_value: u64) -> Circuit {
     let mut circuit = Circuit::new();
 
@@ -202,6 +205,7 @@ struct JVRecordedMessages {
     topology_vectors: Vec<TopologyVector>,
     soldering_challenge: Option<SolderingChallengeMessage>,
     rho: u64,
+    gamma: u64,
     /// Protocol communication stats.
     stats: JVProtocolStats,
 }
@@ -284,6 +288,9 @@ fn jv_record_verifier_messages<const R: usize>(
     stats.prover_sent += commit_size;
     stats.commitment = commit_size;
 
+    // P → V: MK polynomial commitments (for ZK branch hiding)
+    let _mk_commitment = prover.commit_mk_polynomials(&setup_msg).unwrap();
+
     // P → V: SolderingCommitMessage (optional)
     let soldering_commit = prover.commit_soldering().unwrap();
     if let Some(ref commit) = soldering_commit {
@@ -328,20 +335,24 @@ fn jv_record_verifier_messages<const R: usize>(
     let rho = verifier.receive_disclosure(disclosure, &mut rng).unwrap();
     stats.prover_received += msg_size::challenge_u64();
 
+    // V → P: ChallengeGamma (for MK polynomial proofs)
+    let gamma = verifier.generate_lpzk_challenge(&mut rng);
+    stats.prover_received += msg_size::challenge_u64();
+
     // P → V: OpenMessage
-    let open_msg = prover.open(rho, verifier.topology_vectors()).unwrap();
+    let open_msg = prover.open(rho, gamma, verifier.topology_vectors()).unwrap();
     let open_size = msg_size::jv_open_message(&open_msg);
     stats.prover_sent += open_size;
     stats.open = open_size;
 
-    verifier.receive_open(open_msg).unwrap();
+    verifier.receive_open(open_msg, gamma).unwrap();
 
     // P → V: IT-PAC Opening (polynomials + MAC tags)
     let itpac_open_msg = prover.open_itpac().unwrap();
     assert!(verifier.verify_itpac_opening(&itpac_open_msg), "IT-PAC verification failed");
 
     // P → V: AggregatedLpzkProofMessage - O(R) instead of O(M×R)!
-    let gamma = verifier.generate_lpzk_challenge(&mut rng);
+    // gamma already generated above before open()
     let lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
     let lpzk_size = msg_size::aggregated_lpzk_proof_message(&lpzk_proof);
     stats.prover_sent += lpzk_size;
@@ -358,6 +369,7 @@ fn jv_record_verifier_messages<const R: usize>(
         topology_vectors,
         soldering_challenge,
         rho,
+        gamma,
         stats,
     }
 }
@@ -365,7 +377,6 @@ fn jv_record_verifier_messages<const R: usize>(
 /// Pre-setup prover for efficient cloning during benchmark.
 struct PreSetupProver<const R: usize> {
     prover: JVProver<R>,
-    gamma: u64,
 }
 
 impl<const R: usize> PreSetupProver<R> {
@@ -379,9 +390,7 @@ impl<const R: usize> PreSetupProver<R> {
         let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
         prover.setup(circuits, inputs_per_rep).unwrap();
         prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
-        // Use deterministic gamma
-        let gamma = rng.random_range(1..MODULUS);
-        Self { prover, gamma }
+        Self { prover }
     }
 
     fn run_iteration(&self, recorded: &JVRecordedMessages) {
@@ -393,6 +402,8 @@ impl<const R: usize> PreSetupProver<R> {
 
         // P → V: CommitmentMessage (IT-PAC ciphertexts)
         let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
+        // P → V: MK polynomial commitments (for ZK branch hiding)
+        let _mk_commitment = prover.commit_mk_polynomials(&recorded.setup_msg).unwrap();
         let _soldering_commit = prover.commit_soldering().unwrap();
 
         let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
@@ -401,12 +412,12 @@ impl<const R: usize> PreSetupProver<R> {
             let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
         }
 
-        let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
+        let _open_msg = prover.open(recorded.rho, recorded.gamma, &recorded.topology_vectors).unwrap();
 
         // IT-PAC opening
         let _itpac_open_msg = prover.open_itpac().unwrap();
 
-        let _lpzk_proof = prover.prove_multiplications_aggregated(self.gamma).unwrap();
+        let _lpzk_proof = prover.prove_multiplications_aggregated(recorded.gamma).unwrap();
     }
 }
 

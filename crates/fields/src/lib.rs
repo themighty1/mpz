@@ -6,6 +6,7 @@
 
 pub mod gf2_128;
 pub mod goldilocks;
+#[cfg(feature = "mersenne")]
 pub mod m61;
 pub mod p256;
 

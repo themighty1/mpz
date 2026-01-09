@@ -1,6 +1,6 @@
 //! VM-like profiling binary for the JustVengers prover.
 //!
-//! Simulates a simple VM with 30 opcodes and 32-element state vectors.
+//! Simulates a simple VM with 60 opcodes and 16-element state vectors.
 //! Uses JVProver (the O(R+B+C) optimized protocol) to match the benchmark.
 //!
 //! Usage:
@@ -26,8 +26,8 @@ use mpz_justvengers_core::{GlobalKey, VolePool};
 use rand::{Rng, SeedableRng};
 
 const MODULUS: u64 = GOLDILOCKS;
-const NUM_BRANCHES: usize = 30;
-const STATE_SIZE: usize = 32;
+const NUM_BRANCHES: usize = 60;
+const STATE_SIZE: usize = 16;
 const NUM_INPUTS: usize = STATE_SIZE * 2 + 1;
 
 #[derive(Clone)]
@@ -175,11 +175,10 @@ fn record_verifier_messages<const R: usize>(
     }
 
     let rho = verifier.receive_disclosure(disclosure, &mut rng).unwrap();
-
-    let open_msg = prover.open(rho, verifier.topology_vectors()).unwrap();
-    verifier.receive_open(open_msg).unwrap();
-
     let gamma = verifier.generate_lpzk_challenge(&mut rng);
+
+    let open_msg = prover.open(rho, gamma, verifier.topology_vectors()).unwrap();
+    verifier.receive_open(open_msg, gamma).unwrap();
     let lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
     let result = verifier.verify_multiplications_aggregated(lpzk_proof, gamma).unwrap();
     assert!(result, "Protocol verification failed during recording");
@@ -221,7 +220,7 @@ fn run_prover_with_replay<const R: usize>(
         let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
     }
 
-    let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
+    let _open_msg = prover.open(recorded.rho, recorded.gamma, &recorded.topology_vectors).unwrap();
 
     // IT-PAC opening
     let _itpac_open_msg = prover.open_itpac().unwrap();
@@ -269,7 +268,7 @@ fn run_protocol_only<const R: usize>(
             let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
         }
 
-        let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
+        let _open_msg = prover.open(recorded.rho, recorded.gamma, &recorded.topology_vectors).unwrap();
 
         // IT-PAC opening
         let _itpac_open_msg = prover.open_itpac().unwrap();
@@ -332,7 +331,7 @@ fn run_prover_with_timing<const R: usize>(
     let t_solder_reveal = t6.elapsed();
 
     let t7 = Instant::now();
-    let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
+    let _open_msg = prover.open(recorded.rho, recorded.gamma, &recorded.topology_vectors).unwrap();
     let t_open = t7.elapsed();
 
     let t8 = Instant::now();

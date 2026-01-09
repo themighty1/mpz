@@ -26,8 +26,8 @@ use rand::{Rng, SeedableRng};
 use serde::{Serialize, Deserialize};
 
 const MODULUS: u64 = GOLDILOCKS;
-const NUM_BRANCHES: usize = 30;
-const STATE_SIZE: usize = 32;
+const NUM_BRANCHES: usize = 60;
+const STATE_SIZE: usize = 16;
 const NUM_INPUTS: usize = STATE_SIZE * 2 + 1;
 
 #[derive(Serialize, Deserialize)]
@@ -165,7 +165,7 @@ fn run_prover_only<const R: usize>(
             let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
         }
 
-        let _open_msg = prover.open(msgs.rho, &msgs.topology_vectors).unwrap();
+        let _open_msg = prover.open(msgs.rho, msgs.gamma, &msgs.topology_vectors).unwrap();
         let _itpac_open_msg = prover.open_itpac().unwrap();
         let _lpzk_proof = prover.prove_multiplications_aggregated(msgs.gamma).unwrap();
 

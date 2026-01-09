@@ -3,7 +3,7 @@
 //! Runs only the prover hot path (replay) without recording overhead.
 //!
 //! Usage:
-//!   BRANCHES=5 MULTS=5 REPS=100 ITERS=1000 cargo run --release --bin prover_profile
+//!   BRANCHES=60 MULTS=50 REPS=100 ITERS=1000 cargo run --release --bin prover_profile
 //!
 //! Then profile with:
 //!   samply record target/release/prover_profile
@@ -209,11 +209,11 @@ fn main() {
     let num_branches: usize = env::var("BRANCHES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
+        .unwrap_or(60);
     let num_mults: usize = env::var("MULTS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
+        .unwrap_or(50);
     let reps: usize = env::var("REPS")
         .ok()
         .and_then(|s| s.parse().ok())

@@ -61,7 +61,10 @@ pub mod soldering;
 pub mod topology;
 pub mod verifier;
 pub mod vole;
-pub mod jv_optimized;
+pub mod jv;
+
+#[cfg(test)]
+mod jv_tests;
 
 /// KZG polynomial commitment module (requires `kzg` feature).
 #[cfg(feature = "kzg")]
@@ -87,13 +90,16 @@ pub use verifier::{
 pub use vole::{VoleProvider, VoleProviderError, VoleStats};
 pub use mpz_justvengers_core::{VolePool, GlobalKey};
 pub use protocol::{run_prover, run_prover_with_vole, run_verifier, run_protocol as run_protocol_async, ProtocolError as AsyncProtocolError};
-pub use jv_optimized::{
+pub use jv::{
     JVProver, JVVerifier, JVProverPhase, JVVerifierPhase,
     JVSetupMessage, JVCommitmentMessage, JVDisclosureMessage, JVOpenMessage,
     JVLpzkProofMessage, AggregatedLpzkProofMessage, ItPacOpenMessage,
     JVProverError, JVVerifierError, JVProtocolError,
     run_jv_protocol, estimate_communication, CommunicationEstimate,
     extract_verifier_shares_from_pool, GoldilocksItMac,
+    // MK polynomial types for zero-knowledge branch hiding
+    MKCommitmentMessage, MKCiphertextOpenMessage, MKBinaryProofMessage,
+    MKSumProofMessage, MKHashProofMessage,
 };
 
 /// Protocol parameters for Justvengers.

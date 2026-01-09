@@ -8,9 +8,9 @@
 //! This results in O(RC) communication where R is repetitions and C is circuit size.
 //!
 //! For the optimized O(R+B+C) JustVengers protocol that uses polynomial encoding
-//! via IT-PAC, see the `jv_optimized` module. The key difference:
+//! via IT-PAC, see the `jv` module. The key difference:
 //! - Batchman (this module): sends R×C individual masked values
-//! - JustVengers (jv_optimized): encodes R values per wire as polynomial, sends O(C)
+//! - JustVengers (jv): encodes R values per wire as polynomial, sends O(C)
 //!   polynomial commitments + O(R) vanishing polynomial coefficients
 //!
 //! We keep both implementations as they have different trade-offs:

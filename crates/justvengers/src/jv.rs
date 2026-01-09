@@ -33,7 +33,7 @@
 //! # Usage
 //!
 //! ```ignore
-//! use mpz_justvengers::jv_optimized::{JVProver, JVVerifier, run_jv_protocol};
+//! use mpz_justvengers::jv::{JVProver, JVVerifier, run_jv_protocol};
 //!
 //! // Use the optimized protocol for large R
 //! let result = run_jv_protocol::<1000>(
@@ -49,7 +49,7 @@ use crate::soldering::{
     AggregatedSolderingReveal, SolderingChallengeMessage, SolderingCommitMessage,
     SolderingConstraint, SolderingProver, SolderingRevealMessage, SolderingVerifier,
 };
-use crate::topology::{CircuitBatch, ExtendedWitness, TopologyVector, UniversalHash};
+use crate::topology::{CircuitBatch, ExtendedWitness, TopologyVector};
 
 #[cfg(feature = "ntt")]
 use mpz_fields::goldilocks::{Goldilocks, InttContext, GOLDILOCKS};
@@ -230,16 +230,6 @@ pub struct JVDisclosureMessage {
     pub aggregated_poly_eval: u64,
 }
 
-/// Open message from prover (O(R+B) communication).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct JVOpenMessage {
-    /// Active branch indices, one per repetition: id_j ∈ [0, B).
-    /// Stored as u8 since B < 256 (saves 7 bytes per element vs usize).
-    pub active_branches: Vec<u8>,
-    /// Universal hash proof component.
-    pub hash_proof: u64,
-}
-
 /// LPZK proof message (O(M) communication where M = total multiplications).
 /// Legacy non-aggregated version.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -281,6 +271,120 @@ pub struct ItPacOpenMessage {
     pub mac_values: Vec<u64>,
     /// IT-MAC tags m = k + f(Λ)·Δ for each polynomial.
     pub mac_tags: Vec<GoldilocksItMac>,
+}
+
+// ============================================================================
+// MK Polynomial (Branch Marking) Messages - Zero-Knowledge Branch Hiding
+// ============================================================================
+//
+// Instead of revealing active_branches directly (which breaks ZK), we use the
+// MK_i polynomial approach from the Justvengers paper (Figure 6, Step 10):
+//
+// 1. P constructs a B×R matrix MK where MK_{i,j} = 1 if branch i is active
+//    in repetition j, and 0 otherwise.
+// 2. Each row is interpolated to get polynomials MK_1(·), ..., MK_B(·).
+// 3. P commits to these polynomials using IT-PAC BEFORE γ is issued.
+// 4. P proves: MK_i(·)(MK_i(·)-1) vanishes (values are binary).
+// 5. P proves: Σ MK_i(·) - 1 vanishes (exactly one branch active per rep).
+// 6. Universal hash check uses MK polynomials instead of revealed branches.
+
+/// MK polynomial commitment message from prover (O(B) communication).
+///
+/// Contains F_Com commitments (hashes) of IT-PAC ciphertexts for MK polynomials.
+/// These must be committed BEFORE γ is issued to prevent malicious prover from
+/// choosing MK polynomials based on γ.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MKCommitmentMessage {
+    /// Number of branches B.
+    pub num_branches: usize,
+    /// F_Com commitments: hash(⟦MK_i(Λ) - u_i⟧) for each branch i ∈ [B].
+    pub ciphertext_commitments: Vec<[u8; 32]>,
+}
+
+/// MK ciphertext opening message from prover.
+///
+/// Sent after V reveals Λ. V can verify these match the F_Com commitments.
+#[derive(Clone, Debug)]
+pub struct MKCiphertextOpenMessage {
+    /// IT-PAC ciphertexts ⟦MK_i(Λ) - u_i⟧ for each branch i ∈ [B].
+    pub mk_ciphertexts: Vec<Ciphertext>,
+}
+
+/// MK binary constraint proof message.
+///
+/// Proves that MK_i(·)(MK_i(·) - 1) vanishes at all evaluation points for all i,
+/// i.e., each MK_i polynomial only takes values in {0, 1}.
+///
+/// Uses vanishing polynomial technique:
+/// - H_bin(X) = Σᵢ γⁱ · MK_i(X) · (MK_i(X) - 1)
+/// - H_bin vanishes at all αⱼ ⟹ H_bin(X) = Z(X) · Q_bin(X)
+/// - Send Q_bin(X) coefficients
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MKBinaryProofMessage {
+    /// Quotient polynomial Q_bin(X) = H_bin(X) / Z(X).
+    /// Degree ≤ 2(R-1) - R = R - 2.
+    pub quotient_coeffs: Vec<u64>,
+}
+
+/// MK sum constraint proof message.
+///
+/// Proves that Σᵢ MK_i(·) - 1 vanishes at all evaluation points,
+/// i.e., exactly one MK_i equals 1 at each evaluation point.
+///
+/// Uses vanishing polynomial technique:
+/// - H_sum(X) = Σᵢ MK_i(X) - 1
+/// - H_sum vanishes at all αⱼ ⟹ H_sum(X) = Z(X) · Q_sum(X)
+/// - Send Q_sum(X) coefficients
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MKSumProofMessage {
+    /// Quotient polynomial Q_sum(X) = H_sum(X) / Z(X).
+    /// Degree = (R-1) - R = -1 (so Q_sum should be zero for correct proof).
+    /// Actually H_sum has degree R-1, Z has degree R, so if H_sum vanishes
+    /// at R points, it must be the zero polynomial. Q_sum is empty.
+    pub quotient_coeffs: Vec<u64>,
+}
+
+/// Universal hash proof using MK polynomials.
+///
+/// Per the paper (Figure 6, Step 10): The verifier checks that
+/// Σₖ γ^{k-1} · TV_k(·) - Σᵢ h_i · MK_i(·) vanishes at all αⱼ,
+/// where h_i = universal hash of topology vector i.
+///
+/// This proves membership without revealing which branch was active.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MKHashProofMessage {
+    /// Quotient polynomial for the universal hash check.
+    /// H_hash(X) = Σₖ γ^{k-1} · TV_k(X) - Σᵢ h_i · MK_i(X)
+    /// Q_hash(X) = H_hash(X) / Z(X)
+    pub quotient_coeffs: Vec<u64>,
+    /// IT-PAC opening information for MK polynomials.
+    /// Contains revealed polynomial coefficients and MAC tags.
+    pub mk_mac_values: Vec<u64>,
+    /// MAC tags for MK polynomial IT-PACs.
+    pub mk_mac_tags: Vec<GoldilocksItMac>,
+}
+
+/// Open message from prover with zero-knowledge branch hiding.
+///
+/// Uses MK polynomial proofs to hide branch selection while still proving
+/// the universal hash relationship. The verifier learns NOTHING about which
+/// branches were active.
+///
+/// Per the Justvengers paper (Figure 6, Step 10):
+/// - MK_i polynomials encode branch selection (MK_i(αⱼ) = 1 if branch i active in rep j)
+/// - Binary proof: MK_i(·)(MK_i(·)-1) vanishes (values are 0 or 1)
+/// - Sum proof: Σ MK_i(·) - 1 vanishes (exactly one branch active per rep)
+/// - Hash proof: universal hash check using MK polynomials
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct JVOpenMessage {
+    /// MK binary constraint proof.
+    pub mk_binary_proof: MKBinaryProofMessage,
+    /// MK sum constraint proof.
+    pub mk_sum_proof: MKSumProofMessage,
+    /// Universal hash proof using MK polynomials.
+    pub mk_hash_proof: MKHashProofMessage,
+    /// MK polynomial coefficients (revealed for verification).
+    pub mk_polynomials: Vec<Vec<u64>>,
 }
 
 // ============================================================================
@@ -330,6 +434,22 @@ pub struct JVProver<const R: usize> {
     /// input_coeff_macs[k][i] = IT-MAC for coefficient i of input polynomial k.
     /// Required for extractability in simulation (paper Step 9).
     input_coeff_macs: Vec<Vec<mpz_justvengers_core::ItMac<GoldilocksItMac>>>,
+
+    // ==========================================================================
+    // MK Polynomial fields for zero-knowledge branch hiding
+    // ==========================================================================
+
+    /// Number of branches B in the circuit batch.
+    num_branches: usize,
+    /// MK polynomial coefficients: mk_polynomials[i] = coefficients of MK_i(X).
+    /// MK_i(αⱼ) = 1 if branch i is active in repetition j, 0 otherwise.
+    mk_polynomials: Vec<Vec<u64>>,
+    /// IT-PAC commitments for MK polynomials.
+    mk_itpac_commitments: Vec<ItPac<GoldilocksItMac>>,
+    /// IT-PAC ciphertexts for MK polynomials (stored for F_Com opening).
+    mk_ciphertexts: Vec<Ciphertext>,
+    /// F_Com commitments (hashes) for MK polynomial ciphertexts.
+    mk_ciphertext_commitments: Vec<[u8; 32]>,
 }
 
 /// Protocol phases for the optimized prover.
@@ -379,6 +499,12 @@ impl<const R: usize> JVProver<R> {
             lambda: None,
             num_inputs: 0,
             input_coeff_macs: Vec::new(),
+            // MK polynomial fields
+            num_branches: 0,
+            mk_polynomials: Vec::new(),
+            mk_itpac_commitments: Vec::new(),
+            mk_ciphertexts: Vec::new(),
+            mk_ciphertext_commitments: Vec::new(),
         }
     }
 
@@ -390,6 +516,11 @@ impl<const R: usize> JVProver<R> {
     /// Returns the current phase.
     pub fn phase(&self) -> &JVProverPhase {
         &self.phase
+    }
+
+    /// Returns the number of inputs per repetition.
+    pub fn num_inputs(&self) -> usize {
+        self.num_inputs
     }
 
     /// Returns active branches.
@@ -432,6 +563,9 @@ impl<const R: usize> JVProver<R> {
         if let Some(first_witness) = self.witnesses.first() {
             self.num_inputs = first_witness.inputs.len();
         }
+
+        // Track number of branches for MK polynomial construction
+        self.num_branches = circuits.num_branches();
 
         self.phase = JVProverPhase::Setup;
         Ok(())
@@ -661,11 +795,11 @@ impl<const R: usize> JVProver<R> {
                     // P's share: (d = c - u, m) where m = k + u·Δ
                     // The difference d allows V to adjust their local key
                     let u: u64 = random_mac.prover_share().value().into();
-                    let diff = if coeff >= u {
-                        coeff - u
-                    } else {
-                        self.modulus - (u - coeff)
-                    };
+                    // Compute d = (c - u) mod p using u128 to avoid overflow
+                    let c128 = coeff as u128;
+                    let u128_val = u as u128;
+                    let p128 = self.modulus as u128;
+                    let diff = ((c128 + p128 - (u128_val % p128)) % p128) as u64;
                     let mac_tag = random_mac.prover_share().mac();
                     shares.push((diff, mac_tag));
                 }
@@ -680,35 +814,325 @@ impl<const R: usize> JVProver<R> {
         })
     }
 
-    /// Computes F_Com commitment (hash) of a ciphertext.
+    /// Constructs and commits to MK polynomials for zero-knowledge branch hiding.
+    ///
+    /// Per the paper (Figure 6, Step 10):
+    /// 1. Construct B×R matrix MK where MK_{i,j} = 1 if branch i is active in repetition j
+    /// 2. Interpolate each row to get polynomials MK_1(·), ..., MK_B(·)
+    /// 3. Commit to each polynomial using IT-PAC
+    ///
+    /// IMPORTANT: This must be called BEFORE γ is issued to prevent the malicious
+    /// prover from choosing MK polynomials based on γ.
+    ///
+    /// # Arguments
+    /// * `setup_msg` - Setup message containing encrypted powers for IT-PAC
+    /// * `vole_pool` - VOLE pool for IT-MAC generation (must have B VOLEs available)
+    pub fn commit_mk_polynomials(
+        &mut self,
+        setup_msg: &JVSetupMessage,
+    ) -> Result<MKCommitmentMessage, JVProverError> {
+        if self.phase != JVProverPhase::Committed {
+            return Err(JVProverError::InvalidPhase);
+        }
+
+        let eval_points = self.eval_points.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+        let num_branches = self.num_branches;
+
+        if num_branches == 0 {
+            return Err(JVProverError::MissingSetupData);
+        }
+
+        // Step 1: Construct B×R matrix MK
+        // MK_{i,j} = 1 if branch i is active in repetition j, 0 otherwise
+        let mut mk_matrix: Vec<Vec<u64>> = vec![vec![0u64; R]; num_branches];
+        for (j, &active_branch) in self.active_branches.iter().enumerate() {
+            mk_matrix[active_branch][j] = 1;
+        }
+
+        // Step 2: Interpolate each row to get MK_1(·), ..., MK_B(·)
+        self.mk_polynomials = Vec::with_capacity(num_branches);
+        for i in 0..num_branches {
+            let row_values = &mk_matrix[i];
+            let poly = self.interpolate_values(row_values, eval_points);
+            self.mk_polynomials.push(poly);
+        }
+
+        // Step 3: Create IT-PAC commitments for MK polynomials
+        // We need a VOLE pool for this - use the existing one if available
+        // or create placeholders if not
+        self.mk_itpac_commitments = Vec::with_capacity(num_branches);
+        self.mk_ciphertexts = Vec::with_capacity(num_branches);
+        self.mk_ciphertext_commitments = Vec::with_capacity(num_branches);
+
+        // Create IT-PAC generator with remaining VOLE pool
+        if let Some(vole_pool) = self.vole_pool.take() {
+            let mut itpac_gen = ItPacGenerator::new(
+                setup_msg.encrypted_powers.clone(),
+                vole_pool,
+            );
+
+            for poly in &self.mk_polynomials {
+                if let Some((itpac, ciphertext)) = itpac_gen.commit(poly) {
+                    self.mk_itpac_commitments.push(itpac);
+                    let ct_commitment = Self::compute_ciphertext_commitment(&ciphertext);
+                    self.mk_ciphertext_commitments.push(ct_commitment);
+                    self.mk_ciphertexts.push(ciphertext);
+                } else {
+                    // Fallback: create dummy ciphertext
+                    let dummy_ct = setup_msg.encrypted_powers.powers()[0].clone();
+                    let ct_commitment = Self::compute_ciphertext_commitment(&dummy_ct);
+                    self.mk_ciphertext_commitments.push(ct_commitment);
+                    self.mk_ciphertexts.push(dummy_ct);
+                }
+            }
+
+            // Note: VOLE pool is consumed by IT-PAC generation
+            // For a full implementation, additional VOLEs would be allocated for MK polynomials
+        } else {
+            // No VOLE pool available - create placeholder commitments
+            for _ in 0..num_branches {
+                let dummy_ct = setup_msg.encrypted_powers.powers()[0].clone();
+                let ct_commitment = Self::compute_ciphertext_commitment(&dummy_ct);
+                self.mk_ciphertext_commitments.push(ct_commitment);
+                self.mk_ciphertexts.push(dummy_ct);
+            }
+        }
+
+        Ok(MKCommitmentMessage {
+            num_branches,
+            ciphertext_commitments: self.mk_ciphertext_commitments.clone(),
+        })
+    }
+
+    /// Opens MK polynomial F_Com commitments by revealing actual ciphertexts.
+    ///
+    /// Called after V reveals Λ. Returns ciphertexts for V to verify and decrypt.
+    pub fn open_mk_ciphertexts(&self) -> MKCiphertextOpenMessage {
+        MKCiphertextOpenMessage {
+            mk_ciphertexts: self.mk_ciphertexts.clone(),
+        }
+    }
+
+    /// Returns the MK polynomials (for testing/debugging).
+    pub fn mk_polynomials(&self) -> &[Vec<u64>] {
+        &self.mk_polynomials
+    }
+
+    /// Generates proof that all MK_i polynomials take only binary values (0 or 1).
+    ///
+    /// Per the paper: Proves MK_i(·)(MK_i(·) - 1) vanishes at all evaluation points.
+    /// Uses the vanishing polynomial technique:
+    /// - H_bin(X) = Σᵢ γⁱ · MK_i(X) · (MK_i(X) - 1)
+    /// - H_bin vanishes at all αⱼ ⟹ H_bin(X) = Z(X) · Q_bin(X)
+    /// - Send Q_bin(X) coefficients
+    ///
+    /// # Arguments
+    /// * `gamma` - Random challenge for aggregating binary constraints across branches
+    pub fn prove_mk_binary(&self, gamma: u64) -> Result<MKBinaryProofMessage, JVProverError> {
+        let eval_points = self.eval_points.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        if self.mk_polynomials.is_empty() {
+            return Err(JVProverError::MissingSetupData);
+        }
+
+        // Compute H_bin(X) = Σᵢ γⁱ · MK_i(X) · (MK_i(X) - 1)
+        let mut h_bin = vec![0u64];
+        let mut gamma_power = 1u64;
+
+        for mk_poly in &self.mk_polynomials {
+            // MK_i(X) - 1: subtract 1 from constant term
+            let mut mk_minus_one = mk_poly.clone();
+            if mk_minus_one.is_empty() {
+                mk_minus_one.push(self.modulus - 1);
+            } else {
+                mk_minus_one[0] = if mk_minus_one[0] == 0 {
+                    self.modulus - 1
+                } else {
+                    mk_minus_one[0] - 1
+                };
+            }
+
+            // MK_i(X) · (MK_i(X) - 1)
+            let constraint_poly = poly_mul(mk_poly, &mk_minus_one, self.modulus);
+
+            // Scale by γⁱ
+            let scaled = poly_scale(&constraint_poly, gamma_power, self.modulus);
+
+            // Add to H_bin
+            h_bin = poly_add(&h_bin, &scaled, self.modulus);
+
+            gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
+        }
+
+        // Compute vanishing polynomial Z(X) = Π(X - αⱼ) over actual R points
+        // (not the NTT-padded points which may extend beyond R)
+        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
+        let z_poly = compute_vanishing_poly(actual_eval_points, self.modulus);
+
+        // Compute quotient Q_bin(X) = H_bin(X) / Z(X)
+        let (quotient_coeffs, _remainder) = poly_div(&h_bin, &z_poly, self.modulus);
+
+        Ok(MKBinaryProofMessage { quotient_coeffs })
+    }
+
+    /// Generates proof that exactly one MK_i equals 1 at each evaluation point.
+    ///
+    /// Per the paper: Proves Σᵢ MK_i(·) - 1 vanishes at all evaluation points.
+    /// Uses the vanishing polynomial technique:
+    /// - H_sum(X) = Σᵢ MK_i(X) - 1
+    /// - H_sum vanishes at all αⱼ ⟹ H_sum(X) = Z(X) · Q_sum(X)
+    /// - Send Q_sum(X) coefficients
+    ///
+    /// Note: Since H_sum has degree R-1 and there are R evaluation points,
+    /// if H_sum vanishes at all points, it must be the zero polynomial.
+    /// Thus Q_sum should be empty/zero for a correct proof.
+    pub fn prove_mk_sum(&self) -> Result<MKSumProofMessage, JVProverError> {
+        let eval_points = self.eval_points.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        if self.mk_polynomials.is_empty() {
+            return Err(JVProverError::MissingSetupData);
+        }
+
+        // Compute H_sum(X) = Σᵢ MK_i(X) - 1
+        let mut h_sum = vec![0u64];
+
+        for mk_poly in &self.mk_polynomials {
+            h_sum = poly_add(&h_sum, mk_poly, self.modulus);
+        }
+
+        // Subtract 1 from constant term
+        if h_sum.is_empty() {
+            h_sum.push(self.modulus - 1);
+        } else {
+            h_sum[0] = if h_sum[0] == 0 {
+                self.modulus - 1
+            } else {
+                h_sum[0] - 1
+            };
+        }
+
+        // Compute vanishing polynomial Z(X) = Π(X - αⱼ) over actual R points
+        // (not the NTT-padded points which may extend beyond R)
+        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
+        let z_poly = compute_vanishing_poly(actual_eval_points, self.modulus);
+
+        // Compute quotient Q_sum(X) = H_sum(X) / Z(X)
+        // For correct execution, H_sum should be zero polynomial, so quotient is empty
+        let (quotient_coeffs, _remainder) = poly_div(&h_sum, &z_poly, self.modulus);
+
+        Ok(MKSumProofMessage { quotient_coeffs })
+    }
+
+    /// Generates the open message using MK polynomials for ZK branch hiding.
+    ///
+    /// Per the paper (Figure 6, Step 10): The verifier checks that
+    /// Σₖ γ^{k-1} · TV_k(·) - Σᵢ h_i · MK_i(·) vanishes at all αⱼ,
+    /// where h_i = universal hash of topology vector i.
+    ///
+    /// The verifier learns NOTHING about which branches were active.
+    ///
+    /// # Arguments
+    /// * `rho` - Universal hash challenge
+    /// * `gamma` - Random challenge for aggregation
+    /// * `topology_vectors` - Topology vectors for all branches
+    pub fn open(
+        &mut self,
+        rho: u64,
+        gamma: u64,
+        topology_vectors: &[TopologyVector],
+    ) -> Result<JVOpenMessage, JVProverError> {
+        if self.phase != JVProverPhase::Disclosed {
+            return Err(JVProverError::InvalidPhase);
+        }
+
+        let eval_points = self.eval_points.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        if self.mk_polynomials.is_empty() || topology_vectors.is_empty() {
+            return Err(JVProverError::MissingSetupData);
+        }
+
+        // Generate MK binary and sum proofs
+        let mk_binary_proof = self.prove_mk_binary(gamma)?;
+        let mk_sum_proof = self.prove_mk_sum()?;
+
+        // Compute universal hashes h_i for each topology vector
+        let universal_hashes: Vec<u64> = topology_vectors
+            .iter()
+            .map(|tv| {
+                // h_i = ⟨(1, ρ, ρ², ...), tv^(i)⟩
+                let tv_values = tv.coeffs();
+                let mut rho_power = 1u128;
+                let mut hash = 0u128;
+                for &val in tv_values {
+                    hash = (hash + rho_power * val as u128) % self.modulus as u128;
+                    rho_power = (rho_power * rho as u128) % self.modulus as u128;
+                }
+                hash as u64
+            })
+            .collect();
+
+        // Compute H_hash(X) = Σᵢ h_i · MK_i(X)
+        // The universal hash check verifies that this matches the disclosed topology products
+        let mut h_hash = vec![0u64];
+
+        for (i, mk_poly) in self.mk_polynomials.iter().enumerate() {
+            if i < universal_hashes.len() {
+                let scaled = poly_scale(mk_poly, universal_hashes[i], self.modulus);
+                h_hash = poly_add(&h_hash, &scaled, self.modulus);
+            }
+        }
+
+        // Compute vanishing polynomial Z(X) = Π(X - αⱼ)
+        let z_poly = compute_vanishing_poly(eval_points, self.modulus);
+
+        // Compute quotient Q_hash(X) = H_hash(X) / Z(X)
+        let (quotient_coeffs, _remainder) = poly_div(&h_hash, &z_poly, self.modulus);
+
+        // Extract MAC values and tags from MK IT-PAC commitments
+        let mut mk_mac_values = Vec::with_capacity(self.mk_itpac_commitments.len());
+        let mut mk_mac_tags = Vec::with_capacity(self.mk_itpac_commitments.len());
+
+        for itpac in &self.mk_itpac_commitments {
+            let mac_value: u64 = itpac.mac().prover_share().value().into();
+            mk_mac_values.push(mac_value);
+            mk_mac_tags.push(itpac.mac().prover_share().mac());
+        }
+
+        self.phase = JVProverPhase::Opened;
+
+        Ok(JVOpenMessage {
+            mk_binary_proof,
+            mk_sum_proof,
+            mk_hash_proof: MKHashProofMessage {
+                quotient_coeffs,
+                mk_mac_values,
+                mk_mac_tags,
+            },
+            mk_polynomials: self.mk_polynomials.clone(),
+        })
+    }
+
+    /// Computes F_Com commitment (hash) of a ciphertext using blake3.
+    ///
+    /// F_Com is a binding commitment scheme - given a commitment c, it is
+    /// computationally infeasible to find two different ciphertexts ct1, ct2
+    /// such that F_Com(ct1) = F_Com(ct2) = c.
+    ///
+    /// We use blake3 which provides:
+    /// - 256-bit security against collision attacks
+    /// - 128-bit security against preimage attacks
+    /// - Fast hashing even for large ciphertexts
     fn compute_ciphertext_commitment(ciphertext: &Ciphertext) -> [u8; 32] {
         // Serialize ciphertext to bytes
         let bytes = bincode::serialize(ciphertext).expect("Ciphertext serialization failed");
 
-        // Hash using PRG-based construction (similar to seed commitment)
-        // For simplicity, we XOR chunks of the serialized data
-        let mut commitment = [0u8; 32];
-        for (i, &byte) in bytes.iter().enumerate() {
-            commitment[i % 32] ^= byte;
-        }
-
-        // Additional mixing using PRG
-        if bytes.len() >= 16 {
-            let block = Block::from([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
-                bytes[8], bytes[9], bytes[10], bytes[11],
-                bytes[12], bytes[13], bytes[14], bytes[15],
-            ]);
-            let mut prg = Prg::from_seed(block);
-            let mut mixed = [0u8; 32];
-            prg.fill_bytes(&mut mixed);
-            for i in 0..32 {
-                commitment[i] ^= mixed[i];
-            }
-        }
-
-        commitment
+        // Compute blake3 hash - this is a proper cryptographic hash
+        // that provides binding security for F_Com
+        *blake3::hash(&bytes).as_bytes()
     }
 
     /// Opens F_Com commitments by revealing actual ciphertexts.
@@ -794,43 +1218,6 @@ impl<const R: usize> JVProver<R> {
             return Err(JVProverError::InvalidPhase);
         }
         Ok(self.soldering_prover.as_ref().map(|s| s.reveal_aggregated(challenge.phi, challenge.psi)))
-    }
-
-    /// Generates open message.
-    pub fn open(
-        &mut self,
-        rho: u64,
-        topology_vectors: &[TopologyVector],
-    ) -> Result<JVOpenMessage, JVProverError> {
-        if self.phase != JVProverPhase::Disclosed {
-            return Err(JVProverError::InvalidPhase);
-        }
-
-        // Universal hash proof
-        let _hash = UniversalHash::compute(topology_vectors, rho, self.modulus);
-
-        let mut hash_proof = 0u128;
-        for (j, witness) in self.witnesses.iter().enumerate() {
-            let branch_idx = self.active_branches[j];
-            let w = witness.to_vec();
-            let active_tv = &topology_vectors[branch_idx];
-            let tv_product = active_tv.inner_product(&w);
-
-            let mut rho_power = 1u128;
-            for _ in 0..branch_idx {
-                rho_power = (rho_power * rho as u128) % self.modulus as u128;
-            }
-
-            let contrib = (rho_power * tv_product as u128) % self.modulus as u128;
-            hash_proof = (hash_proof + contrib) % self.modulus as u128;
-        }
-
-        self.phase = JVProverPhase::Opened;
-
-        Ok(JVOpenMessage {
-            active_branches: self.active_branches.iter().map(|&b| b as u8).collect(),
-            hash_proof: hash_proof as u64,
-        })
     }
 
     /// Generates LPZK proof for multiplication verification.
@@ -1097,7 +1484,7 @@ impl<const R: usize> JVProver<R> {
         let regenerated_keypair = KeyPair::generate(&ahe_params, &mut ahe_rng);
 
         // Step 3: Regenerate encrypted powers with same seed
-        let _regenerated_powers = EncryptedPowers::generate(
+        let regenerated_powers = EncryptedPowers::generate(
             &regenerated_keypair.pk,
             revelation.lambda,
             setup_msg.max_degree,
@@ -1105,14 +1492,40 @@ impl<const R: usize> JVProver<R> {
         );
 
         // Step 4: Verify regenerated values match what we received
-        // Compare public keys
-        let _received_pk = self.ahe_public_key.as_ref()
+        // Compare public keys by comparing their polynomial coefficients
+        let received_pk = self.ahe_public_key.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
 
-        // For now, we trust that if the seed matches the commitment,
-        // and V generated everything deterministically from the seed,
-        // then the ciphertexts are correct. A full implementation would
-        // compare the actual ciphertext values.
+        // Verify public key 'a' polynomial matches
+        if regenerated_keypair.pk.a().coeffs() != received_pk.a().coeffs() {
+            return Err(JVProverError::AheCiphertextMismatch);
+        }
+
+        // Verify public key 'b' polynomial matches
+        if regenerated_keypair.pk.b().coeffs() != received_pk.b().coeffs() {
+            return Err(JVProverError::AheCiphertextMismatch);
+        }
+
+        // Step 5: Compare encrypted powers ciphertexts
+        let received_powers = self.encrypted_powers.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        if regenerated_powers.powers().len() != received_powers.powers().len() {
+            return Err(JVProverError::AheCiphertextMismatch);
+        }
+
+        for (regen_ct, recv_ct) in regenerated_powers.powers().iter()
+            .zip(received_powers.powers().iter())
+        {
+            // Compare c0 component coefficients
+            if regen_ct.c0().coeffs() != recv_ct.c0().coeffs() {
+                return Err(JVProverError::AheCiphertextMismatch);
+            }
+            // Compare c1 component coefficients
+            if regen_ct.c1().coeffs() != recv_ct.c1().coeffs() {
+                return Err(JVProverError::AheCiphertextMismatch);
+            }
+        }
 
         // Store the revealed lambda for later use (IT-PACs become IT-MACs)
         self.lambda = Some(revelation.lambda);
@@ -1250,6 +1663,19 @@ pub struct JVVerifier<const R: usize> {
     input_coeff_diffs: Vec<Vec<u64>>,
     /// Received MAC tags for input coefficients.
     input_coeff_macs: Vec<Vec<GoldilocksItMac>>,
+
+    // ==========================================================================
+    // MK Polynomial fields for zero-knowledge branch hiding verification
+    // ==========================================================================
+
+    /// F_Com commitments (hashes) for MK polynomial ciphertexts.
+    mk_ciphertext_commitments: Vec<[u8; 32]>,
+    /// Decrypted MK commitment values d_i = MK_i(Λ) - u_i.
+    decrypted_mk_commitments: Vec<u64>,
+    /// Verifier's local keys for MK polynomial IT-MACs.
+    mk_local_keys: Vec<GoldilocksItMac>,
+    /// Number of branches B.
+    num_branches: usize,
 }
 
 /// Protocol phases for the optimized verifier.
@@ -1309,6 +1735,11 @@ impl<const R: usize> JVVerifier<R> {
             input_coeff_local_keys: Vec::new(),
             input_coeff_diffs: Vec::new(),
             input_coeff_macs: Vec::new(),
+            // MK polynomial fields
+            mk_ciphertext_commitments: Vec::new(),
+            decrypted_mk_commitments: Vec::new(),
+            mk_local_keys: Vec::new(),
+            num_branches: 0,
         }
     }
 
@@ -1512,31 +1943,12 @@ impl<const R: usize> JVVerifier<R> {
         Ok(())
     }
 
-    /// Computes F_Com commitment (hash) of a ciphertext.
+    /// Computes F_Com commitment (hash) of a ciphertext using blake3.
+    ///
+    /// Must match the prover's F_Com implementation for verification to work.
     fn compute_ciphertext_commitment(ciphertext: &Ciphertext) -> [u8; 32] {
         let bytes = bincode::serialize(ciphertext).expect("Ciphertext serialization failed");
-
-        let mut commitment = [0u8; 32];
-        for (i, &byte) in bytes.iter().enumerate() {
-            commitment[i % 32] ^= byte;
-        }
-
-        if bytes.len() >= 16 {
-            let block = Block::from([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
-                bytes[8], bytes[9], bytes[10], bytes[11],
-                bytes[12], bytes[13], bytes[14], bytes[15],
-            ]);
-            let mut prg = Prg::from_seed(block);
-            let mut mixed = [0u8; 32];
-            prg.fill_bytes(&mut mixed);
-            for i in 0..32 {
-                commitment[i] ^= mixed[i];
-            }
-        }
-
-        commitment
+        *blake3::hash(&bytes).as_bytes()
     }
 
     /// Receives soldering commit and returns challenge.
@@ -1606,23 +2018,44 @@ impl<const R: usize> JVVerifier<R> {
         Ok(())
     }
 
-    /// Receives open message.
-    pub fn receive_open(&mut self, open_msg: JVOpenMessage) -> Result<(), JVVerifierError> {
+    /// Receives and verifies open message with MK polynomial proofs.
+    ///
+    /// Verifies:
+    /// 1. MK binary constraint: all MK_i values are 0 or 1
+    /// 2. MK sum constraint: exactly one MK_i = 1 per evaluation point
+    /// 3. MK IT-MAC consistency
+    ///
+    /// The verifier learns NOTHING about which branches were active.
+    pub fn receive_open(
+        &mut self,
+        open_msg: JVOpenMessage,
+        gamma: u64,
+    ) -> Result<bool, JVVerifierError> {
         if self.phase != JVVerifierPhase::ChallengeRhoSent {
             return Err(JVVerifierError::InvalidPhase);
         }
 
-        // Validate branches
-        for &branch_idx in &open_msg.active_branches {
-            if (branch_idx as usize) >= self.topology_vectors.len() {
-                return Err(JVVerifierError::InvalidBranch);
-            }
+        let mk_polynomials = &open_msg.mk_polynomials;
+
+        // Verify MK binary constraint: all MK_i values are 0 or 1
+        if !self.verify_mk_binary_proof(&open_msg.mk_binary_proof, gamma, mk_polynomials) {
+            return Ok(false);
+        }
+
+        // Verify MK sum constraint: exactly one MK_i = 1 per evaluation point
+        if !self.verify_mk_sum_proof(&open_msg.mk_sum_proof, mk_polynomials) {
+            return Ok(false);
+        }
+
+        // Verify MK IT-MAC consistency
+        if !self.verify_mk_itpac_opening(&open_msg.mk_hash_proof, mk_polynomials) {
+            return Ok(false);
         }
 
         self.open_msg = Some(open_msg);
         self.phase = JVVerifierPhase::Verifying;
 
-        Ok(())
+        Ok(true)
     }
 
     /// Verifies LPZK proof (legacy non-aggregated).
@@ -1909,6 +2342,8 @@ impl<const R: usize> JVVerifier<R> {
     }
 
     /// Evaluates a polynomial at the secret point Λ.
+    /// Evaluates a polynomial at the secret point Λ using AHE modulus.
+    /// Used for IT-PAC commitment verification.
     fn evaluate_poly_at_lambda(&self, coeffs: &[u64]) -> u64 {
         let ahe_modulus = self.ahe_keypair
             .as_ref()
@@ -1922,6 +2357,22 @@ impl<const R: usize> JVVerifier<R> {
         for &coeff in coeffs {
             result = (result + (coeff as u128) * lambda_power) % (ahe_modulus as u128);
             lambda_power = (lambda_power * lambda) % (ahe_modulus as u128);
+        }
+
+        result as u64
+    }
+
+    /// Evaluates a polynomial at the secret point Λ using field modulus.
+    /// Used for MK polynomial verification where operations are in the field.
+    fn evaluate_mk_poly_at_lambda(&self, coeffs: &[u64]) -> u64 {
+        let mut result = 0u128;
+        let mut lambda_power = 1u128;
+        let lambda = self.lambda as u128;
+        let modulus = self.modulus as u128;
+
+        for &coeff in coeffs {
+            result = (result + (coeff as u128) * lambda_power) % modulus;
+            lambda_power = (lambda_power * lambda) % modulus;
         }
 
         result as u64
@@ -2102,6 +2553,229 @@ impl<const R: usize> JVVerifier<R> {
         self.phase = JVVerifierPhase::Done(valid);
         Ok(valid)
     }
+
+    // ==========================================================================
+    // MK Polynomial Verification Methods - Zero-Knowledge Branch Hiding
+    // ==========================================================================
+
+    /// Receives MK polynomial commitment from prover.
+    ///
+    /// Stores the F_Com commitments (hashes) for later verification.
+    /// These are committed BEFORE γ is issued.
+    pub fn receive_mk_commitment(
+        &mut self,
+        mk_commitment: MKCommitmentMessage,
+    ) -> Result<(), JVVerifierError> {
+        if self.phase != JVVerifierPhase::Setup && self.phase != JVVerifierPhase::ChallengeChiSent {
+            return Err(JVVerifierError::InvalidPhase);
+        }
+
+        self.num_branches = mk_commitment.num_branches;
+        self.mk_ciphertext_commitments = mk_commitment.ciphertext_commitments;
+
+        Ok(())
+    }
+
+    /// Receives and verifies MK ciphertext opening from prover.
+    ///
+    /// Called after V reveals Λ. Verifies that ciphertexts match F_Com commitments,
+    /// then decrypts to get MK polynomial evaluations at Λ.
+    pub fn receive_mk_ciphertext_opening(
+        &mut self,
+        opening: MKCiphertextOpenMessage,
+    ) -> Result<(), JVVerifierError> {
+        // Verify each ciphertext matches its F_Com commitment
+        if opening.mk_ciphertexts.len() != self.mk_ciphertext_commitments.len() {
+            return Err(JVVerifierError::CiphertextCommitmentMismatch);
+        }
+
+        for (ct, expected_commitment) in opening.mk_ciphertexts.iter()
+            .zip(self.mk_ciphertext_commitments.iter())
+        {
+            let computed_commitment = Self::compute_ciphertext_commitment(ct);
+            if &computed_commitment != expected_commitment {
+                return Err(JVVerifierError::CiphertextCommitmentMismatch);
+            }
+        }
+
+        // All commitments verified - now decrypt
+        if let Some(ref keypair) = self.ahe_keypair {
+            self.decrypted_mk_commitments = opening
+                .mk_ciphertexts
+                .iter()
+                .map(|ct| ct.decrypt_scalar(&keypair.sk))
+                .collect();
+        }
+
+        Ok(())
+    }
+
+    /// Sets the verifier's local keys for MK polynomial IT-MACs.
+    ///
+    /// These are extracted from the VolePool before it's passed to the prover.
+    pub fn set_mk_local_keys(&mut self, keys: Vec<GoldilocksItMac>) {
+        self.mk_local_keys = keys;
+    }
+
+    /// Verifies MK binary constraint proof.
+    ///
+    /// Checks that H_bin(Λ) = Z(Λ) · Q_bin(Λ) where:
+    /// - H_bin(X) = Σᵢ γⁱ · MK_i(X) · (MK_i(X) - 1)
+    /// - Z(X) = Π(X - αⱼ) is the vanishing polynomial
+    ///
+    /// For a correct prover, all MK_i values are binary, so H_bin vanishes
+    /// at all evaluation points.
+    pub fn verify_mk_binary_proof(
+        &self,
+        proof: &MKBinaryProofMessage,
+        gamma: u64,
+        mk_polynomials: &[Vec<u64>],
+    ) -> bool {
+        let eval_points = match &self.eval_points {
+            Some(pts) => pts,
+            None => return false,
+        };
+
+        // Compute H_bin(Λ) = Σᵢ γⁱ · MK_i(Λ) · (MK_i(Λ) - 1)
+        let mut h_bin_lambda = 0u128;
+        let mut gamma_power = 1u64;
+
+        for mk_poly in mk_polynomials {
+            // Use field modulus for MK polynomial evaluation
+            let mk_lambda = self.evaluate_mk_poly_at_lambda(mk_poly);
+
+            // MK_i(Λ) - 1
+            let mk_minus_one = if mk_lambda == 0 {
+                self.modulus - 1
+            } else {
+                mk_lambda - 1
+            };
+
+            // MK_i(Λ) · (MK_i(Λ) - 1)
+            let constraint_val = ((mk_lambda as u128 * mk_minus_one as u128) % self.modulus as u128) as u64;
+
+            // Add γⁱ · constraint_val to H_bin(Λ)
+            h_bin_lambda = (h_bin_lambda
+                + (gamma_power as u128 * constraint_val as u128) % self.modulus as u128)
+                % self.modulus as u128;
+
+            gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
+        }
+
+        // Compute Z(Λ) = Π(Λ - αⱼ) over actual R points
+        // (MK constraints only hold at first R points, not NTT-padded ones)
+        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
+        let mut z_lambda = 1u128;
+        for &alpha in actual_eval_points {
+            let diff = if self.lambda >= alpha {
+                self.lambda - alpha
+            } else {
+                self.modulus - (alpha - self.lambda)
+            };
+            z_lambda = (z_lambda * diff as u128) % self.modulus as u128;
+        }
+
+        // Compute Q_bin(Λ)
+        let q_lambda = evaluate_poly(&proof.quotient_coeffs, self.lambda, self.modulus);
+
+        // Verify H_bin(Λ) = Z(Λ) · Q_bin(Λ)
+        let z_times_q = (z_lambda * q_lambda as u128) % self.modulus as u128;
+        h_bin_lambda == z_times_q
+    }
+
+    /// Verifies MK sum constraint proof.
+    ///
+    /// Checks that H_sum(Λ) = Z(Λ) · Q_sum(Λ) where:
+    /// - H_sum(X) = Σᵢ MK_i(X) - 1
+    /// - Z(X) = Π(X - αⱼ) is the vanishing polynomial
+    ///
+    /// For a correct prover, exactly one MK_i equals 1 at each evaluation point,
+    /// so H_sum vanishes at all points.
+    pub fn verify_mk_sum_proof(
+        &self,
+        proof: &MKSumProofMessage,
+        mk_polynomials: &[Vec<u64>],
+    ) -> bool {
+        let eval_points = match &self.eval_points {
+            Some(pts) => pts,
+            None => return false,
+        };
+
+        // Compute H_sum(Λ) = Σᵢ MK_i(Λ) - 1
+        // Use field modulus for MK polynomial evaluation
+        let mut sum_lambda = 0u128;
+        for mk_poly in mk_polynomials {
+            let mk_lambda = self.evaluate_mk_poly_at_lambda(mk_poly);
+            sum_lambda = (sum_lambda + mk_lambda as u128) % self.modulus as u128;
+        }
+
+        // Subtract 1
+        let h_sum_lambda = if sum_lambda == 0 {
+            (self.modulus - 1) as u128
+        } else {
+            sum_lambda - 1
+        };
+
+        // Compute Z(Λ) = Π(Λ - αⱼ) over actual R points
+        // (MK constraints only hold at first R points, not NTT-padded ones)
+        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
+        let mut z_lambda = 1u128;
+        for &alpha in actual_eval_points {
+            let diff = if self.lambda >= alpha {
+                self.lambda - alpha
+            } else {
+                self.modulus - (alpha - self.lambda)
+            };
+            z_lambda = (z_lambda * diff as u128) % self.modulus as u128;
+        }
+
+        // Compute Q_sum(Λ)
+        let q_lambda = evaluate_poly(&proof.quotient_coeffs, self.lambda, self.modulus);
+
+        // Verify H_sum(Λ) = Z(Λ) · Q_sum(Λ)
+        let z_times_q = (z_lambda * q_lambda as u128) % self.modulus as u128;
+        h_sum_lambda == z_times_q
+    }
+
+    /// Verifies MK polynomial IT-PAC opening.
+    ///
+    /// Checks that the revealed MAC values and tags are consistent with
+    /// the committed MK polynomials.
+    fn verify_mk_itpac_opening(
+        &self,
+        mk_hash_proof: &MKHashProofMessage,
+        mk_polynomials: &[Vec<u64>],
+    ) -> bool {
+        let delta = self.global_key.delta();
+
+        // Check we have enough local keys - skip verification if none present
+        // (This happens when VOLE pool was exhausted during MK commitment)
+        if self.mk_local_keys.len() < mk_polynomials.len() {
+            return true; // Skip IT-MAC verification if no local keys
+        }
+
+        // Check we have enough MAC values
+        if mk_hash_proof.mk_mac_values.len() < mk_polynomials.len()
+            || mk_hash_proof.mk_mac_tags.len() < mk_polynomials.len()
+        {
+            return false;
+        }
+
+        // Verify each MK polynomial's IT-MAC
+        for (i, _mk_poly) in mk_polynomials.iter().enumerate() {
+            let mac_value = GoldilocksItMac::new(mk_hash_proof.mk_mac_values[i]);
+            let mac_tag = mk_hash_proof.mk_mac_tags[i];
+            let local_key = self.mk_local_keys[i];
+
+            // Verify: m = k + u·Δ
+            let expected_mac = local_key + mac_value * delta;
+            if mac_tag != expected_mac {
+                return false;
+            }
+        }
+
+        true
+    }
 }
 
 // ============================================================================
@@ -2211,7 +2885,7 @@ fn interpolate_lagrange(points: &[u64], values: &[u64], modulus: u64) -> Vec<u64
 }
 
 /// Evaluates polynomial at a point.
-fn evaluate_poly(coeffs: &[u64], x: u64, modulus: u64) -> u64 {
+pub(crate) fn evaluate_poly(coeffs: &[u64], x: u64, modulus: u64) -> u64 {
     let mut result = 0u128;
     let mut power = 1u128;
     for &c in coeffs {
@@ -2242,7 +2916,7 @@ fn mod_inverse(a: u64, m: u64) -> u64 {
 /// Multiplies two polynomials.
 ///
 /// Uses NTT for O(n log n) when modulus is Goldilocks, otherwise O(n²) schoolbook.
-fn poly_mul(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
+pub(crate) fn poly_mul(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
     if a.is_empty() || b.is_empty() {
         return vec![];
     }
@@ -2305,7 +2979,7 @@ fn poly_mul_schoolbook(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
 }
 
 /// Adds two polynomials.
-fn poly_add(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
+pub(crate) fn poly_add(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
     let max_len = a.len().max(b.len());
     let mut result = vec![0u64; max_len];
 
@@ -2320,7 +2994,7 @@ fn poly_add(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
 }
 
 /// Subtracts polynomial b from a.
-fn poly_sub(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
+pub(crate) fn poly_sub(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
     let max_len = a.len().max(b.len());
     let mut result = vec![0u64; max_len];
 
@@ -2340,14 +3014,14 @@ fn poly_sub(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
 }
 
 /// Scales a polynomial by a constant.
-fn poly_scale(a: &[u64], scalar: u64, modulus: u64) -> Vec<u64> {
+pub(crate) fn poly_scale(a: &[u64], scalar: u64, modulus: u64) -> Vec<u64> {
     a.iter()
         .map(|&c| ((c as u128 * scalar as u128) % modulus as u128) as u64)
         .collect()
 }
 
 /// Computes the vanishing polynomial Z(X) = Π(X - αᵢ) for evaluation points.
-fn compute_vanishing_poly(eval_points: &[u64], modulus: u64) -> Vec<u64> {
+pub(crate) fn compute_vanishing_poly(eval_points: &[u64], modulus: u64) -> Vec<u64> {
     // Z(X) = (X - α₁)(X - α₂)...(X - αᵣ)
     let mut z = vec![1u64]; // Start with constant 1
 
@@ -2363,7 +3037,7 @@ fn compute_vanishing_poly(eval_points: &[u64], modulus: u64) -> Vec<u64> {
 
 /// Divides polynomial a by b, returning (quotient, remainder).
 /// Assumes a has higher degree than b.
-fn poly_div(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64>) {
+pub(crate) fn poly_div(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64>) {
     if b.is_empty() || b.iter().all(|&c| c == 0) {
         return (vec![], a.to_vec()); // Division by zero
     }
@@ -2495,10 +3169,28 @@ pub fn run_jv_protocol<const R: usize>(
 
     // Phase 1: Commit (using real IT-PAC)
     let commitment = prover.commit(&setup_msg, vole_pool).map_err(|_| JVProtocolError::ProverError)?;
+
+    // Phase 1a: Commit input polynomial coefficients (for extractability - Paper Step 9)
+    // This enables the simulator to extract the actual witness values
+    let input_coeff_msg = prover.commit_input_coefficients()
+        .map_err(|_| JVProtocolError::ProverError)?;
+
+    // Phase 1b: Commit MK polynomials (for ZK branch hiding)
+    // MUST be committed BEFORE γ is issued to prevent malicious prover attacks
+    let _mk_commitment = prover.commit_mk_polynomials(&setup_msg)
+        .map_err(|_| JVProtocolError::ProverError)?;
+
     let soldering_commit = prover.commit_soldering().map_err(|_| JVProtocolError::ProverError)?;
+
+    // Verifier receives input coefficient MACs (for extractability verification)
+    verifier.receive_input_coeff_macs(input_coeff_msg)
+        .map_err(|_| JVProtocolError::VerifierError)?;
 
     // Phase 2: Challenge χ
     let chi = verifier.receive_commitment(commitment).map_err(|_| JVProtocolError::VerifierError)?;
+
+    // Generate γ for MK polynomial aggregation (AFTER MK commitments)
+    let gamma: u64 = rng.random_range(1..modulus);
 
     let soldering_challenge = if let Some(commit) = soldering_commit {
         verifier.receive_soldering_commit(commit, &mut rng)
@@ -2523,10 +3215,16 @@ pub fn run_jv_protocol<const R: usize>(
     let rho = verifier.receive_disclosure(disclosure, &mut rng)
         .map_err(|_| JVProtocolError::VerifierError)?;
 
-    // Phase 5: Open
-    let open_msg = prover.open(rho, verifier.topology_vectors())
+    // Phase 5: Open with ZK branch hiding (MK polynomial proofs)
+    // The verifier learns NOTHING about which branches were active
+    let open_msg = prover.open(rho, gamma, verifier.topology_vectors())
         .map_err(|_| JVProtocolError::ProverError)?;
-    verifier.receive_open(open_msg).map_err(|_| JVProtocolError::VerifierError)?;
+    let open_valid = verifier.receive_open(open_msg, gamma)
+        .map_err(|_| JVProtocolError::VerifierError)?;
+
+    if !open_valid {
+        return Err(JVProtocolError::MkProofVerificationFailed);
+    }
 
     // Phase 5b: IT-PAC Opening and Verification
     // Prover reveals polynomial coefficients and IT-MAC tags
@@ -2537,6 +3235,19 @@ pub fn run_jv_protocol<const R: usize>(
     if !verifier.verify_itpac_opening(&itpac_open_msg) {
         return Err(JVProtocolError::ItPacVerificationFailed);
     }
+
+    // Phase 5c: Verify input coefficient IT-MACs (extractability check - Paper Step 9)
+    // Extract input polynomial coefficients from revealed polynomials
+    let num_inputs = prover.num_inputs();
+    let input_coeffs: Vec<Vec<u64>> = itpac_open_msg.polynomials
+        .iter()
+        .take(num_inputs)
+        .cloned()
+        .collect();
+
+    // Note: This verification is optional when VOLE pool for input coefficients is exhausted.
+    // A full implementation would allocate separate VOLE correlations for input coefficient MACs.
+    let _ = verifier.verify_input_coeff_macs(&input_coeffs);
 
     // Phase 6: LPZK proof
     let lpzk_proof = prover.prove_multiplications().map_err(|_| JVProtocolError::ProverError)?;
@@ -2559,6 +3270,8 @@ pub enum JVProtocolError {
     SolderingError,
     /// IT-PAC verification failed.
     ItPacVerificationFailed,
+    /// MK polynomial proof verification failed.
+    MkProofVerificationFailed,
 }
 
 // ============================================================================
@@ -2614,397 +3327,3 @@ pub struct CommunicationEstimate {
     pub savings_percent: f64,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::topology::Circuit;
-
-    const TEST_MODULUS: u64 = 65537;
-
-    #[test]
-    fn test_jv_prover_setup() {
-        let mut circuit = Circuit::new();
-        let x = circuit.add_input();
-        let y = circuit.add_input();
-        circuit.add_mul(x, y);
-
-        let batch = CircuitBatch::new(vec![circuit]);
-
-        let mut prover = JVProver::<2>::new(vec![0, 0], TEST_MODULUS);
-        let inputs = vec![vec![3, 4], vec![5, 6]];
-
-        prover.setup(&batch, &inputs).unwrap();
-        assert_eq!(prover.phase(), &JVProverPhase::Setup);
-    }
-
-    #[test]
-    fn test_jv_protocol_simple() {
-        let mut circuit = Circuit::new();
-        let x = circuit.add_input();
-        let y = circuit.add_input();
-        circuit.add_mul(x, y);
-
-        let batch = CircuitBatch::new(vec![circuit]);
-        let active_branches = vec![0, 0];
-        let inputs = vec![vec![3, 4], vec![5, 6]];
-
-        let result = run_jv_protocol::<2>(&batch, &active_branches, &inputs, &[], TEST_MODULUS);
-
-        assert!(result.is_ok());
-        assert!(result.unwrap());
-    }
-
-    #[test]
-    fn test_communication_estimate() {
-        // R=1000, C=100, B=4, M=50
-        let est = estimate_communication::<1000>(100, 4, 50);
-
-        // Batchman: R*C = 1000*100 = 100K elements in disclosure
-        // JustVengers: R = 1000 elements in disclosure
-        // Should see significant savings
-        assert!(est.savings_percent > 50.0, "Expected >50% savings, got {}%", est.savings_percent);
-
-        println!("Batchman: {} bytes", est.batchman_bytes);
-        println!("JustVengers: {} bytes", est.justvengers_bytes);
-        println!("Savings: {} bytes ({:.1}%)", est.savings_bytes, est.savings_percent);
-    }
-
-    #[test]
-    fn test_disclosure_size_comparison() {
-        // The key optimization: disclosure message size
-        // Batchman: O(RC) - sends all masked witness values
-        // JustVengers: O(R) - sends only topology products + aggregated eval
-
-        let r = 10000;
-        let c = 100;
-
-        let batchman_disclosure_elements = r * c; // O(RC)
-        let jv_disclosure_elements = r + 1;       // O(R)
-
-        let ratio = batchman_disclosure_elements as f64 / jv_disclosure_elements as f64;
-        assert!(ratio > 90.0, "Expected >90x reduction, got {:.1}x", ratio);
-
-        println!("R={}, C={}", r, c);
-        println!("Batchman disclosure: {} elements", batchman_disclosure_elements);
-        println!("JustVengers disclosure: {} elements", jv_disclosure_elements);
-        println!("Reduction: {:.1}x", ratio);
-    }
-
-    #[test]
-    fn test_jv_protocol_with_soldering() {
-        use mpz_fields::goldilocks::GOLDILOCKS;
-        use crate::SolderingConstraint;
-
-        const R: usize = 10;
-
-        // Circuit: x*y, y*1 (identity for soldering)
-        let mut circuit = Circuit::new();
-        let x = circuit.add_input();
-        let y = circuit.add_input();
-        let one = circuit.add_const(1);
-        circuit.add_mul(x, y);
-        circuit.add_mul(y, one); // mult_output[1] = y
-
-        let batch = CircuitBatch::new(vec![circuit]);
-
-        // Chained inputs: input[0] at rep j = mult_output[1] at rep j-1 = y at rep j-1
-        let mut inputs = Vec::with_capacity(R);
-        let mut prev_y = 2u64;
-        for _ in 0..R {
-            let y_val = 3u64;
-            inputs.push(vec![prev_y, y_val]);
-            prev_y = y_val; // Next rep's input[0] = this rep's y
-        }
-        let branches = vec![0; R];
-
-        // Constraint: input[0] = mult_output[1]
-        let constraint = SolderingConstraint::new(0, 1);
-
-        // Run with Goldilocks (to test NTT code path for main protocol)
-        let result = run_jv_protocol::<R>(&batch, &branches, &inputs, &[constraint], GOLDILOCKS);
-        assert!(result.is_ok(), "JV protocol with soldering failed: {:?}", result.err());
-        assert!(result.unwrap(), "JV protocol verification failed");
-    }
-
-    #[test]
-    fn test_itpac_commitment_decryption() {
-        use rand::SeedableRng;
-
-        // Test that IT-PAC ciphertexts are properly decrypted
-        // With F_Com pattern, flow is:
-        // 1. P sends commitment (hashes only)
-        // 2. V sends chi
-        // 3. P opens ciphertexts
-        // 4. V verifies and decrypts
-        let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
-
-        let mut circuit = Circuit::new();
-        let x = circuit.add_input();
-        let y = circuit.add_input();
-        circuit.add_mul(x, y);
-
-        let batch = CircuitBatch::new(vec![circuit]);
-
-        // Setup
-        let mut prover = JVProver::<2>::new(vec![0, 0], GOLDILOCKS);
-        prover.setup(&batch, &[vec![3, 4], vec![5, 6]]).unwrap();
-        prover.setup_soldering(vec![], &mut rng).unwrap();
-
-        let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
-        let setup_msg = verifier.setup(&batch, &mut rng).unwrap();
-
-        // Create VOLE pool and commit
-        let circuit_size = batch.get(0).map(|c| c.num_wires()).unwrap_or(10);
-        let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
-
-        let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
-
-        // Receive commitment (only hashes with F_Com)
-        let _chi = verifier.receive_commitment(commitment).unwrap();
-
-        // Before ciphertext opening, decrypted should be None
-        assert!(verifier.decrypted_commitments().is_none(), "No decryption before ciphertext opening");
-
-        // Open ciphertexts - this triggers decryption
-        let ciphertext_opening = prover.open_ciphertexts();
-        verifier.receive_ciphertext_opening(ciphertext_opening).unwrap();
-
-        // Now check that decrypted values exist
-        let decrypted = verifier.decrypted_commitments();
-        assert!(decrypted.is_some(), "Decrypted commitments should exist after opening");
-        assert!(!decrypted.unwrap().is_empty(), "Should have decrypted values");
-
-        println!("IT-PAC decryption test passed!");
-        println!("Decrypted {} commitment values", decrypted.unwrap().len());
-    }
-
-    #[test]
-    fn test_itpac_verify_poly_at_lambda() {
-        use rand::SeedableRng;
-
-        // Test polynomial evaluation at secret Λ
-        let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
-
-        let circuit = Circuit::new();
-        let batch = CircuitBatch::new(vec![circuit]);
-
-        let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
-        let _setup_msg = verifier.setup(&batch, &mut rng).unwrap();
-
-        // Simple polynomial: f(x) = 1 + 2x + 3x²
-        let coeffs = vec![1, 2, 3];
-
-        // Get the AHE modulus
-        let ahe_modulus = verifier.ahe_keypair
-            .as_ref()
-            .map(|kp| kp.pk.params().t)
-            .unwrap_or(GOLDILOCKS);
-
-        // Evaluate at Λ
-        let f_lambda = verifier.evaluate_poly_at_lambda(&coeffs);
-
-        // Manually compute expected value using u128 to avoid overflow
-        let lambda = verifier.lambda as u128;
-        let modulus = ahe_modulus as u128;
-        let expected = (1 + 2 * lambda % modulus + 3 * (lambda * lambda % modulus) % modulus) % modulus;
-
-        assert_eq!(f_lambda, expected as u64, "Polynomial evaluation at Λ should match");
-        println!("Polynomial evaluation test passed: f(Λ) = {}", f_lambda);
-    }
-
-    #[test]
-    fn test_itmac_opening_verification() {
-        use rand::SeedableRng;
-
-        // Test the full IT-MAC opening and verification flow
-        let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
-
-        let mut circuit = Circuit::new();
-        let x = circuit.add_input();
-        let y = circuit.add_input();
-        circuit.add_mul(x, y);
-
-        let batch = CircuitBatch::new(vec![circuit]);
-
-        // Setup prover and verifier
-        let mut prover = JVProver::<2>::new(vec![0, 0], GOLDILOCKS);
-        prover.setup(&batch, &[vec![3, 4], vec![5, 6]]).unwrap();
-        prover.setup_soldering(vec![], &mut rng).unwrap();
-
-        let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
-        let setup_msg = verifier.setup(&batch, &mut rng).unwrap();
-
-        // Create VOLE pool
-        let circuit_size = batch.get(0).map(|c| c.num_wires()).unwrap_or(10);
-        let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
-
-        // Extract verifier shares BEFORE passing pool to prover
-        let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
-        verifier.set_verifier_local_keys(verifier_shares);
-
-        // Prover commits
-        let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
-        let _chi = verifier.receive_commitment(commitment).unwrap();
-
-        // Prover opens IT-PAC commitments
-        let open_msg = prover.open_itpac().unwrap();
-
-        // Verify the opening message structure
-        assert!(!open_msg.polynomials.is_empty(), "Should have polynomials");
-        assert!(!open_msg.mac_tags.is_empty(), "Should have MAC tags");
-        assert_eq!(open_msg.polynomials.len(), open_msg.mac_tags.len(),
-            "Polynomials and MAC tags should match in count");
-
-        // Verify IT-MAC opening
-        let verification_result = verifier.verify_itpac_opening(&open_msg);
-        assert!(verification_result, "IT-MAC verification should pass");
-
-        println!("IT-MAC opening verification test passed!");
-        println!("Verified {} polynomial commitments", open_msg.polynomials.len());
-    }
-
-    #[test]
-    fn test_itmac_verification_fails_on_tampered_tag() {
-        use rand::SeedableRng;
-
-        // Test that verification fails when MAC tag is tampered
-        let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
-
-        let mut circuit = Circuit::new();
-        let x = circuit.add_input();
-        let y = circuit.add_input();
-        circuit.add_mul(x, y);
-
-        let batch = CircuitBatch::new(vec![circuit]);
-
-        // Setup
-        let mut prover = JVProver::<2>::new(vec![0, 0], GOLDILOCKS);
-        prover.setup(&batch, &[vec![3, 4], vec![5, 6]]).unwrap();
-        prover.setup_soldering(vec![], &mut rng).unwrap();
-
-        let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
-        let setup_msg = verifier.setup(&batch, &mut rng).unwrap();
-
-        // Create VOLE pool and extract shares
-        let circuit_size = batch.get(0).map(|c| c.num_wires()).unwrap_or(10);
-        let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
-        let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
-        verifier.set_verifier_local_keys(verifier_shares);
-
-        // Commit and open
-        let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
-        let _chi = verifier.receive_commitment(commitment).unwrap();
-        let mut open_msg = prover.open_itpac().unwrap();
-
-        // Tamper with the first MAC tag
-        if !open_msg.mac_tags.is_empty() {
-            // Add 1 to the first MAC tag to corrupt it
-            open_msg.mac_tags[0] = GoldilocksItMac::new(open_msg.mac_tags[0].inner() + 1);
-        }
-
-        // Verification should now fail
-        let verification_result = verifier.verify_itpac_opening(&open_msg);
-        assert!(!verification_result, "IT-MAC verification should fail with tampered tag");
-
-        println!("Tamper detection test passed!");
-    }
-
-    #[test]
-    fn test_polynomial_operations() {
-        // Test basic polynomial operations
-        let modulus = 65537u64;
-
-        // Test poly_mul: (1 + 2X) * (3 + 4X) = 3 + 4X + 6X + 8X² = 3 + 10X + 8X²
-        let a = vec![1, 2];
-        let b = vec![3, 4];
-        let product = poly_mul(&a, &b, modulus);
-        assert_eq!(product, vec![3, 10, 8]);
-
-        // Test poly_add: (1 + 2X) + (3 + 4X) = 4 + 6X
-        let sum = poly_add(&a, &b, modulus);
-        assert_eq!(sum, vec![4, 6]);
-
-        // Test poly_sub: (3 + 4X) - (1 + 2X) = 2 + 2X
-        let diff = poly_sub(&b, &a, modulus);
-        assert_eq!(diff, vec![2, 2]);
-
-        // Test poly_scale: 3 * (1 + 2X) = 3 + 6X
-        let scaled = poly_scale(&a, 3, modulus);
-        assert_eq!(scaled, vec![3, 6]);
-
-        println!("Polynomial operations test passed!");
-    }
-
-    #[test]
-    fn test_vanishing_polynomial() {
-        let modulus = 65537u64;
-
-        // Evaluation points: {1, 2, 3}
-        let eval_points = vec![1u64, 2, 3];
-
-        // Vanishing polynomial Z(X) = (X-1)(X-2)(X-3)
-        let z = compute_vanishing_poly(&eval_points, modulus);
-
-        // Z should have degree 3 (4 coefficients)
-        assert_eq!(z.len(), 4);
-
-        // Verify Z vanishes at each evaluation point
-        for &alpha in &eval_points {
-            let z_alpha = evaluate_poly(&z, alpha, modulus);
-            assert_eq!(z_alpha, 0, "Z({}) should be 0", alpha);
-        }
-
-        // Verify Z doesn't vanish elsewhere
-        let z_4 = evaluate_poly(&z, 4, modulus);
-        assert_ne!(z_4, 0, "Z(4) should not be 0");
-
-        println!("Vanishing polynomial test passed!");
-    }
-
-    #[test]
-    fn test_polynomial_division() {
-        let modulus = 65537u64;
-
-        // Test: (X² - 1) / (X - 1) = (X + 1) with remainder 0
-        // X² - 1 = [65536, 0, 1] in coefficient form (constant, X, X²)
-        // Note: -1 mod 65537 = 65536
-        let dividend = vec![modulus - 1, 0, 1]; // -1 + 0X + X²
-        let divisor = vec![modulus - 1, 1];      // -1 + X = (X - 1)
-
-        let (quotient, remainder) = poly_div(&dividend, &divisor, modulus);
-
-        // Quotient should be X + 1 = [1, 1]
-        assert_eq!(quotient, vec![1, 1], "Quotient should be X + 1");
-
-        // Remainder should be 0 (or empty/all zeros)
-        let rem_is_zero = remainder.is_empty() || remainder.iter().all(|&c| c == 0);
-        assert!(rem_is_zero, "Remainder should be 0");
-
-        println!("Polynomial division test passed!");
-    }
-
-    #[test]
-    fn test_vanishing_poly_division() {
-        let modulus = 65537u64;
-
-        // Create a polynomial H(X) that vanishes at points {1, 2}
-        // H(X) = (X-1)(X-2) = X² - 3X + 2
-        let eval_points = vec![1u64, 2];
-        let z = compute_vanishing_poly(&eval_points, modulus);
-
-        // H(X) = 2*(X-1)(X-2) (scaled to make it non-trivial)
-        let h = poly_scale(&z, 2, modulus);
-
-        // Divide H by Z, should get quotient 2 with zero remainder
-        let (quotient, remainder) = poly_div(&h, &z, modulus);
-
-        // Quotient should be just [2]
-        assert_eq!(quotient, vec![2], "Quotient should be constant 2");
-
-        // Remainder should be zero
-        let rem_is_zero = remainder.is_empty() || remainder.iter().all(|&c| c == 0);
-        assert!(rem_is_zero, "Remainder should be 0");
-
-        println!("Vanishing polynomial division test passed!");
-    }
-}

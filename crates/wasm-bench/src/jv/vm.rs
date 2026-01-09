@@ -1,9 +1,9 @@
 //! VM-style JV prover benchmark for WASM with per-rep active branches.
 //!
 //! Simulates a VM with:
-//! - 30 opcodes (branches)
-//! - 32-element state vectors
-//! - 97 multiplications per circuit
+//! - 60 opcodes (branches)
+//! - 16-element state vectors
+//! - ~49 multiplications per circuit
 //! - State soldering across repetitions
 //! - Random active branch per repetition
 //!
@@ -38,9 +38,9 @@ use crate::BenchResult;
 #[cfg(target_arch = "wasm32")]
 const MODULUS: u64 = GOLDILOCKS;
 #[cfg(target_arch = "wasm32")]
-const NUM_BRANCHES: usize = 30;
+const NUM_BRANCHES: usize = 60;
 #[cfg(target_arch = "wasm32")]
-const STATE_SIZE: usize = 32;
+const STATE_SIZE: usize = 16;
 #[cfg(target_arch = "wasm32")]
 const NUM_INPUTS: usize = STATE_SIZE * 2 + 1;
 
@@ -409,11 +409,13 @@ fn run_vm_bench(n: u32, reps: usize) -> Result<BenchResult, String> {
         10 => run_bench!(10),
         100 => run_bench!(100),
         1000 => run_bench!(1000),
+        2000 => run_bench!(2000),
+        3000 => run_bench!(3000),
         10000 => run_bench!(10000),
         25000 => run_bench!(25000),
         100000 => run_bench!(100000),
         _ => Err(format!(
-            "Unsupported reps value: {}. Supported: 10, 100, 1000, 10000, 25000, 100000",
+            "Unsupported reps value: {}. Supported: 10, 100, 1000, 2000, 3000, 10000, 25000, 100000",
             reps
         )),
     }

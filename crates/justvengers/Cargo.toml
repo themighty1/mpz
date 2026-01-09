@@ -19,6 +19,7 @@ bincode = { workspace = true }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 futures = { workspace = true }
+blake3 = { workspace = true }
 
 # KZG polynomial commitments
 ark-ff = { workspace = true }
@@ -31,6 +32,7 @@ ark-serialize = { workspace = true }
 default = ["ntt"]
 ntt = []
 kzg = []
+mersenne = ["mpz-fields/mersenne"]
 
 [dev-dependencies]
 rand = { workspace = true }

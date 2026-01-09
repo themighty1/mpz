@@ -3,6 +3,10 @@ name = "mpz-fields"
 version = "0.1.0-alpha.4"
 edition = "2024"
 
+[features]
+default = []
+mersenne = []
+
 [lints]
 workspace = true
 

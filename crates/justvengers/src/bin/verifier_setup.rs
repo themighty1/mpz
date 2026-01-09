@@ -14,7 +14,6 @@ use mpz_justvengers::{
     topology::TopologyVector,
     soldering::SolderingChallengeMessage,
     JVProver, JVVerifier, JVSetupMessage, GoldilocksItMac,
-    extract_verifier_shares_from_pool,
 };
 
 use mpz_core::{prg::Prg, Block};
@@ -24,8 +23,8 @@ use rand::{Rng, SeedableRng};
 use serde::{Serialize, Deserialize};
 
 const MODULUS: u64 = GOLDILOCKS;
-const NUM_BRANCHES: usize = 30;
-const STATE_SIZE: usize = 32;
+const NUM_BRANCHES: usize = 60;
+const STATE_SIZE: usize = 16;
 const NUM_INPUTS: usize = STATE_SIZE * 2 + 1;
 
 #[derive(Serialize, Deserialize)]
@@ -169,11 +168,10 @@ fn generate_verifier_messages<const R: usize>(
     }
 
     let rho = verifier.receive_disclosure(disclosure, &mut rng).unwrap();
-
-    let open_msg = prover.open(rho, verifier.topology_vectors()).unwrap();
-    verifier.receive_open(open_msg).unwrap();
-
     let gamma = verifier.generate_lpzk_challenge(&mut rng);
+
+    let open_msg = prover.open(rho, gamma, verifier.topology_vectors()).unwrap();
+    verifier.receive_open(open_msg, gamma).unwrap();
     let lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
     let result = verifier.verify_multiplications_aggregated(lpzk_proof, gamma).unwrap();
     assert!(result, "Protocol verification failed");
