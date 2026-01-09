@@ -3175,14 +3175,114 @@ pub(crate) fn compute_vanishing_poly(eval_points: &[u64], modulus: u64) -> Vec<u
     z
 }
 
-/// Divides polynomial a by b, returning (quotient, remainder).
-/// Assumes a has higher degree than b.
-pub(crate) fn poly_div(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64>) {
-    if b.is_empty() || b.iter().all(|&c| c == 0) {
-        return (vec![], a.to_vec()); // Division by zero
+/// Reverses polynomial coefficients.
+/// Used for fast division: rev(A) where rev(A)(X) = X^deg(A) * A(1/X)
+#[inline]
+fn poly_reverse(a: &[u64]) -> Vec<u64> {
+    a.iter().rev().copied().collect()
+}
+
+/// Computes the modular inverse of polynomial b modulo X^precision using Newton iteration.
+/// b[0] must be non-zero (invertible).
+/// Complexity: O(n log n) using NTT.
+#[cfg(feature = "ntt")]
+fn newton_poly_inverse(b: &[u64], precision: usize) -> Vec<u64> {
+    if b.is_empty() || b[0] == 0 {
+        return vec![];
     }
 
-    // Find leading coefficient of b
+    // Initial approximation: g_0 = 1/b[0]
+    let b0_inv = mod_inverse(b[0], GOLDILOCKS);
+    let mut g = vec![b0_inv];
+
+    let mut k = 1usize;
+    while k < precision {
+        k *= 2;
+        let k_capped = k.min(precision);
+
+        // g = g * (2 - b * g) mod X^k
+        // Step 1: Compute b * g (truncated to k terms)
+        let b_trunc: Vec<u64> = b.iter().take(k_capped).copied().collect();
+        let bg = poly_mul_ntt(&b_trunc, &g);
+
+        // Step 2: Compute 2 - b*g
+        let mut two_minus_bg = vec![0u64; k_capped];
+        two_minus_bg[0] = 2;
+        for (i, &val) in bg.iter().take(k_capped).enumerate() {
+            two_minus_bg[i] = if two_minus_bg[i] >= val {
+                two_minus_bg[i] - val
+            } else {
+                GOLDILOCKS - (val - two_minus_bg[i])
+            };
+        }
+
+        // Step 3: g = g * (2 - b*g) mod X^k
+        let new_g = poly_mul_ntt(&g, &two_minus_bg);
+        g = new_g.into_iter().take(k_capped).collect();
+    }
+
+    g.truncate(precision);
+    g
+}
+
+/// Fast polynomial division using Newton iteration and NTT.
+/// Complexity: O(n log n) instead of O(n²).
+#[cfg(feature = "ntt")]
+fn fast_poly_div(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    // Find actual degrees (ignoring trailing zeros)
+    let mut a_deg = a.len().saturating_sub(1);
+    while a_deg > 0 && a[a_deg] == 0 {
+        a_deg -= 1;
+    }
+
+    let mut b_deg = b.len().saturating_sub(1);
+    while b_deg > 0 && b[b_deg] == 0 {
+        b_deg -= 1;
+    }
+
+    if a_deg < b_deg {
+        return (vec![0], a.to_vec());
+    }
+
+    let q_deg = a_deg - b_deg;
+
+    // Reverse polynomials
+    let a_rev = poly_reverse(&a[..=a_deg]);
+    let b_rev = poly_reverse(&b[..=b_deg]);
+
+    // Compute inverse of b_rev modulo X^(q_deg+1)
+    let b_rev_inv = newton_poly_inverse(&b_rev, q_deg + 1);
+
+    if b_rev_inv.is_empty() {
+        // Fallback to schoolbook if inverse computation fails
+        return poly_div_schoolbook(a, b, GOLDILOCKS);
+    }
+
+    // q_rev = a_rev * b_rev_inv mod X^(q_deg+1)
+    let q_rev_full = poly_mul_ntt(&a_rev, &b_rev_inv);
+    let q_rev: Vec<u64> = q_rev_full.into_iter().take(q_deg + 1).collect();
+
+    // Reverse to get quotient
+    let quotient = poly_reverse(&q_rev);
+
+    // Compute remainder: r = a - q * b
+    let qb = poly_mul_ntt(&quotient, &b[..=b_deg]);
+    let mut remainder = poly_sub(a, &qb, GOLDILOCKS);
+
+    // Trim trailing zeros
+    while remainder.len() > 1 && remainder.last() == Some(&0) {
+        remainder.pop();
+    }
+
+    (quotient, remainder)
+}
+
+/// Schoolbook polynomial division - O(n²) fallback.
+fn poly_div_schoolbook(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64>) {
+    if b.is_empty() || b.iter().all(|&c| c == 0) {
+        return (vec![], a.to_vec());
+    }
+
     let mut b_deg = b.len() - 1;
     while b_deg > 0 && b[b_deg] == 0 {
         b_deg -= 1;
@@ -3194,7 +3294,6 @@ pub(crate) fn poly_div(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64
     let mut quotient = vec![0u64; a.len().saturating_sub(b_deg)];
 
     while !remainder.is_empty() {
-        // Find leading term of remainder
         let mut r_deg = remainder.len() - 1;
         while r_deg > 0 && remainder[r_deg] == 0 {
             r_deg -= 1;
@@ -3204,7 +3303,6 @@ pub(crate) fn poly_div(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64
             break;
         }
 
-        // Compute quotient term
         let q_coeff = ((remainder[r_deg] as u128 * b_lead_inv as u128) % modulus as u128) as u64;
         let q_deg = r_deg - b_deg;
 
@@ -3212,7 +3310,6 @@ pub(crate) fn poly_div(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64
             quotient[q_deg] = q_coeff;
         }
 
-        // Subtract q_coeff * X^q_deg * b from remainder
         for (i, &bc) in b.iter().enumerate() {
             let idx = q_deg + i;
             if idx < remainder.len() {
@@ -3225,13 +3322,29 @@ pub(crate) fn poly_div(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64
             }
         }
 
-        // Trim trailing zeros from remainder
         while !remainder.is_empty() && remainder.last() == Some(&0) {
             remainder.pop();
         }
     }
 
     (quotient, remainder)
+}
+
+/// Divides polynomial a by b, returning (quotient, remainder).
+/// Uses fast NTT-based division O(n log n) for Goldilocks, schoolbook O(n²) otherwise.
+pub(crate) fn poly_div(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64>) {
+    if b.is_empty() || b.iter().all(|&c| c == 0) {
+        return (vec![], a.to_vec());
+    }
+
+    // Use fast division for Goldilocks with NTT
+    #[cfg(feature = "ntt")]
+    if modulus == GOLDILOCKS {
+        return fast_poly_div(a, b);
+    }
+
+    // Fallback to schoolbook for other moduli
+    poly_div_schoolbook(a, b, modulus)
 }
 
 // ============================================================================
