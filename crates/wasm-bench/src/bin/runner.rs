@@ -10,15 +10,22 @@
 //! Options:
 //!   --iterations <N>   Number of iterations per benchmark (default: 100)
 //!   --samples <N>      Number of samples per benchmark (default: 10)
-//!   --headed           Run with visible browser window
+//!   --verbose, -v      Print browser console logs to terminal
 
 use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use chromiumoxide::{
+    Page,
     browser::{Browser, BrowserConfig},
-    cdp::browser_protocol::page::NavigateParams,
+    cdp::{
+        browser_protocol::page::NavigateParams,
+        js_protocol::runtime::{
+            ConsoleApiCalledType, EnableParams as RuntimeEnableParams, EventConsoleApiCalled,
+            EventExceptionThrown,
+        },
+    },
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use http_body_util::Full;
 use hyper::{Request, Response, StatusCode, body::Bytes, server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -35,7 +42,6 @@ const ALL_GROUPS: &[&str] = &[
     "zk_verifier",
     "garble",
     "ferret_sender",
-    "jv_prover",
     "jv_vm_prover",
 ];
 
@@ -68,21 +74,9 @@ const ALL_BENCHMARKS: &[&str] = &[
     "ferret_sender/100k",
     "ferret_sender/1m",
     "ferret_sender/10m",
-    "jv_prover/5x5x100",
-    "jv_prover/5x5x1000",
-    "jv_prover/10x10x100",
-    "jv_prover/10x10x1000",
-    "jv_prover/100x100x100",
-    "jv_prover/100x100x10k",
-    "jv_prover/100x100x100k",
-    "jv_vm_prover/10",
-    "jv_vm_prover/100",
-    "jv_vm_prover/1000",
-    "jv_vm_prover/2000",
-    "jv_vm_prover/3000",
-    "jv_vm_prover/10000",
-    "jv_vm_prover/25000",
-    "jv_vm_prover/100000",
+    "jv_vm_prover/1k",
+    "jv_vm_prover/2k",
+    "jv_vm_prover/3k",
 ];
 
 /// Get all benchmarks in a group
@@ -98,7 +92,7 @@ fn benchmarks_in_group(group: &str) -> Vec<&'static str> {
 /// Check if a benchmark is multi-threaded (uses concurrency parameter)
 fn is_mt_benchmark(name: &str) -> bool {
     // MT groups: all benchmarks in these groups are MT
-    let mt_groups = ["zk_prover", "zk_verifier", "garble", "ferret_sender", "jv_prover", "jv_vm_prover"];
+    let mt_groups = ["zk_prover", "zk_verifier", "garble", "ferret_sender", "jv_vm_prover"];
     for group in mt_groups {
         if name.starts_with(&format!("{}/", group)) {
             // Exclude specific ST benchmarks
@@ -149,6 +143,52 @@ fn get_crate_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Register console log listeners for a page via CDP
+async fn register_console_listeners(
+    page: &Page,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    // Enable Runtime domain to receive console API events
+    page.execute(RuntimeEnableParams::default()).await?;
+
+    let mut console_events = page.event_listener::<EventConsoleApiCalled>().await?;
+    let mut exceptions = page.event_listener::<EventExceptionThrown>().await?;
+
+    let handle = tokio::spawn(
+        futures::future::join(
+            async move {
+                while let Some(event) = console_events.next().await {
+                    // Format console arguments into a string
+                    let args: Vec<String> = event
+                        .args
+                        .iter()
+                        .filter_map(|arg| {
+                            arg.value
+                                .as_ref()
+                                .map(|v| v.to_string())
+                                .or_else(|| arg.description.clone())
+                        })
+                        .collect();
+                    let message = args.join(" ");
+
+                    match event.r#type {
+                        ConsoleApiCalledType::Error => eprintln!("[browser:error] {}", message),
+                        ConsoleApiCalledType::Warning => eprintln!("[browser:warn] {}", message),
+                        _ => println!("[browser] {}", message),
+                    }
+                }
+            },
+            async move {
+                while let Some(event) = exceptions.next().await {
+                    eprintln!("[browser:exception] {:?}", event);
+                }
+            },
+        )
+        .map(|_| ()),
+    );
+
+    Ok(handle)
+}
+
 /// Run benchmarks with a specific concurrency setting, returns the results
 async fn run_benchmarks_with_concurrency(
     browser: &Browser,
@@ -157,8 +197,16 @@ async fn run_benchmarks_with_concurrency(
     iterations: u32,
     samples: u32,
     concurrency: Option<u32>,
+    verbose: bool,
 ) -> Result<BenchResults, Box<dyn std::error::Error>> {
     let page = browser.new_page("about:blank").await?;
+
+    // Register console listeners if verbose mode is enabled
+    let _console_handle = if verbose {
+        Some(register_console_listeners(&page).await?)
+    } else {
+        None
+    };
 
     let benchmarks_param = benchmarks.join(",");
     let concurrency_param = concurrency
@@ -183,16 +231,6 @@ async fn run_benchmarks_with_concurrency(
     let result: BenchOutput = loop {
         if start.elapsed() > timeout {
             return Err("Benchmark timed out after 5 minutes".into());
-        }
-
-        // Poll console logs (track count but don't print - reduces noise)
-        let logs_check = page
-            .evaluate("window.__consoleLogs ? JSON.stringify(window.__consoleLogs) : '[]'")
-            .await?;
-        if let Ok(logs_json) = logs_check.into_value::<String>() {
-            if let Ok(logs) = serde_json::from_str::<Vec<String>>(&logs_json) {
-                let _ = logs.len();
-            }
         }
 
         // Check for errors
@@ -333,7 +371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut iterations = 100u32;
     let mut samples = 10u32;
-    let mut headless = true;
+    let mut verbose = false;
     let mut concurrency: Option<u32> = None;
     let mut sweep_concurrency = false;
     let mut selected_benchmarks: Vec<String> = Vec::new();
@@ -357,8 +395,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--sweep" => {
                 sweep_concurrency = true;
             }
-            "--headed" => {
-                headless = false;
+            "--verbose" | "-v" => {
+                verbose = true;
             }
             "--list" | "-l" => {
                 println!("Available groups:");
@@ -422,7 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  --group, -g <GROUP>  Run all benchmarks in a group (can be repeated)");
                 println!("  --bench, -b <NAME>   Run specific benchmark (can be repeated)");
                 println!("  --list, -l           List available groups and benchmarks");
-                println!("  --headed             Run with visible browser window");
+                println!("  --verbose, -v        Print browser console logs to terminal");
                 println!("  --help, -h           Show this help");
                 println!();
                 println!("Groups: {}", ALL_GROUPS.join(", "));
@@ -476,22 +514,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start HTTP server
     let server_addr = start_server(crate_dir).await?;
 
-    // Configure browser
-    let mut builder = BrowserConfig::builder()
+    // Configure browser (headless)
+    let builder = BrowserConfig::builder()
         .arg("--no-sandbox")
         .arg("--disable-dev-shm-usage")
         .arg("--disable-gpu")
         .arg("--disable-cache")
-        .arg("--disable-application-cache");
-
-    if headless {
-        builder = builder.arg("--headless");
-    } else {
-        builder = builder.arg("--no-first-run");
-    }
-
-    // Set window size
-    builder = builder.window_size(1200, 800);
+        .arg("--disable-application-cache")
+        .arg("--headless")
+        .window_size(1200, 800);
 
     let config = builder.build()?;
 
@@ -552,6 +583,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 iterations,
                 samples,
                 Some(*thread_count),
+                verbose,
             )
             .await
             {
@@ -593,6 +625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             iterations,
             samples,
             concurrency,
+            verbose,
         )
         .await?;
 

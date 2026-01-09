@@ -189,6 +189,11 @@ fn jv_record_verifier_messages<const R: usize>(
 
     // P → V: CommitmentMessage (IT-PAC ciphertexts)
     let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
+
+    // P → V: MK polynomial commitment
+    let _mk_commitment = prover.commit_mk_polynomials(&setup_msg).unwrap();
+
+    // P → V: Soldering commitment (optional)
     let soldering_commit = prover.commit_soldering().unwrap();
 
     // V → P: ChallengeChi
@@ -214,17 +219,17 @@ fn jv_record_verifier_messages<const R: usize>(
 
     // V → P: ChallengeRho
     let rho = verifier.receive_disclosure(disclosure, &mut rng).unwrap();
+    let gamma = verifier.generate_lpzk_challenge(&mut rng);
 
     // P → V: OpenMessage
-    let open_msg = prover.open(rho, verifier.topology_vectors()).unwrap();
-    verifier.receive_open(open_msg).unwrap();
+    let open_msg = prover.open(rho, gamma, verifier.topology_vectors()).unwrap();
+    verifier.receive_open(open_msg, gamma).unwrap();
 
     // P → V: IT-PAC Opening
     let itpac_open_msg = prover.open_itpac().unwrap();
     assert!(verifier.verify_itpac_opening(&itpac_open_msg), "IT-PAC verification failed");
 
     // P → V: AggregatedLpzkProofMessage
-    let gamma = verifier.generate_lpzk_challenge(&mut rng);
     let lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
     let result = verifier.verify_multiplications_aggregated(lpzk_proof, gamma).unwrap();
     assert!(result, "JV Protocol verification failed during recording");
@@ -241,51 +246,46 @@ fn jv_record_verifier_messages<const R: usize>(
     }
 }
 
-/// Pre-setup prover for efficient cloning during benchmark.
+/// Runs a single prover iteration with fresh witness setup.
 #[cfg(target_arch = "wasm32")]
-struct PreSetupProver<const R: usize> {
-    prover: JVProver<R>,
-}
+fn run_prover_iteration<const R: usize>(
+    circuits: &CircuitBatch,
+    active_branches: &[usize],
+    inputs_per_rep: &[Vec<u64>],
+    soldering_constraints: &[SolderingConstraint],
+    recorded: &JVRecordedMessages,
+) {
+    let mut rng = Prg::from_seed(Block::ZERO);
 
-#[cfg(target_arch = "wasm32")]
-impl<const R: usize> PreSetupProver<R> {
-    fn new(
-        circuits: &CircuitBatch,
-        active_branches: &[usize],
-        inputs_per_rep: &[Vec<u64>],
-        soldering_constraints: &[SolderingConstraint],
-    ) -> Self {
-        let mut rng = Prg::from_seed(Block::ZERO);
-        let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
-        prover.setup(circuits, inputs_per_rep).unwrap();
-        prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
-        Self { prover }
+    // Fresh prover with fresh witness setup each iteration
+    let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    prover.setup(circuits, inputs_per_rep).unwrap();
+    prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
+
+    // Create VOLE pool for IT-PAC commitments
+    let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
+
+    // P → V: CommitmentMessage (IT-PAC ciphertexts)
+    let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
+
+    // P → V: MK polynomial commitment
+    let _mk_commitment = prover.commit_mk_polynomials(&recorded.setup_msg).unwrap();
+
+    // P → V: Soldering commitment (optional)
+    let _soldering_commit = prover.commit_soldering().unwrap();
+
+    let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
+
+    if let Some(ref challenge) = recorded.soldering_challenge {
+        let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
     }
 
-    fn run_iteration(&self, recorded: &JVRecordedMessages) {
-        let mut rng = Prg::from_seed(Block::ZERO);
-        let mut prover = self.prover.clone();
+    let _open_msg = prover.open(recorded.rho, recorded.gamma, &recorded.topology_vectors).unwrap();
 
-        // Create VOLE pool for IT-PAC commitments
-        let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
+    // IT-PAC opening
+    let _itpac_open_msg = prover.open_itpac().unwrap();
 
-        // P → V: CommitmentMessage (IT-PAC ciphertexts)
-        let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
-        let _soldering_commit = prover.commit_soldering().unwrap();
-
-        let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
-
-        if let Some(ref challenge) = recorded.soldering_challenge {
-            let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
-        }
-
-        let _open_msg = prover.open(recorded.rho, &recorded.topology_vectors).unwrap();
-
-        // IT-PAC opening
-        let _itpac_open_msg = prover.open_itpac().unwrap();
-
-        let _lpzk_proof = prover.prove_multiplications_aggregated(recorded.gamma).unwrap();
-    }
+    let _lpzk_proof = prover.prove_multiplications_aggregated(recorded.gamma).unwrap();
 }
 
 /// Benchmark VM-style JV prover with per-rep active branches.
@@ -302,32 +302,8 @@ impl<const R: usize> PreSetupProver<R> {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn jv_vm_prover(n: u32, reps: u32) -> Result<BenchResult, JsValue> {
-    use std::sync::{Arc, Mutex};
-    use wasm_bindgen_futures::JsFuture;
-
-    let result: Arc<Mutex<Option<Result<BenchResult, String>>>> = Arc::new(Mutex::new(None));
-    let result_clone = result.clone();
-
-    let _handle = web_spawn::spawn(move || {
-        let bench_result = run_vm_bench(n, reps as usize);
-        *result_clone.lock().unwrap() = Some(bench_result);
-    });
-
-    loop {
-        JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL))
-            .await
-            .unwrap();
-        if let Some(r) = result.lock().unwrap().take() {
-            return r.map_err(|e| JsValue::from_str(&e));
-        }
-        let promise = js_sys::Promise::new(&mut |resolve, _| {
-            web_sys::window()
-                .unwrap()
-                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 10)
-                .unwrap();
-        });
-        JsFuture::from(promise).await.unwrap();
-    }
+    // Run synchronously (blocking but simpler than web_spawn for benchmarks)
+    run_vm_bench(n, reps as usize).map_err(|e| JsValue::from_str(&e))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -347,7 +323,7 @@ fn run_vm_bench(n: u32, reps: usize) -> Result<BenchResult, String> {
     macro_rules! run_bench {
         ($r:expr) => {{
             const R: usize = $r;
-            let (inputs, branches, final_acc) = generate_vm_inputs_per_rep(R);
+            let (inputs, branches, _final_acc) = generate_vm_inputs_per_rep(R);
 
             // Record verifier messages (not timed)
             let recorded = jv_record_verifier_messages::<R>(
@@ -357,13 +333,10 @@ fn run_vm_bench(n: u32, reps: usize) -> Result<BenchResult, String> {
                 &soldering,
             );
 
-            // Pre-setup prover once (setup is not part of benchmark)
-            let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
-
             web_sys::console::log_1(
                 &format!(
-                    "[jv_vm] R={}, mults/circuit={}, final_acc={}, starting {} iterations",
-                    R, num_mults, final_acc, n
+                    "[jv_vm] R={}, mults/circuit={}, starting {} iterations",
+                    R, num_mults, n
                 )
                 .into(),
             );
@@ -373,8 +346,14 @@ fn run_vm_bench(n: u32, reps: usize) -> Result<BenchResult, String> {
             for i in 0..n {
                 let start = performance.now();
 
-                // Clone pre-setup prover and run iteration
-                pre_setup.run_iteration(&recorded);
+                // Fresh prover with fresh witness each iteration
+                run_prover_iteration::<R>(
+                    &circuits,
+                    &branches,
+                    &inputs,
+                    &soldering,
+                    &recorded,
+                );
 
                 total_elapsed_ms += performance.now() - start;
 
@@ -406,16 +385,11 @@ fn run_vm_bench(n: u32, reps: usize) -> Result<BenchResult, String> {
     }
 
     match reps {
-        10 => run_bench!(10),
-        100 => run_bench!(100),
         1000 => run_bench!(1000),
         2000 => run_bench!(2000),
         3000 => run_bench!(3000),
-        10000 => run_bench!(10000),
-        25000 => run_bench!(25000),
-        100000 => run_bench!(100000),
         _ => Err(format!(
-            "Unsupported reps value: {}. Supported: 10, 100, 1000, 2000, 3000, 10000, 25000, 100000",
+            "Unsupported reps value: {}. Supported: 1000, 2000, 3000",
             reps
         )),
     }

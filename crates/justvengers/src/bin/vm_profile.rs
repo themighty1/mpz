@@ -242,26 +242,20 @@ fn run_protocol_only<const R: usize>(
 ) {
     let mut rng = Prg::from_seed(Block::ZERO);
 
-    // Setup done ONCE outside the profiling loop
-    eprintln!("Setting up prover (one-time)...");
-    let setup_start = Instant::now();
-    let mut base_prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
-    base_prover.setup(circuits, inputs_per_rep).unwrap();
-    base_prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
-    eprintln!("Setup done in {:.2} ms", setup_start.elapsed().as_secs_f64() * 1000.0);
-
-    // Now profile ONLY the protocol phases (commit, disclose, open, prove)
-    eprintln!("\n=== PROFILING ZONE START (protocol phases only) ===");
+    // Profile full prover work (fresh witness each iteration)
+    eprintln!("\n=== PROFILING ZONE START (fresh witness) ===");
     let profile_start = Instant::now();
 
     for i in 0..iters {
-        // Clone the setup prover to reset state
-        let mut prover = base_prover.clone();
+        // Fresh prover with fresh witness each iteration
+        let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+        prover.setup(circuits, inputs_per_rep).unwrap();
+        prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
         // Create VOLE pool for IT-PAC
         let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
 
-        // Protocol phases only - this is what we're profiling
+        // Protocol phases
         let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
         let _soldering_commit = prover.commit_soldering().unwrap();
         let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();

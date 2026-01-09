@@ -201,25 +201,11 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "ferret_sender", name: "ferret_sender/100k", fn: (n) => wasm.ferret_sender(n, 100000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         { category: "ferret_sender", name: "ferret_sender/1m", fn: (n) => wasm.ferret_sender(n, 1000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         { category: "ferret_sender", name: "ferret_sender/10m", fn: (n) => wasm.ferret_sender(n, 10000000, concurrency), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        // jv_prover benchmarks (Justvengers ZK prover)
-        // Parameters: n=iterations, branches, mults, reps
-        { category: "jv_prover", name: "jv_prover/5x5x100", fn: (n) => wasm.jv_prover(n, 5, 5, 100), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_prover", name: "jv_prover/5x5x1000", fn: (n) => wasm.jv_prover(n, 5, 5, 1000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_prover", name: "jv_prover/10x10x100", fn: (n) => wasm.jv_prover(n, 10, 10, 100), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_prover", name: "jv_prover/10x10x1000", fn: (n) => wasm.jv_prover(n, 10, 10, 1000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_prover", name: "jv_prover/100x100x100", fn: (n) => wasm.jv_prover(n, 100, 100, 100), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_prover", name: "jv_prover/100x100x10k", fn: (n) => wasm.jv_prover(n, 100, 100, 10000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_prover", name: "jv_prover/100x100x100k", fn: (n) => wasm.jv_prover(n, 100, 100, 100000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         // jv_vm_prover benchmarks (VM-style JV prover with per-rep active branches)
-        // Parameters: n=iterations, reps (30 branches, 32-element state, 97 mults/circuit)
-        { category: "jv_vm_prover", name: "jv_vm_prover/10", fn: (n) => wasm.jv_vm_prover(n, 10), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_vm_prover", name: "jv_vm_prover/100", fn: (n) => wasm.jv_vm_prover(n, 100), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_vm_prover", name: "jv_vm_prover/1000", fn: (n) => wasm.jv_vm_prover(n, 1000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_vm_prover", name: "jv_vm_prover/2000", fn: (n) => wasm.jv_vm_prover(n, 2000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_vm_prover", name: "jv_vm_prover/3000", fn: (n) => wasm.jv_vm_prover(n, 3000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_vm_prover", name: "jv_vm_prover/10000", fn: (n) => wasm.jv_vm_prover(n, 10000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_vm_prover", name: "jv_vm_prover/25000", fn: (n) => wasm.jv_vm_prover(n, 25000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
-        { category: "jv_vm_prover", name: "jv_vm_prover/100000", fn: (n) => wasm.jv_vm_prover(n, 100000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        // 60 branches, 16-element state, ~49 mults/circuit. Parameters: n=iterations, reps
+        { category: "jv_vm_prover", name: "jv_vm_prover/1k", fn: (n) => wasm.jv_vm_prover(n, 1000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "jv_vm_prover", name: "jv_vm_prover/2k", fn: (n) => wasm.jv_vm_prover(n, 2000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "jv_vm_prover", name: "jv_vm_prover/3k", fn: (n) => wasm.jv_vm_prover(n, 3000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
     ];
 }
 

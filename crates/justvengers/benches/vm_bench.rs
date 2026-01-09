@@ -1,24 +1,21 @@
-//! VM-style benchmark for Justvengers prover with per-rep active branches.
-//!
-//! Simulates a simple VM with:
-//! - 60 opcodes (branches)
-//! - 16-element state vectors
-//! - ~49 multiplications per circuit
-//! - State soldering across repetitions
+//! JV VM benchmark with fresh witness each iteration.
 //!
 //! Run with: cargo bench -p mpz-justvengers --bench vm_bench
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use futures::executor::block_on;
+use serio::{SinkExt, stream::IoStreamExt};
 
 use mpz_justvengers::{
     Circuit, CircuitBatch, SolderingConstraint,
     topology::TopologyVector,
     soldering::SolderingChallengeMessage,
-    // JustVengers O(R+B+C) optimized prover with IT-PAC
     JVProver, JVVerifier, JVSetupMessage, ItMacFieldType,
+    MKCommitmentMessage,
     extract_verifier_shares_from_pool,
 };
 use mpz_justvengers_core::{VolePool, GlobalKey};
+use mpz_common::context::{Context, recording_st_context_with_limit, replay_st_context};
 
 use mpz_core::{prg::Prg, Block};
 use mpz_fields::goldilocks::GOLDILOCKS;
@@ -27,65 +24,14 @@ use rand::{Rng, SeedableRng};
 const MODULUS: u64 = GOLDILOCKS;
 const NUM_BRANCHES: usize = 60;
 const STATE_SIZE: usize = 16;
-const NUM_INPUTS: usize = STATE_SIZE * 2 + 1; // old_state + new_state + op
+const NUM_INPUTS: usize = STATE_SIZE * 2 + 1;
 
-// Message size computation helpers
-mod msg_size {
-    use mpz_justvengers::{
-        soldering::SolderingCommitMessage,
-        AggregatedSolderingReveal, AggregatedLpzkProofMessage,
-        // JV optimized message types
-        JVSetupMessage, JVCommitmentMessage, JVDisclosureMessage, JVOpenMessage,
-    };
-
-    pub fn soldering_commit_message(msg: &SolderingCommitMessage) -> usize {
-        8 // num_constraints: usize
-        + msg.commitment_hashes.len() * 16 // Vec<(u64, u64)>
-    }
-
-    pub fn soldering_challenge_message() -> usize {
-        16 // phi: u64 + psi: u64
-    }
-
-    pub fn aggregated_soldering_reveal(msg: &AggregatedSolderingReveal) -> usize {
-        (msg.aggregated_f1.len() + msg.aggregated_f2.len()) * 8
-    }
-
-    pub fn challenge_u64() -> usize {
-        8
-    }
-
-    // ========== JV Optimized Message Sizes ==========
-
-    pub fn jv_setup_message(msg: &JVSetupMessage) -> usize {
-        msg.eval_points.len() * 8 // Vec<u64>
-        + 8 // max_degree: usize
-        + 8 // encrypted_powers_hash: u64
-    }
-
-    pub fn jv_commitment_message(msg: &JVCommitmentMessage) -> usize {
-        8 // num_polynomials: usize
-        + msg.ciphertext_commitments.len() * 64 // Vec<Ciphertext> - estimate
-    }
-
-    /// JV Disclosure: O(R) instead of O(RC)!
-    pub fn jv_disclosure_message(msg: &JVDisclosureMessage) -> usize {
-        msg.topology_products.len() * 8 // O(R) - topology products
-        + 8 // aggregated_poly_eval: u64
-    }
-
-    pub fn jv_open_message(msg: &JVOpenMessage) -> usize {
-        // MK polynomial proofs for branch hiding
-        msg.mk_polynomials.len() * 8 * 16 // Estimate: each polynomial ~16 coefficients
-        + 8 * 4 // mk_binary_proof fields
-        + 8 * 4 // mk_sum_proof fields
-        + 8 * 4 // mk_hash_proof fields
-    }
-
-    pub fn aggregated_lpzk_proof_message(msg: &AggregatedLpzkProofMessage) -> usize {
-        msg.quotient_coeffs.len() * 8  // O(R) coefficients
-        + 8  // aggregated_check: u64
-    }
+/// Max frame length for protocol messages.
+fn max_frame_length(num_reps: usize) -> usize {
+    // With n=4096 AHE ring dimension, each ciphertext is ~64KB
+    // Encrypted powers has R ciphertexts → ~64KB per rep
+    // Plus topology vectors and overhead
+    num_reps * 80 * 1024 + 8 * 1024 * 1024
 }
 
 /// Creates a VM circuit for a specific opcode.
@@ -189,568 +135,281 @@ fn generate_vm_inputs_per_rep(num_repetitions: usize) -> (Vec<Vec<u64>>, Vec<usi
 }
 
 // ============================================================================
-// JV Optimized Protocol - O(R+B+C) Communication
+// JV Optimized Protocol - O(R+B+C) Communication with Context IO
 // ============================================================================
 
 /// Recorded verifier messages for JV protocol replay.
 #[derive(Clone)]
 struct JVRecordedMessages {
-    /// Full setup message including encrypted powers for IT-PAC
-    setup_msg: JVSetupMessage,
-    /// Global key for VOLE generation
     global_key: GlobalKey<ItMacFieldType>,
-    /// Circuit size for VOLE pool generation
     circuit_size: usize,
-    chi: u64,
-    topology_vectors: Vec<TopologyVector>,
-    soldering_challenge: Option<SolderingChallengeMessage>,
-    rho: u64,
-    gamma: u64,
-    /// Protocol communication stats.
-    stats: JVProtocolStats,
 }
 
-/// JV Protocol communication statistics.
-#[derive(Clone, Debug, Default)]
-struct JVProtocolStats {
-    prover_sent: usize,
-    prover_received: usize,
-    commitment: usize,
-    soldering_commit: usize,
-    disclosure: usize,  // This is O(R) instead of O(RC)!
-    soldering_reveal: usize,
-    open: usize,
-    lpzk: usize,
-}
-
-impl JVProtocolStats {
-    fn total(&self) -> usize {
-        self.prover_sent + self.prover_received
-    }
-
-    fn format_kb(&self) -> String {
-        format!(
-            "P→V: {:.1} KB, V→P: {:.1} KB, total: {:.1} KB",
-            self.prover_sent as f64 / 1024.0,
-            self.prover_received as f64 / 1024.0,
-            self.total() as f64 / 1024.0
-        )
-    }
-
-    fn format_breakdown(&self) -> String {
-        format!(
-            "  commit: {:.1} KB, solder_commit: {:.1} KB, disclosure: {:.1} KB, solder_reveal: {:.1} KB, open: {:.1} KB, lpzk: {:.1} KB",
-            self.commitment as f64 / 1024.0,
-            self.soldering_commit as f64 / 1024.0,
-            self.disclosure as f64 / 1024.0,
-            self.soldering_reveal as f64 / 1024.0,
-            self.open as f64 / 1024.0,
-            self.lpzk as f64 / 1024.0,
-        )
-    }
-}
-
-/// Records JV verifier messages for replay benchmarking.
-fn jv_record_verifier_messages<const R: usize>(
+/// Runs the full JV protocol with prover and verifier using context IO.
+/// Records verifier->prover messages (V→P communication).
+async fn run_protocol_record_verifier<const R: usize>(
+    ctx_p: &mut Context,
+    ctx_v: &mut Context,
     circuits: &CircuitBatch,
     active_branches: &[usize],
     inputs_per_rep: &[Vec<u64>],
     soldering_constraints: &[SolderingConstraint],
 ) -> JVRecordedMessages {
     let mut rng = Prg::from_seed(Block::ZERO);
-    let mut stats = JVProtocolStats::default();
 
-    // Use JVProver with IT-PAC
+    // Setup prover
     let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
     prover.setup(circuits, inputs_per_rep).unwrap();
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
+    // Setup verifier
     let mut verifier = JVVerifier::<R>::new(MODULUS, &mut rng);
     let setup_msg = verifier.setup(circuits, &mut rng).unwrap();
     verifier.setup_soldering(soldering_constraints.to_vec()).unwrap();
 
-    // V → P: SetupMessage (includes encrypted powers for IT-PAC)
-    stats.prover_received += msg_size::jv_setup_message(&setup_msg);
-
     let topology_vectors = verifier.topology_vectors().to_vec();
-
-    // Create VOLE pool for IT-PAC commitments
     let circuit_size = circuits.get(0).map(|c| c.num_wires()).unwrap_or(10);
     let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
 
-    // Extract verifier shares before passing pool to prover
     let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
     verifier.set_verifier_local_keys(verifier_shares);
 
-    // P → V: CommitmentMessage (IT-PAC ciphertexts)
-    let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
-    let commit_size = msg_size::jv_commitment_message(&commitment);
-    stats.prover_sent += commit_size;
-    stats.commitment = commit_size;
+    // V → P: Setup message
+    ctx_v.io_mut().send(setup_msg.clone()).await.unwrap();
+    let setup_msg_recv: JVSetupMessage = ctx_p.io_mut().expect_next().await.unwrap();
 
-    // P → V: MK polynomial commitments (for ZK branch hiding)
-    let _mk_commitment = prover.commit_mk_polynomials(&setup_msg).unwrap();
+    // P → V: Commitment
+    let commitment = prover.commit(&setup_msg_recv, vole_pool).unwrap();
+    ctx_p.io_mut().send(commitment.clone()).await.unwrap();
+    let commitment_recv = ctx_v.io_mut().expect_next().await.unwrap();
 
-    // P → V: SolderingCommitMessage (optional)
+    // P → V: MK polynomial commitment
+    let mk_commitment = prover.commit_mk_polynomials(&setup_msg_recv).unwrap();
+    ctx_p.io_mut().send(mk_commitment.clone()).await.unwrap();
+    let _mk_commitment_recv: MKCommitmentMessage = ctx_v.io_mut().expect_next().await.unwrap();
+
+    // P → V: Soldering commitment (optional)
     let soldering_commit = prover.commit_soldering().unwrap();
-    if let Some(ref commit) = soldering_commit {
-        let size = msg_size::soldering_commit_message(commit);
-        stats.prover_sent += size;
-        stats.soldering_commit = size;
-    }
+    ctx_p.io_mut().send(soldering_commit.clone()).await.unwrap();
+    let soldering_commit_recv = ctx_v.io_mut().expect_next().await.unwrap();
 
-    // V → P: ChallengeChi
-    let chi = verifier.receive_commitment(commitment).unwrap();
-    stats.prover_received += msg_size::challenge_u64();
+    // V → P: Chi challenge
+    let chi = verifier.receive_commitment(commitment_recv).unwrap();
+    ctx_v.io_mut().send(chi).await.unwrap();
+    let chi_recv: u64 = ctx_p.io_mut().expect_next().await.unwrap();
 
-    // V → P: SolderingChallengeMessage (optional)
-    let soldering_challenge = if let Some(commit) = soldering_commit {
-        let challenge = verifier.receive_soldering_commit(commit, &mut rng).unwrap();
-        if challenge.is_some() {
-            stats.prover_received += msg_size::soldering_challenge_message();
-        }
-        challenge
+    // V → P: Topology vectors
+    ctx_v.io_mut().send(topology_vectors.clone()).await.unwrap();
+    let topology_vectors_recv: Vec<TopologyVector> = ctx_p.io_mut().expect_next().await.unwrap();
+
+    // V → P: Soldering challenge (optional)
+    let soldering_challenge = if let Some(commit) = soldering_commit_recv {
+        verifier.receive_soldering_commit(commit, &mut rng).unwrap()
     } else {
         None
     };
+    ctx_v.io_mut().send(soldering_challenge.clone()).await.unwrap();
+    let soldering_challenge_recv: Option<SolderingChallengeMessage> = ctx_p.io_mut().expect_next().await.unwrap();
 
-    // P → V: DisclosureMessage - THIS IS O(R) instead of O(RC)!
-    let disclosure = prover.disclose(chi, verifier.topology_vectors()).unwrap();
-    let disclosure_size = msg_size::jv_disclosure_message(&disclosure);
-    stats.prover_sent += disclosure_size;
-    stats.disclosure = disclosure_size;
+    // P → V: Disclosure
+    let disclosure = prover.disclose(chi_recv, &topology_vectors_recv).unwrap();
+    ctx_p.io_mut().send(disclosure.clone()).await.unwrap();
+    let disclosure_recv = ctx_v.io_mut().expect_next().await.unwrap();
 
-    // P → V: AggregatedSolderingReveal (optional) - O(R) instead of O(S×R)!
-    if let Some(ref challenge) = soldering_challenge {
+    // P → V: Soldering reveal (optional)
+    if let Some(ref challenge) = soldering_challenge_recv {
         let reveal = prover.reveal_soldering_aggregated(challenge).unwrap();
-        if let Some(ref rev) = reveal {
-            let size = msg_size::aggregated_soldering_reveal(rev);
-            stats.prover_sent += size;
-            stats.soldering_reveal = size;
+        ctx_p.io_mut().send(reveal.clone()).await.unwrap();
+        let reveal_recv = ctx_v.io_mut().expect_next().await.unwrap();
+        if let Some(ref rev) = reveal_recv {
             verifier.receive_soldering_reveal_aggregated(rev).unwrap();
         }
     }
 
-    // V → P: ChallengeRho
-    let rho = verifier.receive_disclosure(disclosure, &mut rng).unwrap();
-    stats.prover_received += msg_size::challenge_u64();
+    // V → P: Rho challenge
+    let rho = verifier.receive_disclosure(disclosure_recv, &mut rng).unwrap();
+    ctx_v.io_mut().send(rho).await.unwrap();
+    let rho_recv: u64 = ctx_p.io_mut().expect_next().await.unwrap();
 
-    // V → P: ChallengeGamma (for MK polynomial proofs)
+    // V → P: Gamma challenge
     let gamma = verifier.generate_lpzk_challenge(&mut rng);
-    stats.prover_received += msg_size::challenge_u64();
+    ctx_v.io_mut().send(gamma).await.unwrap();
+    let gamma_recv: u64 = ctx_p.io_mut().expect_next().await.unwrap();
 
-    // P → V: OpenMessage
-    let open_msg = prover.open(rho, gamma, verifier.topology_vectors()).unwrap();
-    let open_size = msg_size::jv_open_message(&open_msg);
-    stats.prover_sent += open_size;
-    stats.open = open_size;
+    // P → V: Open message
+    let open_msg = prover.open(rho_recv, gamma_recv, &topology_vectors_recv).unwrap();
+    ctx_p.io_mut().send(open_msg.clone()).await.unwrap();
+    let open_msg_recv = ctx_v.io_mut().expect_next().await.unwrap();
+    verifier.receive_open(open_msg_recv, gamma).unwrap();
 
-    verifier.receive_open(open_msg, gamma).unwrap();
-
-    // P → V: IT-PAC Opening (polynomials + MAC tags)
+    // P → V: IT-PAC opening
     let itpac_open_msg = prover.open_itpac().unwrap();
-    assert!(verifier.verify_itpac_opening(&itpac_open_msg), "IT-PAC verification failed");
+    ctx_p.io_mut().send(itpac_open_msg.clone()).await.unwrap();
+    let itpac_open_msg_recv = ctx_v.io_mut().expect_next().await.unwrap();
+    assert!(verifier.verify_itpac_opening(&itpac_open_msg_recv), "IT-PAC verification failed");
 
-    // P → V: AggregatedLpzkProofMessage - O(R) instead of O(M×R)!
-    // gamma already generated above before open()
-    let lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
-    let lpzk_size = msg_size::aggregated_lpzk_proof_message(&lpzk_proof);
-    stats.prover_sent += lpzk_size;
-    stats.lpzk = lpzk_size;
-
-    let result = verifier.verify_multiplications_aggregated(lpzk_proof, gamma).unwrap();
+    // P → V: LPZK proof
+    let lpzk_proof = prover.prove_multiplications_aggregated(gamma_recv).unwrap();
+    ctx_p.io_mut().send(lpzk_proof.clone()).await.unwrap();
+    let lpzk_proof_recv = ctx_v.io_mut().expect_next().await.unwrap();
+    let result = verifier.verify_multiplications_aggregated(lpzk_proof_recv, gamma).unwrap();
     assert!(result, "JV Protocol verification failed during recording");
 
     JVRecordedMessages {
-        setup_msg,
         global_key: verifier.global_key().clone(),
         circuit_size,
-        chi,
-        topology_vectors,
-        soldering_challenge,
-        rho,
-        gamma,
-        stats,
     }
 }
 
-/// Pre-setup prover for efficient cloning during benchmark.
-struct PreSetupProver<const R: usize> {
-    prover: JVProver<R>,
-}
-
-impl<const R: usize> PreSetupProver<R> {
-    fn new(
-        circuits: &CircuitBatch,
-        active_branches: &[usize],
-        inputs_per_rep: &[Vec<u64>],
-        soldering_constraints: &[SolderingConstraint],
-    ) -> Self {
-        let mut rng = Prg::from_seed(Block::ZERO);
-        let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
-        prover.setup(circuits, inputs_per_rep).unwrap();
-        prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
-        Self { prover }
-    }
-
-    fn run_iteration(&self, recorded: &JVRecordedMessages) {
-        let mut rng = Prg::from_seed(Block::ZERO);
-        let mut prover = self.prover.clone();
-
-        // Create VOLE pool for IT-PAC commitments
-        let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
-
-        // P → V: CommitmentMessage (IT-PAC ciphertexts)
-        let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
-        // P → V: MK polynomial commitments (for ZK branch hiding)
-        let _mk_commitment = prover.commit_mk_polynomials(&recorded.setup_msg).unwrap();
-        let _soldering_commit = prover.commit_soldering().unwrap();
-
-        let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
-
-        if let Some(ref challenge) = recorded.soldering_challenge {
-            let _ = prover.reveal_soldering_aggregated(challenge).unwrap();
-        }
-
-        let _open_msg = prover.open(recorded.rho, recorded.gamma, &recorded.topology_vectors).unwrap();
-
-        // IT-PAC opening
-        let _itpac_open_msg = prover.open_itpac().unwrap();
-
-        let _lpzk_proof = prover.prove_multiplications_aggregated(recorded.gamma).unwrap();
-    }
-}
-
-/// Runs JV prover with replay (legacy function for compatibility).
-fn jv_run_prover_with_replay<const R: usize>(
+/// Records verifier->prover messages for prover replay.
+/// Returns (recorded_bytes, recorded_messages).
+fn record_for_prover<const R: usize>(
     circuits: &CircuitBatch,
     active_branches: &[usize],
     inputs_per_rep: &[Vec<u64>],
     soldering_constraints: &[SolderingConstraint],
-    recorded: &JVRecordedMessages,
+) -> (Vec<u8>, JVRecordedMessages) {
+    block_on(async {
+        // Recording buffer: ~150KB per rep + 16MB base (for n=4096 AHE)
+        let buffer_size = R * 150 * 1024 + 16 * 1024 * 1024;
+        let (mut ctx_p, mut ctx_v, recorded) =
+            recording_st_context_with_limit(buffer_size, max_frame_length(R));
+        let messages = run_protocol_record_verifier::<R>(
+            &mut ctx_p, &mut ctx_v, circuits, active_branches, inputs_per_rep, soldering_constraints
+        ).await;
+        (recorded.lock().unwrap().clone(), messages)
+    })
+}
+
+/// Runs prover only with replay context.
+async fn run_prover_with_replay<const R: usize>(
+    ctx: &mut Context,
+    circuits: &CircuitBatch,
+    active_branches: &[usize],
+    inputs_per_rep: &[Vec<u64>],
+    soldering_constraints: &[SolderingConstraint],
+    recorded_messages: &JVRecordedMessages,
 ) {
-    let pre_setup = PreSetupProver::<R>::new(circuits, active_branches, inputs_per_rep, soldering_constraints);
-    pre_setup.run_iteration(recorded);
+    let mut rng = Prg::from_seed(Block::ZERO);
+
+    // Fresh prover with fresh witness setup each iteration
+    let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    prover.setup(circuits, inputs_per_rep).unwrap();
+    prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
+
+    // Create VOLE pool for IT-PAC commitments
+    let vole_pool = VolePool::generate(&recorded_messages.global_key, recorded_messages.circuit_size * 2, &mut rng);
+
+    // V → P: Setup message
+    let setup_msg: JVSetupMessage = ctx.io_mut().expect_next().await.unwrap();
+
+    // P → V: Commitment
+    let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
+    ctx.io_mut().send(commitment).await.unwrap();
+
+    // P → V: MK polynomial commitment
+    let mk_commitment = prover.commit_mk_polynomials(&setup_msg).unwrap();
+    ctx.io_mut().send(mk_commitment).await.unwrap();
+
+    // P → V: Soldering commitment
+    let soldering_commit = prover.commit_soldering().unwrap();
+    ctx.io_mut().send(soldering_commit).await.unwrap();
+
+    // V → P: Chi challenge
+    let chi: u64 = ctx.io_mut().expect_next().await.unwrap();
+
+    // V → P: Topology vectors
+    let topology_vectors: Vec<TopologyVector> = ctx.io_mut().expect_next().await.unwrap();
+
+    // V → P: Soldering challenge
+    let soldering_challenge: Option<SolderingChallengeMessage> = ctx.io_mut().expect_next().await.unwrap();
+
+    // P → V: Disclosure
+    let disclosure = prover.disclose(chi, &topology_vectors).unwrap();
+    ctx.io_mut().send(disclosure).await.unwrap();
+
+    // P → V: Soldering reveal
+    if let Some(ref challenge) = soldering_challenge {
+        let reveal = prover.reveal_soldering_aggregated(challenge).unwrap();
+        ctx.io_mut().send(reveal).await.unwrap();
+    }
+
+    // V → P: Rho challenge
+    let rho: u64 = ctx.io_mut().expect_next().await.unwrap();
+
+    // V → P: Gamma challenge
+    let gamma: u64 = ctx.io_mut().expect_next().await.unwrap();
+
+    // P → V: Open message
+    let open_msg = prover.open(rho, gamma, &topology_vectors).unwrap();
+    ctx.io_mut().send(open_msg).await.unwrap();
+
+    // P → V: IT-PAC opening
+    let itpac_open_msg = prover.open_itpac().unwrap();
+    ctx.io_mut().send(itpac_open_msg).await.unwrap();
+
+    // P → V: LPZK proof
+    let lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
+    ctx.io_mut().send(lpzk_proof).await.unwrap();
 }
 
 // ============================================================================
 // Benchmarks
 // ============================================================================
 
-/// Benchmark VM prover - JustVengers O(R+B+C) protocol.
-///
-/// Uses aggregated LPZK proof which doesn't require VOLE correlations.
-fn bench_vm_prover_with_vole(c: &mut Criterion) {
-    let mut group = c.benchmark_group("vm_prover_with_vole");
+/// Benchmark JV VM prover with fresh witness each iteration.
+fn bench_jv_vm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jv_vm");
     group.sample_size(10);
 
     let circuits = create_vm_circuit_batch();
     let sample_circuit = circuits.get(0).unwrap();
     let state_offset = state_output_offset(sample_circuit);
     let soldering = create_soldering_constraints(state_offset);
-
     let num_mults = sample_circuit.num_mults();
 
-    // 100 reps with VOLE - JV protocol
-    {
-        const R: usize = 100;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-
-        let recorded = jv_record_verifier_messages::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-        );
-
-        // Pre-setup prover once (setup is not part of benchmark)
-        let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
-
-        // Run once to get stats
-        pre_setup.run_iteration(&recorded);
-        println!("\n[JV 100 reps] Communication: {}", recorded.stats.format_kb());
-        println!("{}", recorded.stats.format_breakdown());
-        println!("[JV 100 reps] VOLEs consumed: 0, OTs consumed: 0");
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function(BenchmarkId::new("jv_with_vole", "100_reps"), |b| {
-            b.iter(|| {
-                pre_setup.run_iteration(&recorded);
-                black_box(())
-            });
-        });
-    }
-
-    // 1000 reps with VOLE - JV protocol
+    // 1K reps
     {
         const R: usize = 1000;
         let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
 
-        let recorded = jv_record_verifier_messages::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-        );
-
-        // Pre-setup prover once (setup is not part of benchmark)
-        let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
-
-        // Run once to get stats
-        pre_setup.run_iteration(&recorded);
-        println!("\n[JV 1K reps] Communication: {}", recorded.stats.format_kb());
-        println!("{}", recorded.stats.format_breakdown());
-        println!("[JV 1K reps] VOLEs consumed: 0, OTs consumed: 0");
+        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
 
         let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
         group.throughput(Throughput::Elements(total_mults));
 
-        group.bench_function(BenchmarkId::new("jv_with_vole", "1K_reps"), |b| {
-            b.iter(|| {
-                pre_setup.run_iteration(&recorded);
-                black_box(())
-            });
-        });
-    }
-
-    // 10000 reps - JV protocol
-    {
-        const R: usize = 10000;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-
-        let recorded = jv_record_verifier_messages::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-        );
-
-        // Pre-setup prover once (setup is not part of benchmark)
-        let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
-
-        pre_setup.run_iteration(&recorded);
-        println!("\n[JV 10K reps] Communication: {}", recorded.stats.format_kb());
-        println!("{}", recorded.stats.format_breakdown());
-        println!("[JV 10K reps] VOLEs consumed: 0, OTs consumed: 0");
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function(BenchmarkId::new("jv_with_vole", "10K_reps"), |b| {
-            b.iter(|| {
-                pre_setup.run_iteration(&recorded);
-                black_box(())
-            });
-        });
-    }
-
-    // 25000 reps - JV protocol
-    {
-        const R: usize = 25000;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-
-        let recorded = jv_record_verifier_messages::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-        );
-
-        // Pre-setup prover once (setup is not part of benchmark)
-        let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
-
-        pre_setup.run_iteration(&recorded);
-        println!("\n[JV 25K reps] Communication: {}", recorded.stats.format_kb());
-        println!("{}", recorded.stats.format_breakdown());
-        println!("[JV 25K reps] VOLEs consumed: 0, OTs consumed: 0");
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function(BenchmarkId::new("jv_with_vole", "25K_reps"), |b| {
-            b.iter(|| {
-                pre_setup.run_iteration(&recorded);
-                black_box(())
-            });
-        });
-    }
-
-    // 50000 reps - JV protocol
-    {
-        const R: usize = 50000;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-
-        let recorded = jv_record_verifier_messages::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-        );
-
-        // Pre-setup prover once (setup is not part of benchmark)
-        let pre_setup = PreSetupProver::<R>::new(&circuits, &branches, &inputs, &soldering);
-
-        pre_setup.run_iteration(&recorded);
-        println!("\n[JV 50K reps] Communication: {}", recorded.stats.format_kb());
-        println!("{}", recorded.stats.format_breakdown());
-        println!("[JV 50K reps] VOLEs consumed: 0, OTs consumed: 0");
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function(BenchmarkId::new("jv_with_vole", "50K_reps"), |b| {
-            b.iter(|| {
-                pre_setup.run_iteration(&recorded);
-                black_box(())
-            });
-        });
-    }
-
-    group.finish();
-}
-
-/// Benchmark with actual recorded communication bytes.
-///
-/// Uses mpz-common recording infrastructure to measure actual serialized bytes.
-fn bench_vm_recorded_communication(c: &mut Criterion) {
-    use futures::executor::block_on;
-    use mpz_common::context::replay_st_context;
-    use mpz_justvengers::protocol::run_prover;
-
-    let mut group = c.benchmark_group("vm_recorded");
-    group.sample_size(10);
-
-    let circuits = create_vm_circuit_batch();
-    let sample_circuit = circuits.get(0).unwrap();
-    let state_offset = state_output_offset(sample_circuit);
-    let soldering = create_soldering_constraints(state_offset);
-
-    let num_mults = sample_circuit.num_mults();
-
-    // Helper to run protocol with recording
-    fn record_and_run<const R: usize>(
-        circuits: &CircuitBatch,
-        branches: &[usize],
-        inputs: &[Vec<u64>],
-        soldering: &[SolderingConstraint],
-    ) -> (Vec<u8>, usize) {
-        use futures::executor::block_on;
-        use mpz_common::context::recording_st_context_with_limit;
-        use mpz_justvengers::protocol::{run_prover, run_verifier};
-
-        // Large buffer for recording
-        const IO_BUFFER: usize = 64 * 1024 * 1024; // 64 MB
-        const MAX_FRAME: usize = 16 * 1024 * 1024; // 16 MB frames
-
-        block_on(async {
-            let (mut ctx_p, mut ctx_v, recorded) =
-                recording_st_context_with_limit(IO_BUFFER, MAX_FRAME);
-
-            let circuits_v = circuits.clone();
-            let soldering_v = soldering.to_vec();
-
-            // Run protocol
-            let mut rng = Prg::from_seed(Block::ZERO);
-
-            let result = futures::join!(
-                run_prover::<R>(
-                    &mut ctx_p,
-                    circuits,
-                    branches,
-                    inputs,
-                    soldering,
-                    MODULUS,
-                ),
-                run_verifier::<R, _>(
-                    &mut ctx_v,
-                    &circuits_v,
-                    &soldering_v,
-                    MODULUS,
-                    &mut rng,
-                )
-            );
-
-            // Check both sides succeeded
-            result.0.unwrap();
-            result.1.unwrap();
-
-            let recorded_bytes = recorded.lock().unwrap().clone();
-            let bytes_v_to_p = recorded_bytes.len();
-            (recorded_bytes, bytes_v_to_p)
-        })
-    }
-
-    // 100 reps
-    {
-        const R: usize = 100;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-
-        // Record once to get bytes
-        let (recorded_bytes, bytes_v_to_p) = record_and_run::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-        );
-
-        println!("\n[100 reps] Recorded V→P: {:.1} KB", bytes_v_to_p as f64 / 1024.0);
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function(BenchmarkId::new("recorded", "100_reps"), |b| {
+        group.bench_function(BenchmarkId::new("fresh_witness", "1K"), |b| {
             b.iter(|| {
                 block_on(async {
-                    const MAX_FRAME: usize = 16 * 1024 * 1024;
-                    let mut ctx_p = replay_st_context(recorded_bytes.clone(), MAX_FRAME);
-
-                    run_prover::<R>(
-                        &mut ctx_p,
-                        &circuits,
-                        &branches,
-                        &inputs,
-                        &soldering,
-                        MODULUS,
-                    ).await.unwrap();
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
                 });
                 black_box(())
             });
         });
     }
 
-    // 1000 reps
+    // 2K reps
     {
-        const R: usize = 1000;
+        const R: usize = 2000;
         let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
 
-        let (recorded_bytes, bytes_v_to_p) = record_and_run::<R>(
-            &circuits,
-            &branches,
-            &inputs,
-            &soldering,
-        );
-
-        println!("\n[1K reps] Recorded V→P: {:.1} KB", bytes_v_to_p as f64 / 1024.0);
+        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
 
         let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
         group.throughput(Throughput::Elements(total_mults));
 
-        group.bench_function(BenchmarkId::new("recorded", "1K_reps"), |b| {
+        group.bench_function(BenchmarkId::new("fresh_witness", "2K"), |b| {
             b.iter(|| {
                 block_on(async {
-                    const MAX_FRAME: usize = 16 * 1024 * 1024;
-                    let mut ctx_p = replay_st_context(recorded_bytes.clone(), MAX_FRAME);
-
-                    run_prover::<R>(
-                        &mut ctx_p,
-                        &circuits,
-                        &branches,
-                        &inputs,
-                        &soldering,
-                        MODULUS,
-                    ).await.unwrap();
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
                 });
                 black_box(())
             });
@@ -760,5 +419,5 @@ fn bench_vm_recorded_communication(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_vm_prover_with_vole, bench_vm_recorded_communication);
+criterion_group!(benches, bench_jv_vm);
 criterion_main!(benches);

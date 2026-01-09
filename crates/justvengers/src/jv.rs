@@ -58,7 +58,7 @@ use mpz_fields::Field;
 
 // IT-PAC imports for real polynomial commitments
 use mpz_justvengers_core::{
-    ahe::{Ciphertext, KeyPair, ParamSet, PublicKey},
+    ahe::{BgvParams, Ciphertext, KeyPair, PublicKey},
     EncryptedPowers, GlobalKey, ItMacField, ItPac, ItPacGenerator, VolePool,
 };
 
@@ -392,7 +392,7 @@ pub struct AggregatedLpzkProofMessage {
 /// Contains the revealed polynomial coefficients and IT-MAC tags for each
 /// wire commitment. The verifier uses these to check the IT-MAC relationship:
 /// m = k + f(Λ)·Δ
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ItPacOpenMessage {
     /// Polynomial coefficients for each wire position.
     /// polynomials[w] = coefficients of f_w(X).
@@ -1619,7 +1619,7 @@ impl<const R: usize> JVProver<R> {
         }
 
         // Step 2: Regenerate AHE keypair from seed
-        let ahe_params = ParamSet::Small.params();
+        let ahe_params = BgvParams::default();
         let mut ahe_rng = ChaCha20Rng::from_seed(revelation.ahe_seed);
         let regenerated_keypair = KeyPair::generate(&ahe_params, &mut ahe_rng);
 
@@ -1847,7 +1847,7 @@ impl<const R: usize> JVVerifier<R> {
         let ahe_seed_commitment = Self::compute_seed_commitment(&ahe_seed);
 
         // Generate AHE keypair deterministically from seed
-        let ahe_params = ParamSet::Small.params();
+        let ahe_params = BgvParams::default();
         let mut ahe_rng = ChaCha20Rng::from_seed(ahe_seed);
         let ahe_keypair = KeyPair::generate(&ahe_params, &mut ahe_rng);
 
@@ -1970,7 +1970,7 @@ impl<const R: usize> JVVerifier<R> {
         let ahe_keypair = self.ahe_keypair.as_ref().expect("AHE keypair should be initialized");
         let mut enc_rng = ChaCha20Rng::from_seed(self.ahe_seed);
         // Skip keypair generation bytes (keypair was generated from same seed)
-        let ahe_params = ParamSet::Small.params();
+        let ahe_params = BgvParams::default();
         let _ = KeyPair::generate(&ahe_params, &mut enc_rng);
         // Now generate encrypted powers with deterministic randomness
         let encrypted_powers = EncryptedPowers::generate(

@@ -170,7 +170,9 @@ impl ParamSet {
 
 impl Default for BgvParams {
     fn default() -> Self {
-        ParamSet::Small.params()
+        // Use Large (n=4096) for ~128-bit security
+        // Small (n=1024) only provides ~40-60 bit security
+        ParamSet::Large.params()
     }
 }
 

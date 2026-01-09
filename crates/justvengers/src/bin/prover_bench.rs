@@ -138,25 +138,20 @@ fn run_prover_only<const R: usize>(
 ) {
     let mut rng = Prg::from_seed(Block::ZERO);
 
-    // Setup prover once
-    eprintln!("Setting up prover...");
-    let setup_start = Instant::now();
-    let mut base_prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
-    base_prover.setup(circuits, inputs_per_rep).unwrap();
-    base_prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
-    eprintln!("Setup done in {:.2} ms", setup_start.elapsed().as_secs_f64() * 1000.0);
-
-    // Benchmark prover protocol phases
-    eprintln!("\n=== PROVER BENCHMARK START ===");
+    // Benchmark full prover work (fresh witness each iteration)
+    eprintln!("\n=== PROVER BENCHMARK START (fresh witness) ===");
     let bench_start = Instant::now();
 
     for i in 0..iters {
-        let mut prover = base_prover.clone();
+        // Fresh prover with fresh witness each iteration
+        let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+        prover.setup(circuits, inputs_per_rep).unwrap();
+        prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
         // Create VOLE pool
         let vole_pool = VolePool::generate(&msgs.global_key, msgs.circuit_size * 2, &mut rng);
 
-        // Prover protocol phases only
+        // Prover protocol phases
         let _commitment = prover.commit(&msgs.setup_msg, vole_pool).unwrap();
         let _mk_commitment = prover.commit_mk_polynomials(&msgs.setup_msg).unwrap();
         let _soldering_commit = prover.commit_soldering().unwrap();
