@@ -2,6 +2,12 @@
 //!
 //! Parameters determine security level, noise budget, and performance.
 
+/// Goldilocks prime: p = 2^64 - 2^32 + 1
+/// This prime is used in many ZK proof systems and supports NTT.
+/// For slot packing with N=8192: p-1 = 2^64 - 2^32 = 2^32(2^32 - 1)
+/// Since 2^32 is divisible by 16384 = 2^14, we have p ≡ 1 (mod 16384) ✓
+pub const GOLDILOCKS: u64 = 0xFFFFFFFF00000001; // 2^64 - 2^32 + 1 = 18446744069414584321
+
 /// BGV encryption parameters.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct BgvParams {
@@ -176,6 +182,88 @@ impl Default for BgvParams {
     }
 }
 
+/// RNS-based BGV parameters for large plaintext modulus (like Goldilocks).
+///
+/// When the plaintext modulus t is large (e.g., Goldilocks ≈ 2^64), the ciphertext
+/// modulus q must be much larger to maintain noise budget. This requires RNS
+/// representation where q = q_1 × q_2 × ... × q_k with each q_i fitting in 64 bits.
+#[derive(Clone, Debug)]
+pub struct RnsBgvParams {
+    /// Ring dimension (must be power of 2).
+    pub n: usize,
+
+    /// Plaintext modulus t.
+    pub t: u64,
+
+    /// Number of RNS moduli for ciphertext modulus q.
+    pub num_moduli: usize,
+
+    /// Standard deviation for error sampling.
+    pub sigma: f64,
+
+    /// Whether slot packing is supported (t ≡ 1 mod 2n).
+    pub supports_slots: bool,
+
+    /// Number of slots (equals n when slot packing is supported).
+    pub num_slots: usize,
+}
+
+impl RnsBgvParams {
+    /// Creates RNS BGV parameters for the Goldilocks field.
+    ///
+    /// Uses N=8192 ring dimension with 8192 slots and 4 RNS moduli (~240 bit q).
+    /// This matches the Low Gear paper configuration.
+    pub fn goldilocks() -> Self {
+        let n = 8192;
+        let t = GOLDILOCKS;
+
+        // Verify slot packing is supported
+        let order = 2 * n as u64;
+        let supports_slots = (t - 1) % order == 0;
+        assert!(supports_slots, "Goldilocks must support slot packing with N=8192");
+
+        Self {
+            n,
+            t,
+            num_moduli: 4, // ~240 bit ciphertext modulus
+            sigma: 3.2,
+            supports_slots,
+            num_slots: n,
+        }
+    }
+
+    /// Creates RNS BGV parameters with custom settings.
+    pub fn new(n: usize, t: u64, num_moduli: usize, sigma: f64) -> Self {
+        assert!(n.is_power_of_two(), "n must be power of 2");
+        assert!(n >= 64, "n must be at least 64");
+        assert!(t > 1, "t must be greater than 1");
+        assert!(num_moduli > 0, "need at least one modulus");
+
+        let order = 2 * n as u64;
+        let supports_slots = (t - 1) % order == 0;
+        let num_slots = if supports_slots { n } else { 1 };
+
+        Self {
+            n,
+            t,
+            num_moduli,
+            sigma,
+            supports_slots,
+            num_slots,
+        }
+    }
+
+    /// Returns whether this configuration supports slot packing.
+    pub fn supports_slot_packing(&self) -> bool {
+        self.supports_slots
+    }
+
+    /// Returns the number of plaintext slots per ciphertext.
+    pub fn slots(&self) -> usize {
+        self.num_slots
+    }
+}
+
 #[cfg(test)]
 mod param_tests {
     use super::*;
@@ -195,5 +283,33 @@ mod param_tests {
         let params = ParamSet::Small.params();
         assert!(params.noise_bound() > 0);
         assert!(params.noise_bound() < params.q / 2);
+    }
+
+    #[test]
+    fn test_goldilocks_constant() {
+        // Verify Goldilocks = 2^64 - 2^32 + 1
+        let expected = (1u64 << 32).wrapping_neg().wrapping_add(1);
+        assert_eq!(GOLDILOCKS, expected);
+
+        // Verify it's the right value
+        assert_eq!(GOLDILOCKS, 18446744069414584321);
+    }
+
+    #[test]
+    fn test_goldilocks_slot_packing_support() {
+        // Goldilocks should support slot packing with N=8192
+        let order = 2 * 8192u64; // 16384
+        let remainder = (GOLDILOCKS - 1) % order;
+        assert_eq!(remainder, 0, "Goldilocks-1 must be divisible by 16384");
+    }
+
+    #[test]
+    fn test_rns_bgv_params_goldilocks() {
+        let params = RnsBgvParams::goldilocks();
+        assert_eq!(params.n, 8192);
+        assert_eq!(params.t, GOLDILOCKS);
+        assert_eq!(params.num_moduli, 4);
+        assert!(params.supports_slot_packing());
+        assert_eq!(params.slots(), 8192);
     }
 }

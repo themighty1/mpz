@@ -18,12 +18,16 @@ mod ring;
 mod keys;
 mod ciphertext;
 mod sample;
+mod slot;
+mod rns;
 
-pub use params::{BgvParams, ParamSet};
+pub use params::{BgvParams, ParamSet, RnsBgvParams, GOLDILOCKS};
 pub use ring::{BarrettReducer, RingPoly};
 pub use keys::{SecretKey, PublicKey, KeyPair};
 pub use ciphertext::Ciphertext;
 pub use sample::DiscreteGaussian;
+pub use slot::SlotEncoder;
+pub use rns::{RnsParams, RnsParamSet, RnsPoly};
 
 #[cfg(test)]
 mod tests;
