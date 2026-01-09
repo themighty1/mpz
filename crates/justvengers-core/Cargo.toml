@@ -20,6 +20,9 @@ serde = { workspace = true, features = ["derive"] }
 rayon = { workspace = true, optional = true }
 rand = { workspace = true }
 
+# Class group cryptography for CL-based homomorphic encryption
+class_group = { path = "/tmp/class" }
+
 [dev-dependencies]
 rand = { workspace = true }
 criterion = { workspace = true }

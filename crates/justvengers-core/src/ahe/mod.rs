@@ -1,13 +1,27 @@
-//! Additively Homomorphic Encryption (BGV-style).
+//! Additively Homomorphic Encryption.
 //!
-//! This module implements BGV encryption with the following properties required
-//! by the Justvengers protocol:
-//! - CPA security (from Ring-LWE hardness)
-//! - Circuit privacy (re-randomization)
-//! - Linear targeted malleability (can compute a*c + b on encrypted c)
+//! This module provides two homomorphic encryption schemes:
+//!
+//! ## CL Encryption (Class Groups)
+//!
+//! The Castagnos-Laguillaumie scheme based on class groups of imaginary quadratic
+//! orders. Provides linear homomorphism (addition and scalar multiplication) with:
+//! - No noise accumulation (unlike BGV)
+//! - Deterministic decryption
+//! - Security from class group order computation hardness
+//!
+//! See [`cl_ahe`] module for CL-based encryption.
+//!
+//! ## BGV Encryption (Legacy)
+//!
+//! Traditional BGV lattice-based encryption with:
+//! - Ring-LWE security
+//! - Slot packing for SIMD operations
+//! - Noise management requirements
 //!
 //! # Structure
 //!
+//! - `cl_ahe`: CL-based homomorphic encryption (recommended for addition)
 //! - `params`: Parameter sets for different security levels
 //! - `ring`: Polynomial ring arithmetic R_q = Z_q[X]/(X^n + 1)
 //! - `keys`: Key generation
@@ -21,6 +35,7 @@ mod sample;
 mod slot;
 mod rns;
 mod rns_bgv;
+pub mod cl_ahe;
 
 pub use params::{BgvParams, ParamSet, RnsBgvParams, GOLDILOCKS};
 pub use ring::{BarrettReducer, RingPoly};
@@ -33,6 +48,12 @@ pub use rns_bgv::{
     RnsSecretKey, RnsPublicKey, RnsKeyPair, RnsCiphertext,
     SlotPackedEncryptedPowers, SlotPackedCiphertextBatch,
     decrypt_batched_evaluation,
+};
+
+// Re-export CL types at top level for convenience
+pub use cl_ahe::{
+    CLGroup, CLSecretKey, CLPublicKey, CLKeyPair, CLCiphertext,
+    DEFAULT_SECURITY_PARAMETER,
 };
 
 #[cfg(test)]
