@@ -1,9 +1,9 @@
-//! Verifier setup binary - generates and saves messages for prover benchmarking.
+//! Verifier setup binary for M61 - generates and saves messages for prover benchmarking.
 //!
 //! Usage:
-//!   REPS=3000 cargo run --release --bin verifier_setup
+//!   REPS=1000 cargo run --release --features mersenne --bin verifier_setup_m61
 //!
-//! Outputs: verifier_msgs_REPS.bin
+//! Outputs: verifier_msgs_m61_REPS.bin
 
 use std::env;
 use std::fs::File;
@@ -17,12 +17,12 @@ use mpz_justvengers::{
 };
 
 use mpz_core::{prg::Prg, Block};
-use mpz_fields::goldilocks::GOLDILOCKS;
+use mpz_fields::m61::M61;
 use mpz_justvengers_core::{GlobalKey, VolePool};
 use rand::{Rng, SeedableRng};
 use serde::{Serialize, Deserialize};
 
-const MODULUS: u64 = GOLDILOCKS;
+const MODULUS: u64 = M61;
 const NUM_BRANCHES: usize = 60;
 const STATE_SIZE: usize = 16;
 const NUM_INPUTS: usize = STATE_SIZE * 2 + 1;
@@ -201,7 +201,8 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1000);
 
-    eprintln!("Generating verifier messages for REPS={}...", reps);
+    eprintln!("Generating verifier messages for REPS={} using M61...", reps);
+    eprintln!("MODULUS=M61 (2^61 - 1 = {})", MODULUS);
 
     let circuits = create_vm_circuit_batch();
     let sample_circuit = circuits.get(0).unwrap();
@@ -221,7 +222,7 @@ fn main() {
         }
     };
 
-    let filename = format!("verifier_msgs_{}.bin", reps);
+    let filename = format!("verifier_msgs_m61_{}.bin", reps);
     let file = File::create(&filename).expect("Failed to create output file");
     let writer = BufWriter::new(file);
     bincode::serialize_into(writer, &msgs).expect("Failed to serialize");

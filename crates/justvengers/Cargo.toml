@@ -63,3 +63,13 @@ path = "src/bin/verifier_setup.rs"
 [[bin]]
 name = "prover_bench"
 path = "src/bin/prover_bench.rs"
+
+[[bin]]
+name = "prover_bench_m61"
+path = "src/bin/prover_bench_m61.rs"
+required-features = ["mersenne"]
+
+[[bin]]
+name = "verifier_setup_m61"
+path = "src/bin/verifier_setup_m61.rs"
+required-features = ["mersenne"]

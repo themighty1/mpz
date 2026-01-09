@@ -140,6 +140,114 @@ impl From<GoldilocksItMac> for u64 {
 }
 
 // ============================================================================
+// Mersenne IT-MAC Field (M61 = 2^61 - 1)
+// ============================================================================
+
+#[cfg(feature = "mersenne")]
+use mpz_fields::m61::M61;
+
+/// Mersenne prime field element for IT-MAC operations.
+///
+/// Uses M61 = 2^61 - 1, which has efficient modular reduction via bit operations.
+/// Note: M61 is NOT NTT-friendly (only supports 2-point NTT).
+#[cfg(feature = "mersenne")]
+#[derive(Copy, Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MersenneItMac(pub u64);
+
+#[cfg(feature = "mersenne")]
+impl MersenneItMac {
+    /// Creates a new field element.
+    pub fn new(v: u64) -> Self {
+        Self(Self::reduce(v as u128))
+    }
+
+    /// Returns the inner value.
+    pub fn inner(self) -> u64 {
+        self.0
+    }
+
+    /// Reduces a u128 value modulo M61 using the Mersenne prime property.
+    #[inline]
+    const fn reduce(x: u128) -> u64 {
+        let low = (x as u64) & M61;
+        let high = (x >> 61) as u64;
+        let sum = low + high;
+        let low2 = sum & M61;
+        let high2 = sum >> 61;
+        let result = low2 + high2;
+        if result >= M61 {
+            result - M61
+        } else {
+            result
+        }
+    }
+}
+
+#[cfg(feature = "mersenne")]
+impl Add for MersenneItMac {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self(Self::reduce(self.0 as u128 + rhs.0 as u128))
+    }
+}
+
+#[cfg(feature = "mersenne")]
+impl Sub for MersenneItMac {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        Self(Self::reduce(self.0 as u128 + M61 as u128 - rhs.0 as u128))
+    }
+}
+
+#[cfg(feature = "mersenne")]
+impl Mul for MersenneItMac {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self {
+        Self(Self::reduce(self.0 as u128 * rhs.0 as u128))
+    }
+}
+
+#[cfg(feature = "mersenne")]
+impl ItMacField for MersenneItMac {
+    fn zero() -> Self {
+        Self(0)
+    }
+    fn one() -> Self {
+        Self(1)
+    }
+    fn random<R: Rng>(rng: &mut R) -> Self {
+        // Rejection sampling for uniform distribution
+        loop {
+            let value = rng.next_u64() & M61;
+            if value < M61 {
+                return Self(value);
+            }
+        }
+    }
+    fn neg(self) -> Self {
+        if self.0 == 0 {
+            Self(0)
+        } else {
+            Self(M61 - self.0)
+        }
+    }
+}
+
+#[cfg(feature = "mersenne")]
+impl From<u64> for MersenneItMac {
+    fn from(v: u64) -> Self {
+        Self::new(v)
+    }
+}
+
+#[cfg(feature = "mersenne")]
+impl From<MersenneItMac> for u64 {
+    fn from(v: MersenneItMac) -> u64 {
+        v.0
+    }
+}
+
+// ============================================================================
 // Message Types - O(R+B+C) communication
 // ============================================================================
 
