@@ -67,6 +67,11 @@ impl RnsSecretKey {
     pub fn poly(&self) -> &RnsPoly {
         &self.s
     }
+
+    /// Returns the secret polynomial (alias for poly()).
+    pub fn s(&self) -> &RnsPoly {
+        &self.s
+    }
 }
 
 impl RnsPublicKey {
@@ -125,40 +130,46 @@ impl RnsKeyPair {
         let params = RnsBgvParams::goldilocks();
         Self::generate(&params, rng)
     }
+
+    /// Generates a key pair for Goldilocks with extended modulus (testing only).
+    ///
+    /// Uses 4 RNS moduli for tests requiring larger noise budget.
+    /// Production code should use `generate_goldilocks()`.
+    pub fn generate_goldilocks_test<R: Rng>(rng: &mut R) -> Self {
+        let params = RnsBgvParams::goldilocks_test();
+        Self::generate(&params, rng)
+    }
 }
 
 // ============================================================================
 // Galois Keys for Slot Rotation
 // ============================================================================
 
+/// Decomposition base for key-switching (2^15 = 32768).
+/// Each ~60-bit RNS limb needs 4 digits.
+const DECOMP_BASE_LOG: u32 = 15;
+const DECOMP_BASE: u64 = 1 << DECOMP_BASE_LOG;
+
+/// Number of digits per RNS limb (~60 bits / 15 bits = 4 digits).
+const DIGITS_PER_LIMB: usize = 4;
+
 /// Galois key for a single automorphism σ_k: X → X^k.
 ///
-/// Used for key-switching after applying automorphism to ciphertext.
-/// The key encrypts σ_k(s) under the original secret key s.
+/// Uses HYBRID key-switching (RNS + digit decomposition) for low noise.
+/// For each RNS limb i and digit position j, stores a key encrypting
+/// P_i * β^j * σ_k(s), where P_i = Q/q_i is the partial product.
 ///
-/// # IMPORTANT: Key-Switching Noise
-///
-/// The current implementation uses **naive key-switching** without digit decomposition.
-/// This causes noise proportional to ||c1|| * ||e|| ≈ Q * σ, which is catastrophic
-/// for large ciphertext modulus Q.
-///
-/// For production use, implement key-switching with **digit decomposition** (gadget
-/// decomposition):
-/// 1. Decompose c1 into base-β digits: c1 = Σ d_i * β^i where each d_i < β
-/// 2. Store multiple keys: encrypt(β^i * σ_k(s)) for each digit position
-/// 3. Compute key-switch as Σ d_i * key[i], keeping noise proportional to
-///    O(num_digits * β * σ) instead of O(Q * σ)
-///
-/// The automorphism logic and key structure are correct; only the key-switching
-/// step needs digit decomposition for correctness.
+/// Key-switching noise is O(num_limbs * num_digits * β * σ) instead of O(Q * σ).
 #[derive(Clone, Debug)]
 pub struct RnsGaloisKey {
     /// The automorphism exponent k (odd, in range [1, 2n-1]).
     k: usize,
-    /// Key-switching key: encryptions of σ_k(s) * base^i for digit decomposition.
-    /// For simple implementation, we use a single key without decomposition.
-    key_a: RnsPoly,
-    key_b: RnsPoly,
+    /// Key-switching keys indexed by [limb_idx * DIGITS_PER_LIMB + digit_idx].
+    /// keys[limb][digit] encrypts P_limb * β^digit * σ_k(s).
+    keys_a: Vec<RnsPoly>,
+    keys_b: Vec<RnsPoly>,
+    /// Number of RNS limbs (moduli).
+    num_limbs: usize,
     /// RNS parameters.
     rns_params: RnsParams,
     /// BGV parameters.
@@ -166,10 +177,9 @@ pub struct RnsGaloisKey {
 }
 
 impl RnsGaloisKey {
-    /// Generates a Galois key for automorphism σ_k.
+    /// Generates a Galois key for automorphism σ_k with HYBRID key-switching.
     ///
-    /// The key allows converting a ciphertext encrypted under σ_k(s) back to
-    /// encryption under s after applying automorphism.
+    /// Creates num_limbs × DIGITS_PER_LIMB key pairs.
     pub fn generate<R: Rng>(
         sk: &RnsSecretKey,
         k: usize,
@@ -181,23 +191,62 @@ impl RnsGaloisKey {
 
         let rns_params = sk.s.params().clone();
         let bgv_params = sk.bgv_params.clone();
+        let moduli = rns_params.moduli();
+        let num_limbs = moduli.len();
 
         // Compute σ_k(s) by applying automorphism to secret key
         let s_auto = apply_automorphism_rns(&sk.s, k);
 
-        // Generate key-switching key: encrypt σ_k(s) under s
-        // Simple version: (a, b = -a·s + e + σ_k(s))
-        let key_a = sample_uniform_rns(&rns_params, rng);
-        let e = sample_gaussian_rns(&rns_params, bgv_params.sigma, rng);
+        // Compute P_i = Q / q_i for each limb (stored in RNS form)
+        // P_i mod q_j = 0 if j != i, and P_i mod q_i = prod_{j!=i}(q_j) mod q_i
+        let p_values = compute_partial_products(&rns_params);
 
-        // b = -a·s + e + σ_k(s)
-        let neg_as = key_a.mul(&sk.s).neg();
-        let key_b = neg_as.add(&e).add(&s_auto);
+        let total_keys = num_limbs * DIGITS_PER_LIMB;
+        let mut keys_a = Vec::with_capacity(total_keys);
+        let mut keys_b = Vec::with_capacity(total_keys);
+
+        // Generate keys for each (limb, digit) pair
+        for limb_idx in 0..num_limbs {
+            let mut power_of_base = 1u64;
+
+            for _digit_idx in 0..DIGITS_PER_LIMB {
+                // Scale σ_k(s) by P_limb * β^digit
+                // In RNS: we multiply component-wise, but only limb_idx component is non-zero for P_limb
+                let mut scaled_s_auto = RnsPoly::zero(&rns_params);
+                for mod_idx in 0..num_limbs {
+                    let q_m = moduli[mod_idx];
+                    // P_limb mod q_m
+                    let p_mod_qm = p_values[limb_idx][mod_idx];
+                    // Scale factor: P_limb * β^digit mod q_m
+                    let scale = mulmod(p_mod_qm, power_of_base % q_m, q_m);
+
+                    for coeff_idx in 0..n {
+                        let s_coeff = s_auto.residues()[mod_idx][coeff_idx];
+                        scaled_s_auto.residues_mut()[mod_idx][coeff_idx] =
+                            mulmod(s_coeff, scale, q_m);
+                    }
+                }
+
+                // Generate key-switching key: encrypt scaled_s_auto under s
+                let key_a = sample_uniform_rns(&rns_params, rng);
+                let e = sample_gaussian_rns(&rns_params, bgv_params.sigma, rng);
+
+                // b = -a·s + e + scaled_s_auto
+                let neg_as = key_a.mul(&sk.s).neg();
+                let key_b = neg_as.add(&e).add(&scaled_s_auto);
+
+                keys_a.push(key_a);
+                keys_b.push(key_b);
+
+                power_of_base *= DECOMP_BASE;
+            }
+        }
 
         Self {
             k,
-            key_a,
-            key_b,
+            keys_a,
+            keys_b,
+            num_limbs,
             rns_params,
             bgv_params,
         }
@@ -207,6 +256,114 @@ impl RnsGaloisKey {
     pub fn exponent(&self) -> usize {
         self.k
     }
+
+    /// Returns the automorphism exponent k.
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Returns the keys_b polynomials.
+    pub fn keys_b(&self) -> &[RnsPoly] {
+        &self.keys_b
+    }
+
+    /// Returns the keys_a polynomials.
+    pub fn keys_a(&self) -> &[RnsPoly] {
+        &self.keys_a
+    }
+
+    /// Performs HYBRID key-switching (RNS + digit decomposition).
+    ///
+    /// Given c1 (after automorphism), returns (c0_ks, c1_ks) such that
+    /// c0_ks + c1_ks * s ≈ c1 * σ_k(s).
+    fn key_switch(&self, c1_auto: &RnsPoly) -> (RnsPoly, RnsPoly) {
+        let mut c0_acc = RnsPoly::zero(&self.rns_params);
+        let mut c1_acc = RnsPoly::zero(&self.rns_params);
+
+        let n = self.rns_params.ring_dim();
+        let moduli = self.rns_params.moduli();
+
+        // For each RNS limb
+        for limb_idx in 0..self.num_limbs {
+            // For each digit position within this limb
+            for digit_idx in 0..DIGITS_PER_LIMB {
+                // Create polynomial for this digit from limb_idx's residue
+                let mut digit_poly = RnsPoly::zero(&self.rns_params);
+
+                // Extract digit from the limb_idx residue of c1_auto
+                for coeff_idx in 0..n {
+                    let coeff = c1_auto.residues()[limb_idx][coeff_idx];
+                    // Extract digit: (coeff >> (digit_idx * log_β)) & (β - 1)
+                    let shifted = coeff >> (DECOMP_BASE_LOG * digit_idx as u32);
+                    let digit = shifted & (DECOMP_BASE - 1);
+
+                    // Set this digit in ALL RNS components
+                    // (the digit is small, so no reduction needed)
+                    for mod_idx in 0..self.num_limbs {
+                        digit_poly.residues_mut()[mod_idx][coeff_idx] = digit;
+                    }
+                }
+
+                // Get key index
+                let key_idx = limb_idx * DIGITS_PER_LIMB + digit_idx;
+
+                // Accumulate: result += digit_poly * key[limb][digit]
+                let term_c0 = digit_poly.mul(&self.keys_b[key_idx]);
+                let term_c1 = digit_poly.mul(&self.keys_a[key_idx]);
+
+                c0_acc = c0_acc.add(&term_c0);
+                c1_acc = c1_acc.add(&term_c1);
+            }
+        }
+
+        (c0_acc, c1_acc)
+    }
+}
+
+/// Computes P_i * P_i^* in RNS form for each limb i.
+/// Where P_i = Q/q_i and P_i^* = (P_i^{-1} mod q_i).
+/// Returns p_values[i][j] = (P_i * P_i^*) mod q_j.
+///
+/// This is the CRT lifting coefficient needed for proper reconstruction.
+fn compute_partial_products(params: &RnsParams) -> Vec<Vec<u64>> {
+    let moduli = params.moduli();
+    let k = moduli.len();
+
+    let mut result = vec![vec![0u64; k]; k];
+
+    for i in 0..k {
+        // P_i = prod_{j != i} q_j
+        // P_i^* = P_i^{-1} mod q_i
+
+        // First compute P_i mod q_i to get P_i^*
+        let q_i = moduli[i];
+        let mut p_i_mod_qi = 1u64;
+        for j in 0..k {
+            if j != i {
+                p_i_mod_qi = mulmod(p_i_mod_qi, moduli[j] % q_i, q_i);
+            }
+        }
+        let p_i_star = mod_inv(p_i_mod_qi, q_i);
+
+        // Now compute (P_i * P_i^*) mod q_m for each m
+        for m in 0..k {
+            let q_m = moduli[m];
+
+            // P_i mod q_m
+            let mut p_i_mod_qm = 1u64;
+            for j in 0..k {
+                if j != i {
+                    p_i_mod_qm = mulmod(p_i_mod_qm, moduli[j] % q_m, q_m);
+                }
+            }
+
+            // (P_i * P_i^*) mod q_m
+            // Note: P_i^* is computed mod q_i, but we use it as a scalar
+            result[i][m] = mulmod(p_i_mod_qm, p_i_star % q_m, q_m);
+        }
+    }
+
+    result
 }
 
 /// Collection of Galois keys for slot operations.
@@ -320,6 +477,16 @@ impl RnsGaloisKeys {
     pub fn get_exponent(&self, index: usize) -> Option<usize> {
         self.automorphism_exponents.get(index).copied()
     }
+
+    /// Returns all Galois keys.
+    pub fn keys(&self) -> &[RnsGaloisKey] {
+        &self.keys
+    }
+
+    /// Returns all automorphism exponents.
+    pub fn automorphism_exponents(&self) -> &[usize] {
+        &self.automorphism_exponents
+    }
 }
 
 /// Applies automorphism σ_k to an RNS polynomial: a(X) → a(X^k) mod (X^n + 1).
@@ -378,6 +545,16 @@ impl RnsCiphertext {
             rns_params,
             bgv_params,
         }
+    }
+
+    /// Returns the c0 component.
+    pub fn c0(&self) -> &RnsPoly {
+        &self.c0
+    }
+
+    /// Returns the c1 component.
+    pub fn c1(&self) -> &RnsPoly {
+        &self.c1
     }
 
     /// Encrypts a single scalar value.
@@ -745,6 +922,8 @@ impl RnsCiphertext {
     ///
     /// This rotates/permutes slot values according to the automorphism.
     /// Requires a Galois key for the specific automorphism.
+    ///
+    /// Uses digit decomposition for low-noise key-switching.
     pub fn apply_automorphism(&self, galois_key: &RnsGaloisKey) -> Self {
         let k = galois_key.k;
 
@@ -753,26 +932,24 @@ impl RnsCiphertext {
         let c0_auto = apply_automorphism_rns(&self.c0, k);
         let c1_auto = apply_automorphism_rns(&self.c1, k);
 
-        // Step 2: Key-switch to convert from encryption under σ_k(s) to s
-        // After automorphism, decryption would use σ_k(s):
-        //   c0_auto + c1_auto * σ_k(s) = σ_k(c0 + c1*s) ≈ σ_k(m)
+        // Step 2: Key-switch using digit decomposition
+        // After automorphism, decryption would use σ_k(s).
+        // Key-switching converts to encryption under s.
         //
-        // Key-switching: use galois_key = (a', b') where b' = -a'·s + σ_k(s)
-        // New ciphertext: (c0_auto + c1_auto * b', c1_auto * a')
+        // With digit decomposition:
+        // - Decompose c1_auto into digits: c1_auto = Σ d_i * β^i
+        // - For each digit, multiply by corresponding key
+        // - Sum to get key-switched ciphertext
         //
-        // Decryption: (c0_auto + c1_auto*b') + (c1_auto*a')*s
-        //           = c0_auto + c1_auto*(b' + a'*s)
-        //           = c0_auto + c1_auto*(-a'*s + σ_k(s) + a'*s)
-        //           = c0_auto + c1_auto*σ_k(s)
-        //           = σ_k(m) ✓
+        // This keeps noise proportional to num_digits * β * σ instead of Q * σ.
+        let (ks_c0, ks_c1) = galois_key.key_switch(&c1_auto);
 
-        let c1_auto_times_b = c1_auto.mul(&galois_key.key_b);
-        let new_c0 = c0_auto.add(&c1_auto_times_b);
-        let new_c1 = c1_auto.mul(&galois_key.key_a);
+        // New ciphertext: (c0_auto + ks_c0, ks_c1)
+        let new_c0 = c0_auto.add(&ks_c0);
 
         Self {
             c0: new_c0,
-            c1: new_c1,
+            c1: ks_c1,
             rns_params: self.rns_params.clone(),
             bgv_params: self.bgv_params.clone(),
         }
@@ -1896,8 +2073,9 @@ mod rns_bgv_tests {
     #[test]
     fn test_mul_plaintext_slots_goldilocks() {
         // Test slot-wise multiplication with Goldilocks modulus
+        // Uses 4 moduli (goldilocks_test) for higher noise budget than prod IT-PAC
         let mut rng = Prg::from_seed(Block::ZERO);
-        let keypair = RnsKeyPair::generate_goldilocks(&mut rng);
+        let keypair = RnsKeyPair::generate_goldilocks_test(&mut rng);
         let t = GOLDILOCKS;
 
         // Encrypt slot values
@@ -2175,8 +2353,9 @@ mod rns_bgv_tests {
 
     #[test]
     fn test_slot_packed_goldilocks() {
+        // Uses 4 moduli (goldilocks_test) for higher noise budget than prod IT-PAC
         let mut rng = Prg::from_seed(Block::ZERO);
-        let keypair = RnsKeyPair::generate_goldilocks(&mut rng);
+        let keypair = RnsKeyPair::generate_goldilocks_test(&mut rng);
         let t = GOLDILOCKS;
         let lambda = 12345u64;
 

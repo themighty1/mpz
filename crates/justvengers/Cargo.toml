@@ -33,6 +33,7 @@ default = ["ntt"]
 ntt = []
 kzg = []
 mersenne = ["mpz-fields/mersenne"]
+cl-scheme = ["mpz-justvengers-core/cl-scheme"]
 
 [dev-dependencies]
 rand = { workspace = true }

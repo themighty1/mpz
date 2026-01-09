@@ -10,6 +10,7 @@ workspace = true
 [features]
 default = []
 rayon = ["dep:rayon"]
+cl-scheme = []
 
 [dependencies]
 mpz-core = { workspace = true }
@@ -21,9 +22,14 @@ rayon = { workspace = true, optional = true }
 rand = { workspace = true }
 
 # Class group cryptography for CL-based homomorphic encryption
-class_group = { path = "/tmp/class" }
+class_group = { path = "/home/default2/Desktop/gh_repos/class-group" }
+num-bigint = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }
 criterion = { workspace = true }
 rstest = { workspace = true }
+
+[[bench]]
+name = "rotation_bench"
+harness = false

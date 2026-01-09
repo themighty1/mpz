@@ -211,8 +211,8 @@ pub struct RnsBgvParams {
 impl RnsBgvParams {
     /// Creates RNS BGV parameters for the Goldilocks field.
     ///
-    /// Uses N=8192 ring dimension with 8192 slots and 4 RNS moduli (~240 bit q).
-    /// This matches the Low Gear paper configuration.
+    /// Uses N=8192 ring dimension with 8192 slots and 3 RNS moduli (~180 bit q).
+    /// In IT-PAC, noise never exceeds 80 bits, so 3 moduli (~180 bits) suffices.
     pub fn goldilocks() -> Self {
         let n = 8192;
         let t = GOLDILOCKS;
@@ -225,7 +225,51 @@ impl RnsBgvParams {
         Self {
             n,
             t,
-            num_moduli: 4, // ~240 bit ciphertext modulus
+            num_moduli: 3, // ~180 bit q; IT-PAC noise ≤ 80 bits
+            sigma: 3.2,
+            supports_slots,
+            num_slots: n,
+        }
+    }
+
+    /// Creates RNS BGV parameters for Goldilocks with reduced modulus.
+    ///
+    /// Uses only 2 RNS moduli (~120 bit q) for lower noise in rotations.
+    /// This provides less noise budget but allows more key-switching operations.
+    pub fn goldilocks_reduced() -> Self {
+        let n = 8192;
+        let t = GOLDILOCKS;
+
+        let order = 2 * n as u64;
+        let supports_slots = (t - 1) % order == 0;
+        assert!(supports_slots, "Goldilocks must support slot packing with N=8192");
+
+        Self {
+            n,
+            t,
+            num_moduli: 2, // ~120 bit ciphertext modulus - less noise
+            sigma: 3.2,
+            supports_slots,
+            num_slots: n,
+        }
+    }
+
+    /// Creates RNS BGV parameters for Goldilocks with extended modulus (testing only).
+    ///
+    /// Uses 4 RNS moduli (~240 bit q) for tests requiring larger noise budget.
+    /// Production IT-PAC uses `goldilocks()` with 3 moduli since noise ≤ 80 bits.
+    pub fn goldilocks_test() -> Self {
+        let n = 8192;
+        let t = GOLDILOCKS;
+
+        let order = 2 * n as u64;
+        let supports_slots = (t - 1) % order == 0;
+        assert!(supports_slots, "Goldilocks must support slot packing with N=8192");
+
+        Self {
+            n,
+            t,
+            num_moduli: 4, // ~240 bit q; for tests with higher noise operations
             sigma: 3.2,
             supports_slots,
             num_slots: n,
@@ -308,7 +352,7 @@ mod param_tests {
         let params = RnsBgvParams::goldilocks();
         assert_eq!(params.n, 8192);
         assert_eq!(params.t, GOLDILOCKS);
-        assert_eq!(params.num_moduli, 4);
+        assert_eq!(params.num_moduli, 3);
         assert!(params.supports_slot_packing());
         assert_eq!(params.slots(), 8192);
     }

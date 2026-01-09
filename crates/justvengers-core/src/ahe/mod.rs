@@ -46,15 +46,13 @@ pub use slot::SlotEncoder;
 pub use rns::{RnsParams, RnsParamSet, RnsPoly};
 pub use rns_bgv::{
     RnsSecretKey, RnsPublicKey, RnsKeyPair, RnsCiphertext,
+    RnsGaloisKey, RnsGaloisKeys,
     SlotPackedEncryptedPowers, SlotPackedCiphertextBatch,
     decrypt_batched_evaluation,
 };
 
 // Re-export CL types at top level for convenience
-pub use cl_ahe::{
-    CLGroup, CLSecretKey, CLPublicKey, CLKeyPair, CLCiphertext,
-    DEFAULT_SECURITY_PARAMETER,
-};
+pub use cl_ahe::{CLGroup, CLSecretKey, CLPublicKey, CLKeyPair, CLCiphertext};
 
 #[cfg(test)]
 mod tests;

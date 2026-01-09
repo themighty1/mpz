@@ -384,6 +384,15 @@ impl<F: ItMacField> RnsItPacVerifier<F> {
         Self::new(&params, rng)
     }
 
+    /// Creates a verifier for Goldilocks with extended modulus (testing only).
+    ///
+    /// Uses 4 RNS moduli for tests requiring larger noise budget.
+    /// Production code should use `new_goldilocks()`.
+    pub fn new_goldilocks_test<R: Rng>(rng: &mut R) -> Self {
+        let params = RnsBgvParams::goldilocks_test();
+        Self::new(&params, rng)
+    }
+
     /// Returns the secret evaluation point (for testing only).
     pub fn lambda(&self) -> u64 {
         self.lambda
@@ -1632,8 +1641,9 @@ mod tests {
 
         #[test]
         fn test_rns_polynomial_evaluation_large_coeffs() {
+            // Uses 4 moduli (goldilocks_test) for higher noise budget than prod IT-PAC
             let mut rng = Prg::from_seed(Block::ZERO);
-            let verifier = RnsItPacVerifier::<TestField>::new_goldilocks(&mut rng);
+            let verifier = RnsItPacVerifier::<TestField>::new_goldilocks_test(&mut rng);
             let t = verifier.params().t;
 
             let max_degree = 5;

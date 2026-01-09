@@ -22,12 +22,19 @@ pub mod itpac;
 pub mod ntt;
 pub mod poly;
 
+#[cfg(feature = "cl-scheme")]
+pub mod cl_itpac;
+
 pub use ahe::{
     BgvParams, Ciphertext, KeyPair, ParamSet, PublicKey, SecretKey,
     RnsCiphertext, RnsKeyPair, RnsPublicKey, RnsSecretKey, RnsBgvParams, GOLDILOCKS,
+    RnsGaloisKey, RnsGaloisKeys,
     SlotPackedEncryptedPowers, SlotPackedCiphertextBatch, decrypt_batched_evaluation,
 };
 pub use itmac::{GlobalKey, ItMac, ItMacBatch, ItMacField, ProverShare, VerifierShare, VolePool, VoleSource};
 pub use itpac::{EncryptedPowers, ItPac, ItPacGenerator, ItPacVerifier, RnsEncryptedPowers, RnsItPacVerifier};
 pub use ntt::{Ntt, NttField};
 pub use poly::Poly;
+
+#[cfg(feature = "cl-scheme")]
+pub use cl_itpac::{CLBatchEvaluation, CLEncryptedPowers, CLItPacProver, CLItPacVerifier};

@@ -514,7 +514,7 @@ pub enum RnsParamSet {
     Test,
     /// Medium set (~180 bit modulus, 3 primes).
     Medium,
-    /// Large set for Goldilocks (~240 bit modulus, 4 primes).
+    /// Goldilocks (~180 bit modulus, 3 primes). IT-PAC noise ≤ 80 bits.
     Goldilocks,
 }
 
@@ -524,7 +524,7 @@ impl RnsParamSet {
         match self {
             RnsParamSet::Test => RnsParams::new(ring_dim, 2, 58),
             RnsParamSet::Medium => RnsParams::new(ring_dim, 3, 59),
-            RnsParamSet::Goldilocks => RnsParams::new(ring_dim, 4, 60),
+            RnsParamSet::Goldilocks => RnsParams::new(ring_dim, 3, 60),
         }
     }
 }
@@ -617,7 +617,7 @@ mod rns_tests {
         // Ring dimension 8192 for Goldilocks slot packing
         let params = RnsParamSet::Goldilocks.params(8192);
 
-        assert_eq!(params.num_moduli(), 4);
+        assert_eq!(params.num_moduli(), 3);
         assert_eq!(params.ring_dim(), 8192);
 
         // Verify NTT-friendliness
@@ -626,8 +626,8 @@ mod rns_tests {
             assert_eq!((q - 1) % order, 0, "modulus {} not NTT-friendly", q);
         }
 
-        // Total modulus should be ~240 bits
+        // Total modulus should be ~180 bits (3 * 60-bit primes)
         let total_bits: u32 = params.moduli().iter().map(|&q| 64 - q.leading_zeros()).sum();
-        assert!(total_bits >= 230, "total bits {} too small", total_bits);
+        assert!(total_bits >= 170, "total bits {} too small", total_bits);
     }
 }

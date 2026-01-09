@@ -1,0 +1,26 @@
+[package]
+name = "bgv-webgpu"
+version = "0.1.0"
+edition = "2021"
+description = "WebGPU-accelerated BGV ciphertext scalar multiplication"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+wgpu = { version = "23", features = ["wgsl"] }
+bytemuck = { workspace = true }
+pollster = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+criterion = { workspace = true }
+mpz-justvengers-core = { path = "../justvengers-core" }
+mpz-core = { path = "../core" }
+
+[[bench]]
+name = "gpu_bench"
+harness = false
+
+[[bench]]
+name = "sum_slots_bench"
+harness = false
