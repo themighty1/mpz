@@ -15,7 +15,7 @@ use mpz_justvengers::{
     topology::TopologyVector,
     soldering::SolderingChallengeMessage,
     // JustVengers O(R+B+C) optimized prover with IT-PAC
-    JVProver, JVVerifier, JVSetupMessage, GoldilocksItMac,
+    JVProver, JVVerifier, JVSetupMessage, ItMacFieldType,
     extract_verifier_shares_from_pool,
 };
 use mpz_justvengers_core::{VolePool, GlobalKey};
@@ -198,7 +198,7 @@ struct JVRecordedMessages {
     /// Full setup message including encrypted powers for IT-PAC
     setup_msg: JVSetupMessage,
     /// Global key for VOLE generation
-    global_key: GlobalKey<GoldilocksItMac>,
+    global_key: GlobalKey<ItMacFieldType>,
     /// Circuit size for VOLE pool generation
     circuit_size: usize,
     chi: u64,

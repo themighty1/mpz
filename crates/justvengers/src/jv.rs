@@ -248,6 +248,29 @@ impl From<MersenneItMac> for u64 {
 }
 
 // ============================================================================
+// IT-MAC Field Type Selection (feature-flagged)
+// ============================================================================
+
+/// The IT-MAC field type used throughout the protocol.
+///
+/// With `mersenne` feature: Uses M61 (2^61-1) Mersenne prime
+/// Without `mersenne` feature: Uses Goldilocks (2^64-2^32+1)
+#[cfg(feature = "mersenne")]
+pub type ItMacFieldType = MersenneItMac;
+
+/// IT-MAC field type - Goldilocks (default).
+#[cfg(not(feature = "mersenne"))]
+pub type ItMacFieldType = GoldilocksItMac;
+
+/// The modulus for the IT-MAC field.
+#[cfg(feature = "mersenne")]
+pub const ITMAC_MODULUS: u64 = M61;
+
+/// The modulus for the IT-MAC field.
+#[cfg(not(feature = "mersenne"))]
+pub const ITMAC_MODULUS: u64 = GOLDILOCKS;
+
+// ============================================================================
 // Message Types - O(R+B+C) communication
 // ============================================================================
 
@@ -321,7 +344,7 @@ pub struct InputCoefficientMacsMessage {
     pub num_inputs: usize,
     /// For each input wire k, the prover's shares (value, mac) for each coefficient.
     /// input_coeff_shares[k][i] = (c_i, m_i) where m_i = k_i + c_i·Δ.
-    pub input_coeff_shares: Vec<Vec<(u64, GoldilocksItMac)>>,
+    pub input_coeff_shares: Vec<Vec<(u64, ItMacFieldType)>>,
 }
 
 /// Disclosure message from prover (O(R) communication).
@@ -378,7 +401,7 @@ pub struct ItPacOpenMessage {
     /// The prover reveals these for verification.
     pub mac_values: Vec<u64>,
     /// IT-MAC tags m = k + f(Λ)·Δ for each polynomial.
-    pub mac_tags: Vec<GoldilocksItMac>,
+    pub mac_tags: Vec<ItMacFieldType>,
 }
 
 // ============================================================================
@@ -469,7 +492,7 @@ pub struct MKHashProofMessage {
     /// Contains revealed polynomial coefficients and MAC tags.
     pub mk_mac_values: Vec<u64>,
     /// MAC tags for MK polynomial IT-PACs.
-    pub mk_mac_tags: Vec<GoldilocksItMac>,
+    pub mk_mac_tags: Vec<ItMacFieldType>,
 }
 
 /// Open message from prover with zero-knowledge branch hiding.
@@ -523,9 +546,9 @@ pub struct JVProver<const R: usize> {
     /// Encrypted powers received from verifier for IT-PAC commitments.
     encrypted_powers: Option<EncryptedPowers>,
     /// VOLE pool for IT-MAC generation.
-    vole_pool: Option<VolePool<GoldilocksItMac>>,
+    vole_pool: Option<VolePool<ItMacFieldType>>,
     /// IT-PAC commitments for each wire polynomial.
-    itpac_commitments: Vec<ItPac<GoldilocksItMac>>,
+    itpac_commitments: Vec<ItPac<ItMacFieldType>>,
     /// IT-PAC ciphertexts (stored for F_Com opening).
     itpac_ciphertexts: Vec<Ciphertext>,
     /// F_Com commitments (hashes of ciphertexts).
@@ -541,7 +564,7 @@ pub struct JVProver<const R: usize> {
     /// IT-MAC commitments for input polynomial coefficients.
     /// input_coeff_macs[k][i] = IT-MAC for coefficient i of input polynomial k.
     /// Required for extractability in simulation (paper Step 9).
-    input_coeff_macs: Vec<Vec<mpz_justvengers_core::ItMac<GoldilocksItMac>>>,
+    input_coeff_macs: Vec<Vec<mpz_justvengers_core::ItMac<ItMacFieldType>>>,
 
     // ==========================================================================
     // MK Polynomial fields for zero-knowledge branch hiding
@@ -553,11 +576,14 @@ pub struct JVProver<const R: usize> {
     /// MK_i(αⱼ) = 1 if branch i is active in repetition j, 0 otherwise.
     mk_polynomials: Vec<Vec<u64>>,
     /// IT-PAC commitments for MK polynomials.
-    mk_itpac_commitments: Vec<ItPac<GoldilocksItMac>>,
+    mk_itpac_commitments: Vec<ItPac<ItMacFieldType>>,
     /// IT-PAC ciphertexts for MK polynomials (stored for F_Com opening).
     mk_ciphertexts: Vec<Ciphertext>,
     /// F_Com commitments (hashes) for MK polynomial ciphertexts.
     mk_ciphertext_commitments: Vec<[u8; 32]>,
+    /// Cached vanishing polynomial Z(X) = Π(X - αⱼ) for eval_points.
+    /// Computed once and reused to avoid O(R²) recomputation.
+    vanishing_poly: Option<Vec<u64>>,
 }
 
 /// Protocol phases for the optimized prover.
@@ -613,6 +639,8 @@ impl<const R: usize> JVProver<R> {
             mk_itpac_commitments: Vec::new(),
             mk_ciphertexts: Vec::new(),
             mk_ciphertext_commitments: Vec::new(),
+            // Cached vanishing polynomial
+            vanishing_poly: None,
         }
     }
 
@@ -773,7 +801,7 @@ impl<const R: usize> JVProver<R> {
     pub fn commit(
         &mut self,
         setup_msg: &JVSetupMessage,
-        vole_pool: VolePool<GoldilocksItMac>,
+        vole_pool: VolePool<ItMacFieldType>,
     ) -> Result<JVCommitmentMessage, JVProverError> {
         if self.phase != JVProverPhase::Setup {
             return Err(JVProverError::InvalidPhase);
@@ -797,6 +825,10 @@ impl<const R: usize> JVProver<R> {
         }
 
         self.eval_points = Some(eval_points.to_vec());
+        // Compute and cache vanishing polynomial Z(X) = Π(X - αⱼ) over actual R points
+        // (not NTT-padded points which may extend beyond R)
+        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
+        self.vanishing_poly = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
         self.encrypted_powers = Some(setup_msg.encrypted_powers.clone());
         self.vole_pool = Some(vole_pool);
         // Store seed commitment and public key for later verification
@@ -1074,13 +1106,12 @@ impl<const R: usize> JVProver<R> {
             gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
         }
 
-        // Compute vanishing polynomial Z(X) = Π(X - αⱼ) over actual R points
-        // (not the NTT-padded points which may extend beyond R)
-        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
-        let z_poly = compute_vanishing_poly(actual_eval_points, self.modulus);
+        // Use cached vanishing polynomial Z(X) = Π(X - αⱼ)
+        let z_poly = self.vanishing_poly.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
 
         // Compute quotient Q_bin(X) = H_bin(X) / Z(X)
-        let (quotient_coeffs, _remainder) = poly_div(&h_bin, &z_poly, self.modulus);
+        let (quotient_coeffs, _remainder) = poly_div(&h_bin, z_poly, self.modulus);
 
         Ok(MKBinaryProofMessage { quotient_coeffs })
     }
@@ -1122,14 +1153,13 @@ impl<const R: usize> JVProver<R> {
             };
         }
 
-        // Compute vanishing polynomial Z(X) = Π(X - αⱼ) over actual R points
-        // (not the NTT-padded points which may extend beyond R)
-        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
-        let z_poly = compute_vanishing_poly(actual_eval_points, self.modulus);
+        // Use cached vanishing polynomial Z(X) = Π(X - αⱼ)
+        let z_poly = self.vanishing_poly.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
 
         // Compute quotient Q_sum(X) = H_sum(X) / Z(X)
         // For correct execution, H_sum should be zero polynomial, so quotient is empty
-        let (quotient_coeffs, _remainder) = poly_div(&h_sum, &z_poly, self.modulus);
+        let (quotient_coeffs, _remainder) = poly_div(&h_sum, z_poly, self.modulus);
 
         Ok(MKSumProofMessage { quotient_coeffs })
     }
@@ -1194,11 +1224,12 @@ impl<const R: usize> JVProver<R> {
             }
         }
 
-        // Compute vanishing polynomial Z(X) = Π(X - αⱼ)
-        let z_poly = compute_vanishing_poly(eval_points, self.modulus);
+        // Use cached vanishing polynomial Z(X) = Π(X - αⱼ)
+        let z_poly = self.vanishing_poly.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
 
         // Compute quotient Q_hash(X) = H_hash(X) / Z(X)
-        let (quotient_coeffs, _remainder) = poly_div(&h_hash, &z_poly, self.modulus);
+        let (quotient_coeffs, _remainder) = poly_div(&h_hash, z_poly, self.modulus);
 
         // Extract MAC values and tags from MK IT-PAC commitments
         let mut mk_mac_values = Vec::with_capacity(self.mk_itpac_commitments.len());
@@ -1513,11 +1544,12 @@ impl<const R: usize> JVProver<R> {
             gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
         }
 
-        // Compute vanishing polynomial Z(X) = Π(X - αⱼ)
-        let z_poly = compute_vanishing_poly(&eval_points, self.modulus);
+        // Use cached vanishing polynomial Z(X) = Π(X - αⱼ)
+        let z_poly = self.vanishing_poly.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
 
         // Compute quotient Q(X) = H(X) / Z(X)
-        let (quotient_coeffs, _remainder) = poly_div(&h_poly, &z_poly, self.modulus);
+        let (quotient_coeffs, _remainder) = poly_div(&h_poly, z_poly, self.modulus);
 
         self.phase = JVProverPhase::Done;
 
@@ -1725,7 +1757,7 @@ pub struct JVVerifier<const R: usize> {
     /// Secret evaluation point Λ.
     lambda: u64,
     /// IT-MAC global key Δ.
-    global_key: GlobalKey<GoldilocksItMac>,
+    global_key: GlobalKey<ItMacFieldType>,
     /// AHE key pair for IT-PAC.
     ahe_keypair: Option<KeyPair>,
     /// Encrypted powers of Λ for IT-PAC.
@@ -1757,20 +1789,20 @@ pub struct JVVerifier<const R: usize> {
     /// Soldering verifier.
     soldering_verifier: Option<SolderingVerifier>,
     /// IT-PAC commitments received from prover.
-    itpac_commitments: Vec<ItPac<GoldilocksItMac>>,
+    itpac_commitments: Vec<ItPac<ItMacFieldType>>,
     /// Decrypted commitment values d_w = f_w(Λ) - u_w.
     decrypted_commitments: Option<Vec<u64>>,
     /// Verifier's local keys k for IT-MAC verification.
     /// For IT-MAC [x]: m = k + x·Δ, verifier holds k.
-    verifier_local_keys: Vec<GoldilocksItMac>,
+    verifier_local_keys: Vec<ItMacFieldType>,
     /// Local keys for input coefficient IT-MACs.
     /// input_coeff_local_keys[k][i] = local key for coefficient i of input polynomial k.
-    input_coeff_local_keys: Vec<Vec<GoldilocksItMac>>,
+    input_coeff_local_keys: Vec<Vec<ItMacFieldType>>,
     /// Received differences for input coefficient IT-MACs.
     /// Used together with revealed coefficients during verification.
     input_coeff_diffs: Vec<Vec<u64>>,
     /// Received MAC tags for input coefficients.
-    input_coeff_macs: Vec<Vec<GoldilocksItMac>>,
+    input_coeff_macs: Vec<Vec<ItMacFieldType>>,
 
     // ==========================================================================
     // MK Polynomial fields for zero-knowledge branch hiding verification
@@ -1781,7 +1813,7 @@ pub struct JVVerifier<const R: usize> {
     /// Decrypted MK commitment values d_i = MK_i(Λ) - u_i.
     decrypted_mk_commitments: Vec<u64>,
     /// Verifier's local keys for MK polynomial IT-MACs.
-    mk_local_keys: Vec<GoldilocksItMac>,
+    mk_local_keys: Vec<ItMacFieldType>,
     /// Number of branches B.
     num_branches: usize,
 }
@@ -1876,7 +1908,7 @@ impl<const R: usize> JVVerifier<R> {
     }
 
     /// Returns the IT-MAC global key (for VOLE pool generation).
-    pub fn global_key(&self) -> &GlobalKey<GoldilocksItMac> {
+    pub fn global_key(&self) -> &GlobalKey<ItMacFieldType> {
         &self.global_key
     }
 
@@ -2198,12 +2230,12 @@ impl<const R: usize> JVVerifier<R> {
     ///
     /// These are extracted from the VolePool before it's passed to the prover.
     /// For IT-MAC [x]: m = k + x·Δ, the verifier stores k.
-    pub fn set_verifier_local_keys(&mut self, keys: Vec<GoldilocksItMac>) {
+    pub fn set_verifier_local_keys(&mut self, keys: Vec<ItMacFieldType>) {
         self.verifier_local_keys = keys;
     }
 
     /// Returns the verifier's local keys.
-    pub fn verifier_local_keys(&self) -> &[GoldilocksItMac] {
+    pub fn verifier_local_keys(&self) -> &[ItMacFieldType] {
         &self.verifier_local_keys
     }
 
@@ -2211,7 +2243,7 @@ impl<const R: usize> JVVerifier<R> {
     ///
     /// These are the local keys k for each coefficient of each input polynomial.
     /// Extracted from the VolePool before it's passed to the prover.
-    pub fn set_input_coeff_local_keys(&mut self, keys: Vec<Vec<GoldilocksItMac>>) {
+    pub fn set_input_coeff_local_keys(&mut self, keys: Vec<Vec<ItMacFieldType>>) {
         self.input_coeff_local_keys = keys;
     }
 
@@ -2274,11 +2306,11 @@ impl<const R: usize> JVVerifier<R> {
                 let m = macs[coeff_idx];
 
                 // Compute adjusted local key: k' = k - d·Δ
-                let d_times_delta = GoldilocksItMac::new(d) * delta;
+                let d_times_delta = ItMacFieldType::new(d) * delta;
                 let k_adjusted = k - d_times_delta;
 
                 // Verify: m = k' + c·Δ
-                let c_times_delta = GoldilocksItMac::new(coeff) * delta;
+                let c_times_delta = ItMacFieldType::new(coeff) * delta;
                 let expected_mac = k_adjusted + c_times_delta;
 
                 if m != expected_mac {
@@ -2332,7 +2364,7 @@ impl<const R: usize> JVVerifier<R> {
 
             // Get the MAC value (u) from prover
             let mac_value = match open_msg.mac_values.get(i) {
-                Some(&v) => GoldilocksItMac::new(v),
+                Some(&v) => ItMacFieldType::new(v),
                 None => return false,
             };
 
@@ -2721,7 +2753,7 @@ impl<const R: usize> JVVerifier<R> {
     /// Sets the verifier's local keys for MK polynomial IT-MACs.
     ///
     /// These are extracted from the VolePool before it's passed to the prover.
-    pub fn set_mk_local_keys(&mut self, keys: Vec<GoldilocksItMac>) {
+    pub fn set_mk_local_keys(&mut self, keys: Vec<ItMacFieldType>) {
         self.mk_local_keys = keys;
     }
 
@@ -2871,7 +2903,7 @@ impl<const R: usize> JVVerifier<R> {
 
         // Verify each MK polynomial's IT-MAC
         for (i, _mk_poly) in mk_polynomials.iter().enumerate() {
-            let mac_value = GoldilocksItMac::new(mk_hash_proof.mk_mac_values[i]);
+            let mac_value = ItMacFieldType::new(mk_hash_proof.mk_mac_values[i]);
             let mac_tag = mk_hash_proof.mk_mac_tags[i];
             let local_key = self.mk_local_keys[i];
 
@@ -3215,9 +3247,9 @@ pub(crate) fn poly_div(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64
 /// the prover only receives (value, MAC tag) and the verifier only receives (local key).
 /// This function simulates that extraction.
 pub fn extract_verifier_shares_from_pool(
-    pool: &VolePool<GoldilocksItMac>,
+    pool: &VolePool<ItMacFieldType>,
     count: usize,
-) -> Vec<GoldilocksItMac> {
+) -> Vec<ItMacFieldType> {
     // Access the pool's internal state to extract verifier shares
     // This is a simplification - in a real protocol, VOLE generation would
     // naturally distribute shares to each party

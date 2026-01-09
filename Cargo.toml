@@ -118,6 +118,13 @@ pin-project-lite = "0.2"
 
 # serialization
 ark-serialize = "0.4"
+
+# FRI polynomial commitments
+winter-fri = "0.10"
+winter-math = "0.10"
+winter-crypto = "0.10"
+winter-utils = "0.10"
+plonky2 = "0.2"
 serde = "1.0"
 serde_yaml = "0.9"
 serde_arrays = "0.1"

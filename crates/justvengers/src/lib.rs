@@ -96,11 +96,15 @@ pub use jv::{
     JVLpzkProofMessage, AggregatedLpzkProofMessage, ItPacOpenMessage,
     JVProverError, JVVerifierError, JVProtocolError,
     run_jv_protocol, estimate_communication, CommunicationEstimate,
-    extract_verifier_shares_from_pool, GoldilocksItMac,
+    extract_verifier_shares_from_pool,
+    // IT-MAC field types
+    GoldilocksItMac, ItMacFieldType, ITMAC_MODULUS,
     // MK polynomial types for zero-knowledge branch hiding
     MKCommitmentMessage, MKCiphertextOpenMessage, MKBinaryProofMessage,
     MKSumProofMessage, MKHashProofMessage,
 };
+#[cfg(feature = "mersenne")]
+pub use jv::MersenneItMac;
 
 /// Protocol parameters for Justvengers.
 #[derive(Clone, Debug)]

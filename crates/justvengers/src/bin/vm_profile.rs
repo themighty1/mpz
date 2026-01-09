@@ -17,7 +17,7 @@ use mpz_justvengers::{
     Circuit, CircuitBatch, SolderingConstraint,
     topology::TopologyVector,
     soldering::SolderingChallengeMessage,
-    JVProver, JVVerifier, JVSetupMessage, GoldilocksItMac,
+    JVProver, JVVerifier, JVSetupMessage, ItMacFieldType,
 };
 
 use mpz_core::{prg::Prg, Block};
@@ -38,7 +38,7 @@ struct RecordedVerifierMessages {
     soldering_challenge: Option<SolderingChallengeMessage>,
     rho: u64,
     gamma: u64,
-    global_key: GlobalKey<GoldilocksItMac>,
+    global_key: GlobalKey<ItMacFieldType>,
     circuit_size: usize,
 }
 
@@ -155,6 +155,7 @@ fn record_verifier_messages<const R: usize>(
     let vole_pool = VolePool::generate(&global_key, circuit_size * 2, &mut rng);
 
     let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
+    let _mk_commitment = prover.commit_mk_polynomials(&setup_msg).unwrap();
     let soldering_commit = prover.commit_soldering().unwrap();
 
     let chi = verifier.receive_commitment(commitment).unwrap();
@@ -212,6 +213,7 @@ fn run_prover_with_replay<const R: usize>(
     let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
 
     let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
+    let _mk_commitment = prover.commit_mk_polynomials(&recorded.setup_msg).unwrap();
     let _soldering_commit = prover.commit_soldering().unwrap();
 
     let _disclosure = prover.disclose(recorded.chi, &recorded.topology_vectors).unwrap();
@@ -316,6 +318,10 @@ fn run_prover_with_timing<const R: usize>(
     let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
     let t_commit = t3.elapsed();
 
+    let t3b = Instant::now();
+    let _mk_commitment = prover.commit_mk_polynomials(&recorded.setup_msg).unwrap();
+    let t_mk_commit = t3b.elapsed();
+
     let t4 = Instant::now();
     let _soldering_commit = prover.commit_soldering().unwrap();
     let t_solder_commit = t4.elapsed();
@@ -345,6 +351,7 @@ fn run_prover_with_timing<const R: usize>(
     eprintln!("  setup():              {:>8.2} ms ({:>5.1}%)", t_setup.as_secs_f64() * 1000.0, t_setup.as_secs_f64() / total.as_secs_f64() * 100.0);
     eprintln!("  setup_soldering():    {:>8.2} ms ({:>5.1}%)", t_setup_solder.as_secs_f64() * 1000.0, t_setup_solder.as_secs_f64() / total.as_secs_f64() * 100.0);
     eprintln!("  commit():             {:>8.2} ms ({:>5.1}%)", t_commit.as_secs_f64() * 1000.0, t_commit.as_secs_f64() / total.as_secs_f64() * 100.0);
+    eprintln!("  commit_mk():          {:>8.2} ms ({:>5.1}%)", t_mk_commit.as_secs_f64() * 1000.0, t_mk_commit.as_secs_f64() / total.as_secs_f64() * 100.0);
     eprintln!("  commit_soldering():   {:>8.2} ms ({:>5.1}%)", t_solder_commit.as_secs_f64() * 1000.0, t_solder_commit.as_secs_f64() / total.as_secs_f64() * 100.0);
     eprintln!("  disclose():           {:>8.2} ms ({:>5.1}%)", t_disclose.as_secs_f64() * 1000.0, t_disclose.as_secs_f64() / total.as_secs_f64() * 100.0);
     eprintln!("  reveal_soldering():   {:>8.2} ms ({:>5.1}%)", t_solder_reveal.as_secs_f64() * 1000.0, t_solder_reveal.as_secs_f64() / total.as_secs_f64() * 100.0);

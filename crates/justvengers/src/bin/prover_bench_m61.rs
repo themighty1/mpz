@@ -16,7 +16,7 @@ use mpz_justvengers::{
     Circuit, CircuitBatch, SolderingConstraint,
     topology::TopologyVector,
     soldering::SolderingChallengeMessage,
-    JVProver, JVSetupMessage, GoldilocksItMac,
+    JVProver, JVSetupMessage, ItMacFieldType,
 };
 
 use mpz_core::{prg::Prg, Block};
@@ -38,7 +38,7 @@ struct VerifierMessages {
     soldering_challenge: Option<SolderingChallengeMessage>,
     rho: u64,
     gamma: u64,
-    global_key: GlobalKey<GoldilocksItMac>,
+    global_key: GlobalKey<ItMacFieldType>,
     circuit_size: usize,
 }
 

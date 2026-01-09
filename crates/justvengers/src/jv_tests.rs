@@ -247,7 +247,7 @@ fn test_itmac_verification_fails_on_tampered_tag() {
     // Tamper with the first MAC tag
     if !open_msg.mac_tags.is_empty() {
         // Add 1 to the first MAC tag to corrupt it
-        open_msg.mac_tags[0] = GoldilocksItMac::new(open_msg.mac_tags[0].inner() + 1);
+        open_msg.mac_tags[0] = ItMacFieldType::new(open_msg.mac_tags[0].inner() + 1);
     }
 
     // Verification should now fail

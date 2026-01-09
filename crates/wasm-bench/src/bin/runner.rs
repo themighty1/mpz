@@ -78,6 +78,8 @@ const ALL_BENCHMARKS: &[&str] = &[
     "jv_vm_prover/10",
     "jv_vm_prover/100",
     "jv_vm_prover/1000",
+    "jv_vm_prover/2000",
+    "jv_vm_prover/3000",
     "jv_vm_prover/10000",
     "jv_vm_prover/25000",
     "jv_vm_prover/100000",
