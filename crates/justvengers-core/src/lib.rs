@@ -22,8 +22,12 @@ pub mod itpac;
 pub mod ntt;
 pub mod poly;
 
-pub use ahe::{BgvParams, Ciphertext, KeyPair, ParamSet, PublicKey, SecretKey};
+pub use ahe::{
+    BgvParams, Ciphertext, KeyPair, ParamSet, PublicKey, SecretKey,
+    RnsCiphertext, RnsKeyPair, RnsPublicKey, RnsSecretKey, RnsBgvParams, GOLDILOCKS,
+    SlotPackedEncryptedPowers, SlotPackedCiphertextBatch, decrypt_batched_evaluation,
+};
 pub use itmac::{GlobalKey, ItMac, ItMacBatch, ItMacField, ProverShare, VerifierShare, VolePool, VoleSource};
-pub use itpac::{EncryptedPowers, ItPac, ItPacGenerator, ItPacVerifier};
+pub use itpac::{EncryptedPowers, ItPac, ItPacGenerator, ItPacVerifier, RnsEncryptedPowers, RnsItPacVerifier};
 pub use ntt::{Ntt, NttField};
 pub use poly::Poly;

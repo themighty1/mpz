@@ -20,6 +20,7 @@ mod ciphertext;
 mod sample;
 mod slot;
 mod rns;
+mod rns_bgv;
 
 pub use params::{BgvParams, ParamSet, RnsBgvParams, GOLDILOCKS};
 pub use ring::{BarrettReducer, RingPoly};
@@ -28,6 +29,11 @@ pub use ciphertext::Ciphertext;
 pub use sample::DiscreteGaussian;
 pub use slot::SlotEncoder;
 pub use rns::{RnsParams, RnsParamSet, RnsPoly};
+pub use rns_bgv::{
+    RnsSecretKey, RnsPublicKey, RnsKeyPair, RnsCiphertext,
+    SlotPackedEncryptedPowers, SlotPackedCiphertextBatch,
+    decrypt_batched_evaluation,
+};
 
 #[cfg(test)]
 mod tests;

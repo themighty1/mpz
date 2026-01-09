@@ -292,40 +292,36 @@ impl RingPoly {
     fn mul_schoolbook(&self, other: &Self) -> Self {
         let n = self.coeffs.len();
         let q = self.q;
-        let mut result = vec![0i128; n];
+        let reducer = BarrettReducer::new(q);
 
-        // Schoolbook multiplication - accumulate in i128
+        // Use u64 result with modular reduction to avoid i128 overflow.
+        // For large q and n, accumulating in i128 can overflow (e.g., q ≈ 2^60, n = 4096).
+        let mut result = vec![0u64; n];
+
+        // Schoolbook multiplication with immediate reduction
         for (i, &a) in self.coeffs.iter().enumerate() {
             for (j, &b) in other.coeffs.iter().enumerate() {
-                let prod = (a as i128) * (b as i128);
+                let prod = reducer.reduce((a as u128) * (b as u128));
                 let idx = i + j;
 
                 if idx < n {
-                    result[idx] += prod;
+                    // result[idx] = (result[idx] + prod) mod q
+                    result[idx] = reducer.reduce((result[idx] as u128) + (prod as u128));
                 } else {
                     // X^n ≡ -1, so X^(n+k) ≡ -X^k
-                    result[idx - n] -= prod;
+                    // result[idx-n] = (result[idx-n] - prod) mod q
+                    let target = idx - n;
+                    if result[target] >= prod {
+                        result[target] -= prod;
+                    } else {
+                        // result - prod + q to handle underflow
+                        result[target] = q - (prod - result[target]);
+                    }
                 }
             }
         }
 
-        // Reduce to [0, q) - use Barrett for positive, handle negative separately
-        let reducer = BarrettReducer::new(q);
-        let coeffs: Vec<u64> = result
-            .iter()
-            .map(|&c| {
-                if c >= 0 {
-                    reducer.reduce(c as u128)
-                } else {
-                    // For negative c: c mod q = q - ((-c) mod q) if c is not divisible by q
-                    let pos = (-c) as u128;
-                    let r = reducer.reduce(pos);
-                    if r == 0 { 0 } else { q - r }
-                }
-            })
-            .collect();
-
-        Self { coeffs, q, omega: self.omega }
+        Self { coeffs: result, q, omega: self.omega }
     }
 
     /// NTT-based multiplication for negacyclic convolution (O(n log n)).

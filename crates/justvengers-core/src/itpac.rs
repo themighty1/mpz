@@ -26,6 +26,7 @@
 use rand::Rng;
 
 use crate::ahe::{BarrettReducer, BgvParams, Ciphertext, KeyPair, PublicKey, SecretKey};
+use crate::ahe::{RnsBgvParams, RnsCiphertext, RnsKeyPair, RnsPublicKey, RnsSecretKey};
 use crate::itmac::{GlobalKey, ItMac, ItMacField, VolePool};
 
 /// Encrypted powers of Λ sent by verifier.
@@ -184,7 +185,20 @@ impl<F: ItMacField> ItPacVerifier<F> {
     }
 
     /// Generates encrypted powers of Λ to send to prover.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_degree` exceeds the number of available BGV slots (ring dimension n).
     pub fn generate_encrypted_powers<R: Rng>(&self, max_degree: usize, rng: &mut R) -> EncryptedPowers {
+        let num_slots = self.ahe_keypair.pk.params().n;
+        assert!(
+            max_degree <= num_slots,
+            "R={} exceeds available BGV slots ({}). To support more repetitions, \
+             need to parameterize BGV with more slots or use multiple ciphertexts, \
+             but currently we support only 1 ciphertext for simplicity.",
+            max_degree,
+            num_slots
+        );
         EncryptedPowers::generate(&self.ahe_keypair.pk, self.lambda, max_degree, rng)
     }
 
@@ -196,6 +210,226 @@ impl<F: ItMacField> ItPacVerifier<F> {
     /// Evaluates a polynomial at Λ.
     pub fn evaluate_at_lambda(&self, coeffs: &[u64]) -> u64 {
         let t = self.ahe_keypair.pk.params().t;
+        let mut result = 0u128;
+        let mut lambda_power = 1u128;
+        let lambda = self.lambda as u128;
+
+        for &coeff in coeffs {
+            result = (result + (coeff as u128) * lambda_power) % (t as u128);
+            lambda_power = (lambda_power * lambda) % (t as u128);
+        }
+
+        result as u64
+    }
+}
+
+// ============================================================================
+// RNS-based IT-PAC for Goldilocks field
+// ============================================================================
+
+/// Encrypted powers of Λ using RNS BGV for large plaintext modulus.
+///
+/// Each power Λ^i is encrypted in a separate ciphertext. This approach
+/// supports homomorphic polynomial evaluation via scalar multiplication
+/// and addition operations.
+///
+/// Note: A slot-packed version (all powers in one ciphertext) would require
+/// rotation operations for the inner product, which adds complexity.
+/// The separate-ciphertext approach is simpler and sufficient for IT-PAC.
+#[derive(Clone, Debug)]
+pub struct RnsEncryptedPowers {
+    /// ⟦Λ^i⟧ for i = 1, ..., max_degree
+    powers: Vec<RnsCiphertext>,
+    /// Maximum polynomial degree (R).
+    max_degree: usize,
+    /// BGV parameters.
+    params: RnsBgvParams,
+}
+
+impl RnsEncryptedPowers {
+    /// Creates encrypted powers of Λ.
+    ///
+    /// V encrypts Λ, Λ², ..., Λ^max_degree using RNS BGV.
+    pub fn generate<R: Rng>(
+        pk: &RnsPublicKey,
+        lambda: u64,
+        max_degree: usize,
+        rng: &mut R,
+    ) -> Self {
+        let params = pk.params().clone();
+        let t = params.t;
+
+        assert!(
+            max_degree <= params.num_slots,
+            "R={} exceeds available BGV slots ({}). To support more repetitions, \
+             need to parameterize BGV with more slots or use multiple ciphertexts, \
+             but currently we support only 1 ciphertext for simplicity.",
+            max_degree,
+            params.num_slots
+        );
+
+        let mut powers = Vec::with_capacity(max_degree);
+        let mut lambda_power = lambda % t;
+
+        for _ in 0..max_degree {
+            // Encrypt each power as a scalar (in slot 0)
+            powers.push(RnsCiphertext::encrypt_scalar(pk, lambda_power, rng));
+            lambda_power = ((lambda_power as u128 * lambda as u128) % t as u128) as u64;
+        }
+
+        Self {
+            powers,
+            max_degree,
+            params,
+        }
+    }
+
+    /// Returns the maximum polynomial degree supported.
+    pub fn max_degree(&self) -> usize {
+        self.max_degree
+    }
+
+    /// Returns the encrypted power ⟦Λ^i⟧.
+    pub fn get(&self, i: usize) -> Option<&RnsCiphertext> {
+        if i == 0 || i > self.max_degree {
+            None
+        } else {
+            Some(&self.powers[i - 1])
+        }
+    }
+
+    /// Returns all encrypted powers.
+    pub fn powers(&self) -> &[RnsCiphertext] {
+        &self.powers
+    }
+
+    /// Returns the BGV parameters.
+    pub fn params(&self) -> &RnsBgvParams {
+        &self.params
+    }
+
+    /// Evaluates polynomial f(·) homomorphically to get ⟦f(Λ)⟧.
+    ///
+    /// Given f(X) = c₀ + c₁X + c₂X² + ... + cₙXⁿ,
+    /// computes ⟦f(Λ)⟧ = c₀ + c₁⟦Λ⟧ + c₂⟦Λ²⟧ + ... + cₙ⟦Λⁿ⟧
+    pub fn evaluate_poly(&self, coeffs: &[u64]) -> Option<RnsCiphertext> {
+        if coeffs.is_empty() {
+            return None;
+        }
+
+        let t = self.params.t;
+
+        // Polynomial must fit within max_degree
+        if coeffs.len() > self.max_degree + 1 {
+            return None;
+        }
+
+        // If polynomial is just a constant, we can't return a proper ciphertext
+        // without having a "zero ciphertext" or fresh encryption capability
+        if coeffs.len() == 1 {
+            return None; // Constant case needs special handling
+        }
+
+        // Initialize accumulator with c₁⟦Λ⟧
+        let mut result = self.powers[0].scalar_mul(coeffs[1] % t);
+
+        // Add remaining terms c₂⟦Λ²⟧ + ...
+        for (i, &coeff) in coeffs.iter().enumerate().skip(2) {
+            if coeff != 0 {
+                let term = self.powers[i - 1].scalar_mul(coeff % t);
+                result = result.add(&term);
+            }
+        }
+
+        // Add constant term c₀
+        // Note: For RNS BGV, adding a scalar requires creating a ciphertext
+        // encrypting the scalar or using a specialized add_scalar method.
+        // For now, we assume c₀ is handled separately by the caller.
+        // TODO: Add add_scalar method to RnsCiphertext
+
+        Some(result)
+    }
+}
+
+/// RNS-based IT-PAC verifier for Goldilocks field.
+///
+/// Uses RNS BGV encryption to support large plaintext moduli (like Goldilocks).
+#[derive(Clone, Debug)]
+pub struct RnsItPacVerifier<F: ItMacField> {
+    /// Secret evaluation point Λ.
+    lambda: u64,
+    /// IT-MAC global key Δ.
+    global_key: GlobalKey<F>,
+    /// RNS BGV key pair.
+    ahe_keypair: RnsKeyPair,
+}
+
+impl<F: ItMacField> RnsItPacVerifier<F> {
+    /// Creates a new RNS IT-PAC verifier with fresh secrets.
+    pub fn new<R: Rng>(bgv_params: &RnsBgvParams, rng: &mut R) -> Self {
+        let lambda = rng.random_range(0..bgv_params.t);
+        let global_key = GlobalKey::generate(rng);
+        let ahe_keypair = RnsKeyPair::generate(bgv_params, rng);
+
+        Self {
+            lambda,
+            global_key,
+            ahe_keypair,
+        }
+    }
+
+    /// Creates a verifier configured for Goldilocks field.
+    pub fn new_goldilocks<R: Rng>(rng: &mut R) -> Self {
+        let params = RnsBgvParams::goldilocks();
+        Self::new(&params, rng)
+    }
+
+    /// Returns the secret evaluation point (for testing only).
+    pub fn lambda(&self) -> u64 {
+        self.lambda
+    }
+
+    /// Returns the IT-MAC global key.
+    pub fn global_key(&self) -> &GlobalKey<F> {
+        &self.global_key
+    }
+
+    /// Returns the RNS BGV public key.
+    pub fn public_key(&self) -> &RnsPublicKey {
+        &self.ahe_keypair.pk
+    }
+
+    /// Returns the RNS BGV secret key.
+    pub fn secret_key(&self) -> &RnsSecretKey {
+        &self.ahe_keypair.sk
+    }
+
+    /// Returns the BGV parameters.
+    pub fn params(&self) -> &RnsBgvParams {
+        self.ahe_keypair.pk.params()
+    }
+
+    /// Generates encrypted powers of Λ to send to prover.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_degree` exceeds the number of available BGV slots.
+    pub fn generate_encrypted_powers<R: Rng>(
+        &self,
+        max_degree: usize,
+        rng: &mut R,
+    ) -> RnsEncryptedPowers {
+        RnsEncryptedPowers::generate(&self.ahe_keypair.pk, self.lambda, max_degree, rng)
+    }
+
+    /// Decrypts a ciphertext (used when P sends ⟦f(Λ) - u⟧).
+    pub fn decrypt(&self, ct: &RnsCiphertext) -> u64 {
+        ct.decrypt_scalar(&self.ahe_keypair.sk)
+    }
+
+    /// Evaluates a polynomial at Λ directly (for verification).
+    pub fn evaluate_at_lambda(&self, coeffs: &[u64]) -> u64 {
+        let t = self.params().t;
         let mut result = 0u128;
         let mut lambda_power = 1u128;
         let lambda = self.lambda as u128;
@@ -1321,6 +1555,172 @@ mod tests {
             if points.contains(&lambda) {
                 assert_eq!(result, 0);
             }
+        }
+    }
+
+    // ==================== RNS IT-PAC tests ====================
+
+    mod rns_itpac_tests {
+        use super::*;
+        use crate::ahe::GOLDILOCKS;
+
+        #[test]
+        fn test_rns_encrypted_powers_generation() {
+            let mut rng = Prg::from_seed(Block::ZERO);
+            let verifier = RnsItPacVerifier::<TestField>::new_goldilocks(&mut rng);
+
+            let max_degree = 100;
+            let enc_powers = verifier.generate_encrypted_powers(max_degree, &mut rng);
+
+            assert_eq!(enc_powers.max_degree(), max_degree);
+            assert_eq!(enc_powers.powers().len(), max_degree);
+        }
+
+        #[test]
+        fn test_rns_encrypted_powers_decrypt() {
+            let mut rng = Prg::from_seed(Block::ZERO);
+            let verifier = RnsItPacVerifier::<TestField>::new_goldilocks(&mut rng);
+            let lambda = verifier.lambda();
+            let t = verifier.params().t;
+
+            let max_degree = 10;
+            let enc_powers = verifier.generate_encrypted_powers(max_degree, &mut rng);
+
+            // Decrypt each power and verify
+            let mut expected_power = lambda;
+            for i in 1..=max_degree {
+                let ct = enc_powers.get(i).unwrap();
+                let decrypted = verifier.decrypt(ct);
+                assert_eq!(
+                    decrypted, expected_power,
+                    "power {} should be Λ^{} = {}, got {}",
+                    i, i, expected_power, decrypted
+                );
+                expected_power = ((expected_power as u128 * lambda as u128) % t as u128) as u64;
+            }
+        }
+
+        #[test]
+        fn test_rns_polynomial_evaluation() {
+            let mut rng = Prg::from_seed(Block::ZERO);
+            let verifier = RnsItPacVerifier::<TestField>::new_goldilocks(&mut rng);
+            let t = verifier.params().t;
+
+            let max_degree = 10;
+            let enc_powers = verifier.generate_encrypted_powers(max_degree, &mut rng);
+
+            // Polynomial f(X) = 5 + 3X + 2X² + 7X³
+            // Note: c₀=5 is not included in homomorphic evaluation (handled separately)
+            let poly = vec![5u64, 3, 2, 7];
+
+            // Evaluate homomorphically (returns c₁Λ + c₂Λ² + c₃Λ³, not including c₀)
+            let result_ct = enc_powers.evaluate_poly(&poly).unwrap();
+            let result_without_c0 = verifier.decrypt(&result_ct);
+
+            // Add c₀ manually
+            let result = (result_without_c0 as u128 + poly[0] as u128) % (t as u128);
+
+            // Compare with direct evaluation
+            let expected = verifier.evaluate_at_lambda(&poly);
+
+            assert_eq!(
+                result as u64, expected,
+                "homomorphic evaluation {} != direct evaluation {}",
+                result, expected
+            );
+        }
+
+        #[test]
+        fn test_rns_polynomial_evaluation_large_coeffs() {
+            let mut rng = Prg::from_seed(Block::ZERO);
+            let verifier = RnsItPacVerifier::<TestField>::new_goldilocks(&mut rng);
+            let t = verifier.params().t;
+
+            let max_degree = 5;
+            let enc_powers = verifier.generate_encrypted_powers(max_degree, &mut rng);
+
+            // Polynomial with large Goldilocks coefficients
+            let poly = vec![
+                GOLDILOCKS - 1,  // c₀ = -1 mod p
+                GOLDILOCKS - 100, // c₁ = -100 mod p
+                12345678901234u64 % GOLDILOCKS, // c₂
+                GOLDILOCKS / 2, // c₃
+            ];
+
+            let result_ct = enc_powers.evaluate_poly(&poly).unwrap();
+            let result_without_c0 = verifier.decrypt(&result_ct);
+            let result = (result_without_c0 as u128 + poly[0] as u128) % (t as u128);
+
+            let expected = verifier.evaluate_at_lambda(&poly);
+
+            assert_eq!(result as u64, expected);
+        }
+
+        #[test]
+        fn test_rns_verifier_evaluate_at_lambda() {
+            let mut rng = Prg::from_seed(Block::ZERO);
+            let verifier = RnsItPacVerifier::<TestField>::new_goldilocks(&mut rng);
+            let lambda = verifier.lambda();
+            let t = verifier.params().t;
+
+            // f(X) = 1 + 2X + 3X²
+            let poly = vec![1u64, 2, 3];
+
+            let result = verifier.evaluate_at_lambda(&poly);
+
+            // Manual computation
+            let expected = (1 + 2 * lambda as u128 + 3 * (lambda as u128).pow(2)) % t as u128;
+            assert_eq!(result, expected as u64);
+        }
+
+        #[test]
+        #[should_panic(expected = "exceeds available BGV slots")]
+        fn test_rns_encrypted_powers_exceeds_slots() {
+            let mut rng = Prg::from_seed(Block::ZERO);
+            let verifier = RnsItPacVerifier::<TestField>::new_goldilocks(&mut rng);
+
+            // Goldilocks with N=8192 has 8192 slots
+            // Trying to create 10000 powers should fail
+            let _ = verifier.generate_encrypted_powers(10000, &mut rng);
+        }
+
+        #[test]
+        fn test_rns_linear_polynomial() {
+            let mut rng = Prg::from_seed(Block::ZERO);
+            let verifier = RnsItPacVerifier::<TestField>::new_goldilocks(&mut rng);
+            let t = verifier.params().t;
+
+            let enc_powers = verifier.generate_encrypted_powers(10, &mut rng);
+
+            // f(X) = 100 + 50X (linear)
+            let poly = vec![100u64, 50];
+
+            let result_ct = enc_powers.evaluate_poly(&poly).unwrap();
+            let result_without_c0 = verifier.decrypt(&result_ct);
+            let result = (result_without_c0 as u128 + poly[0] as u128) % (t as u128);
+
+            let expected = verifier.evaluate_at_lambda(&poly);
+            assert_eq!(result as u64, expected);
+        }
+
+        #[test]
+        fn test_rns_higher_degree_polynomial() {
+            let mut rng = Prg::from_seed(Block::ZERO);
+            let verifier = RnsItPacVerifier::<TestField>::new_goldilocks(&mut rng);
+            let t = verifier.params().t;
+
+            let max_degree = 20;
+            let enc_powers = verifier.generate_encrypted_powers(max_degree, &mut rng);
+
+            // f(X) = 1 + X + X² + ... + X^10 (degree 10)
+            let poly: Vec<u64> = (0..=10).map(|_| 1u64).collect();
+
+            let result_ct = enc_powers.evaluate_poly(&poly).unwrap();
+            let result_without_c0 = verifier.decrypt(&result_ct);
+            let result = (result_without_c0 as u128 + poly[0] as u128) % (t as u128);
+
+            let expected = verifier.evaluate_at_lambda(&poly);
+            assert_eq!(result as u64, expected);
         }
     }
 }

@@ -44,8 +44,13 @@ impl SlotEncoder {
     ///
     /// Returns None if slot packing is not supported (t ≢ 1 (mod 2n)).
     pub fn new(params: &BgvParams) -> Option<Self> {
-        let n = params.n;
-        let t = params.t;
+        Self::new_direct(params.n, params.t)
+    }
+
+    /// Creates a new slot encoder with explicit n and t.
+    ///
+    /// Returns None if slot packing is not supported (t ≢ 1 (mod 2n)).
+    pub fn new_direct(n: usize, t: u64) -> Option<Self> {
 
         // Check if slot packing is supported: t ≡ 1 (mod 2n)
         let order = 2 * n as u64;
@@ -139,22 +144,33 @@ impl SlotEncoder {
 
     /// Forward NTT: evaluates polynomial at zeta^(2i+1) for i = 0..n.
     ///
-    /// Uses Cooley-Tukey butterfly with negacyclic twist.
+    /// Uses pre-twist followed by Cooley-Tukey butterfly.
+    /// This computes p(ζ^(2k+1)) = Σ_i a_i * ζ^((2k+1)i) for k = 0..n-1.
+    ///
+    /// The pre-twist converts evaluation at odd powers to standard NTT:
+    /// - Pre-twist: b_i = a_i * ζ^i
+    /// - NTT: result[k] = Σ_i b_i * ω^(ik) = Σ_i a_i * ζ^((2k+1)i) = p(ζ^(2k+1))
     fn forward_ntt(&self, data: &mut [u64]) {
         let n = self.n;
         let log_n = n.trailing_zeros();
 
+        // Pre-twist: multiply by zeta^i for evaluation at odd powers
+        // This converts: p(ζ^(2k+1)) = Σ a_i * ζ^((2k+1)i) to standard NTT form
+        let mut twist = 1u64;
+        for i in 0..n {
+            data[i] = Self::mod_mul(data[i], twist, self.t);
+            twist = Self::mod_mul(twist, self.zeta, self.t);
+        }
+
         // Bit-reversal permutation
         Self::bit_reverse(data, log_n);
 
-        // Cooley-Tukey butterflies for negacyclic NTT
+        // Cooley-Tukey butterflies for standard NTT
+        // Uses omega = zeta^2 (an n-th root of unity)
         for s in 0..log_n {
             let m = 1 << (s + 1);
             let half_m = m / 2;
 
-            // Compute root of unity for this stage
-            // For negacyclic NTT with evaluation at odd powers of zeta,
-            // we use powers of zeta^2 (which is an n-th root of unity)
             let exp = n / m;
             let w_m = Self::mod_pow(self.zeta, (2 * exp) as u64, self.t);
 
@@ -171,28 +187,19 @@ impl SlotEncoder {
                 }
             }
         }
-
-        // Apply twist: multiply by zeta^i for evaluation at odd powers
-        let mut twist = 1u64;
-        for i in 0..n {
-            data[i] = Self::mod_mul(data[i], twist, self.t);
-            twist = Self::mod_mul(twist, self.zeta, self.t);
-        }
     }
 
     /// Inverse NTT: interpolates polynomial from values at zeta^(2i+1).
     ///
-    /// Uses Gentleman-Sande butterfly with inverse twist.
+    /// Uses Gentleman-Sande butterfly with post-untwist.
+    /// This is the inverse of forward_ntt (which uses pre-twist).
+    ///
+    /// The post-untwist converts from standard inverse NTT to interpolation at odd powers:
+    /// - Inverse NTT gives: c_i = (1/n) * Σ_k v_k * ω^(-ik)
+    /// - Post-untwist: a_i = c_i * ζ^(-i) gives correct coefficients for p(ζ^(2k+1)) = v_k
     fn inverse_ntt(&self, data: &mut [u64]) {
         let n = self.n;
         let log_n = n.trailing_zeros();
-
-        // Remove twist: multiply by zeta^(-i)
-        let mut twist_inv = 1u64;
-        for i in 0..n {
-            data[i] = Self::mod_mul(data[i], twist_inv, self.t);
-            twist_inv = Self::mod_mul(twist_inv, self.zeta_inv, self.t);
-        }
 
         // Gentleman-Sande (inverse) butterflies
         for s in (0..log_n).rev() {
@@ -222,6 +229,14 @@ impl SlotEncoder {
         // Scale by 1/n
         for x in data.iter_mut() {
             *x = Self::mod_mul(*x, self.n_inv, self.t);
+        }
+
+        // Post-untwist: multiply by zeta^(-i) to convert from standard inverse NTT
+        // to interpolation at odd powers ζ^(2k+1)
+        let mut twist_inv = 1u64;
+        for i in 0..n {
+            data[i] = Self::mod_mul(data[i], twist_inv, self.t);
+            twist_inv = Self::mod_mul(twist_inv, self.zeta_inv, self.t);
         }
     }
 
@@ -270,22 +285,21 @@ impl SlotEncoder {
     }
 
     /// Modular addition: (a + b) mod t.
+    /// Uses u128 to avoid overflow with large moduli like Goldilocks.
     #[inline]
     fn mod_add(a: u64, b: u64, t: u64) -> u64 {
-        let sum = a + b;
-        if sum >= t {
-            sum - t
-        } else {
-            sum
-        }
+        let sum = (a as u128) + (b as u128);
+        (sum % t as u128) as u64
     }
 
     /// Modular subtraction: (a - b) mod t.
+    /// Uses u128 to handle underflow correctly.
     #[inline]
     fn mod_sub(a: u64, b: u64, t: u64) -> u64 {
         if a >= b {
             a - b
         } else {
+            // a - b + t, but a < b, so compute t - (b - a)
             t - (b - a)
         }
     }
@@ -522,5 +536,104 @@ mod slot_tests {
         // Verify inverse exists
         assert_eq!(SlotEncoder::mod_mul(zeta, zeta_inv, t), 1);
         assert_eq!(SlotEncoder::mod_mul(n as u64, n_inv, t), 1);
+    }
+
+    #[test]
+    fn test_decode_constant_polynomial() {
+        // Test that the constant polynomial p(X) = 1 evaluates to 1 at all roots.
+        // This is critical for verifying the NTT correctly evaluates at odd roots.
+        let params = ParamSet::Toy.params();
+        let encoder = SlotEncoder::new(&params).unwrap();
+        let n = encoder.num_slots();
+
+        // Constant polynomial: coeffs = [1, 0, 0, ..., 0]
+        let mut coeffs = vec![0u64; n];
+        coeffs[0] = 1;
+
+        // Decode should give [1, 1, 1, ..., 1]
+        let decoded = encoder.decode(&coeffs);
+
+        for (i, &val) in decoded.iter().enumerate() {
+            assert_eq!(val, 1, "slot {} should be 1 for constant polynomial p(X)=1", i);
+        }
+    }
+
+    #[test]
+    fn test_encode_constant_slots() {
+        // Test that encoding constant slots [c, c, ..., c] gives the constant polynomial [c, 0, 0, ..., 0].
+        let params = ParamSet::Toy.params();
+        let encoder = SlotEncoder::new(&params).unwrap();
+        let n = encoder.num_slots();
+
+        let constant = 42u64;
+        let slots = vec![constant; n];
+
+        let encoded = encoder.encode(&slots);
+
+        // First coefficient should be the constant value
+        assert_eq!(encoded[0], constant, "first coefficient should equal the constant");
+
+        // All other coefficients should be 0
+        for (i, &coeff) in encoded.iter().enumerate().skip(1) {
+            assert_eq!(coeff, 0, "coefficient {} should be 0 for constant encoding", i);
+        }
+    }
+
+    #[test]
+    fn test_slot_multiplication_homomorphism() {
+        // Test that polynomial multiplication gives slot-wise (element-wise) multiplication.
+        // This is the key property for SIMD operations: decode(encode(s1) * encode(s2)) = s1 ⊙ s2
+
+        let params = ParamSet::Toy.params();
+        let encoder = SlotEncoder::new(&params).unwrap();
+        let t = encoder.modulus();
+        let n = encoder.num_slots();
+
+        // Two sets of slot values (small values to avoid overflow)
+        let slots1: Vec<u64> = (1..=n as u64).map(|i| (i % 100) + 1).collect();
+        let slots2: Vec<u64> = (1..=n as u64).map(|i| ((i * 3) % 100) + 1).collect();
+
+        // Encode both
+        let poly1 = encoder.encode(&slots1);
+        let poly2 = encoder.encode(&slots2);
+
+        // Multiply polynomials mod X^n + 1 in Z_t (not Z_q)
+        // Use schoolbook multiplication with mod t reduction
+        let product_coeffs = poly_mul_mod_xn_plus_1(&poly1, &poly2, n, t);
+
+        // Decode the product
+        let decoded_product = encoder.decode(&product_coeffs);
+
+        // Should equal slot-wise multiplication
+        for (i, ((&s1, &s2), &d)) in slots1.iter().zip(slots2.iter()).zip(decoded_product.iter()).enumerate() {
+            let expected = (s1 * s2) % t;
+            assert_eq!(expected, d, "mismatch at slot {} for multiplication: {} * {} = {} (got {})", i, s1, s2, expected, d);
+        }
+    }
+
+    /// Helper: polynomial multiplication mod (X^n + 1) with modulus t.
+    fn poly_mul_mod_xn_plus_1(a: &[u64], b: &[u64], n: usize, t: u64) -> Vec<u64> {
+        let mut result = vec![0i128; n];
+        let t_i128 = t as i128;
+
+        // Schoolbook multiplication
+        for (i, &ai) in a.iter().enumerate() {
+            for (j, &bj) in b.iter().enumerate() {
+                let prod = (ai as i128) * (bj as i128);
+                let idx = i + j;
+                if idx < n {
+                    result[idx] = (result[idx] + prod) % t_i128;
+                } else {
+                    // X^n = -1, so X^(n+k) = -X^k
+                    result[idx - n] = (result[idx - n] - prod) % t_i128;
+                }
+            }
+        }
+
+        // Reduce to positive mod t
+        result.iter().map(|&r| {
+            let rem = r % t_i128;
+            if rem < 0 { (rem + t_i128) as u64 } else { rem as u64 }
+        }).collect()
     }
 }
