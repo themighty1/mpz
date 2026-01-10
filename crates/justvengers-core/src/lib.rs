@@ -27,6 +27,8 @@ pub use ahe::{
     RnsCiphertext, RnsKeyPair, RnsPublicKey, RnsSecretKey, RnsBgvParams, GOLDILOCKS,
     RnsGaloisKey, RnsGaloisKeys,
     SlotPackedEncryptedPowers, SlotPackedCiphertextBatch, decrypt_batched_evaluation,
+    CiphertextPacking, PackedSlots, PackedValue, SlotPacker,
+    PackedEncryptedPowers, PackedProverEvaluator, PackedVerifierEvaluator,
 };
 pub use itmac::{GlobalKey, ItMac, ItMacBatch, ItMacField, ProverShare, VerifierShare, VolePool, VoleSource};
 pub use itpac::{EncryptedPowers, ItPac, ItPacGenerator, ItPacVerifier, RnsEncryptedPowers, RnsItPacVerifier};

@@ -17,6 +17,7 @@ mpz-fields = { workspace = true }
 
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+bincode = { workspace = true }
 rayon = { workspace = true, optional = true }
 rand = { workspace = true }
 
@@ -27,4 +28,16 @@ rstest = { workspace = true }
 
 [[bench]]
 name = "rotation_bench"
+harness = false
+
+[[bench]]
+name = "sum_slots_to_slot_bench"
+harness = false
+
+[[bench]]
+name = "packing_bench"
+harness = false
+
+[[bench]]
+name = "packed_eval_bench"
 harness = false

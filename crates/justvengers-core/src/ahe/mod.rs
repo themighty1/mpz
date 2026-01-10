@@ -20,6 +20,8 @@ mod sample;
 mod slot;
 mod rns;
 mod rns_bgv;
+mod packing;
+mod packed_eval;
 
 pub use params::{BgvParams, ParamSet, RnsBgvParams, GOLDILOCKS};
 pub use ring::{BarrettReducer, RingPoly};
@@ -34,6 +36,8 @@ pub use rns_bgv::{
     SlotPackedEncryptedPowers, SlotPackedCiphertextBatch,
     decrypt_batched_evaluation,
 };
+pub use packing::{CiphertextPacking, PackedSlots, PackedValue, SlotPacker};
+pub use packed_eval::{PackedEncryptedPowers, PackedProverEvaluator, PackedVerifierEvaluator};
 
 #[cfg(test)]
 mod tests;
