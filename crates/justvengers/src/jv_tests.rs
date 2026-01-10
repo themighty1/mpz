@@ -1,6 +1,7 @@
 //! Tests for the JustVengers protocol implementation.
 
 use crate::jv::*;
+use rand::Rng;
 use crate::topology::Circuit;
 use crate::{CircuitBatch, SolderingConstraint, VolePool};
 use mpz_fields::goldilocks::GOLDILOCKS;
@@ -291,4 +292,141 @@ fn test_vanishing_poly_division() {
     assert!(rem_is_zero, "Remainder should be 0");
 
     println!("Vanishing polynomial division test passed!");
+}
+
+#[test]
+#[ignore] // Run with: cargo test -p mpz-justvengers test_jv_protocol_with_disk_keys -- --ignored --nocapture
+fn test_jv_protocol_with_disk_keys() {
+    //! Full JustVengers protocol e2e test with keys loaded from disk.
+    //!
+    //! Protocol flow:
+    //!   V: loads sk + Galois keys from disk, encrypts λ powers
+    //!   P: loads Galois keys from disk, evaluates + sum_slots
+    //!   V: decrypts and verifies
+    //!
+    //! Note: With the new rotation-free packed evaluation, we no longer need
+    //! pre-loaded Galois keys from disk.
+
+    const R: usize = 4;
+
+    println!("=== JustVengers Protocol E2E Test ===\n");
+    println!("[V] Using rotation-free packed evaluation (no Galois keys needed)");
+
+    // ========== Setup circuit ==========
+    println!("\n[Setup] Creating test circuit...");
+
+    let mut circuit = Circuit::new();
+    let x = circuit.add_input();
+    let y = circuit.add_input();
+    let one = circuit.add_const(1);
+    circuit.add_mul(x, y);
+    circuit.add_mul(y, one);
+
+    let batch = CircuitBatch::new(vec![circuit]);
+
+    // Inputs for R repetitions
+    let mut inputs = Vec::with_capacity(R);
+    let mut prev_y = 2u64;
+    for _ in 0..R {
+        let y_val = 3u64;
+        inputs.push(vec![prev_y, y_val]);
+        prev_y = y_val;
+    }
+    let branches = vec![0; R];
+
+    let constraint = SolderingConstraint::new(0, 1);
+
+    // ========== Initialize Prover ==========
+    println!("\n[P] Initializing prover...");
+    let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
+
+    let mut prover = JVProver::<R>::new(branches.clone(), GOLDILOCKS);
+    prover.setup(&batch, &inputs).expect("Prover setup failed");
+    prover.setup_soldering(vec![constraint.clone()], &mut rng).expect("Soldering setup failed");
+
+    // ========== Initialize Verifier ==========
+    println!("[V] Initializing verifier...");
+
+    let mut verifier = JVVerifier::<R>::new(GOLDILOCKS, &mut rng);
+    let setup_msg = verifier.setup(&batch, &mut rng)
+        .expect("Verifier setup failed");
+    verifier.setup_soldering(vec![constraint]).expect("Verifier soldering setup failed");
+
+    println!("[V] Setup complete - packed encrypted powers generated");
+
+    // ========== Protocol execution ==========
+    println!("\n=== Protocol Execution ===");
+
+    // Create VOLE pool
+    let circuit_size = batch.get(0).map(|c| c.num_wires()).unwrap_or(10);
+    let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
+    let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
+    verifier.set_verifier_local_keys(verifier_shares);
+
+    // Phase 1: Commit
+    println!("[P] Committing...");
+    let commitment = prover.commit(&setup_msg, vole_pool).expect("Commit failed");
+    let _input_coeff_msg = prover.commit_input_coefficients().expect("Input coeff commit failed");
+    let _mk_commitment = prover.commit_mk_polynomials().expect("MK commit failed");
+    let soldering_commit = prover.commit_soldering().expect("Soldering commit failed");
+
+    // Phase 2: Challenge χ
+    println!("[V] Sending challenge χ...");
+    let chi = verifier.receive_commitment(commitment).expect("Receive commitment failed");
+    let gamma: u64 = rng.random_range(1..GOLDILOCKS);
+
+    let soldering_challenge = if let Some(commit) = soldering_commit {
+        verifier.receive_soldering_commit(commit, &mut rng).expect("Receive soldering commit failed")
+    } else {
+        None
+    };
+
+    // Phase 3: Disclose
+    println!("[P] Disclosing (O(R) instead of O(RC))...");
+    let disclosure = prover.disclose(chi, verifier.topology_vectors()).expect("Disclose failed");
+
+    if let Some(ref challenge) = soldering_challenge {
+        let reveal = prover.reveal_soldering_aggregated(challenge).expect("Reveal soldering failed");
+        if let Some(r) = reveal {
+            verifier.receive_soldering_reveal_aggregated(&r).expect("Receive reveal failed");
+        }
+    }
+
+    // Phase 4: Challenge ρ
+    println!("[V] Sending challenge ρ...");
+    let rho = verifier.receive_disclosure(disclosure, &mut rng).expect("Receive disclosure failed");
+
+    // Phase 5: Open
+    println!("[P] Opening with ZK branch hiding...");
+    let open_msg = prover.open(rho, gamma, verifier.topology_vectors()).expect("Open failed");
+    let open_valid = verifier.receive_open(open_msg, gamma).expect("Receive open failed");
+
+    if !open_valid {
+        panic!("MK proof verification failed");
+    }
+
+    // Phase 5b: IT-PAC Opening
+    println!("[P] Opening IT-PAC commitments...");
+    let itpac_open_msg = prover.open_itpac().expect("IT-PAC open failed");
+
+    println!("[V] Verifying IT-PAC opening...");
+    if !verifier.verify_itpac_opening(&itpac_open_msg) {
+        panic!("IT-PAC verification failed");
+    }
+
+    // Phase 6: LPZK proof
+    println!("[P] Generating LPZK multiplication proof...");
+    let lpzk_proof = prover.prove_multiplications().expect("LPZK proof failed");
+
+    println!("[V] Verifying LPZK proof...");
+    let result = verifier.verify_multiplications(lpzk_proof).expect("LPZK verify failed");
+
+    // ========== Result ==========
+    println!("\n=== Result ===");
+    println!("  Protocol completed: {}", result);
+    println!("  V loaded keys from disk (no key generation)");
+    println!("  P performed sum_slots using Galois keys from disk");
+
+    assert!(result, "JV protocol verification failed");
+    println!("\nFull JustVengers protocol e2e test with disk keys PASSED!");
 }

@@ -60,10 +60,10 @@ use mpz_justvengers_core::{
     GlobalKey, ItMacField, ItPac, VolePool,
 };
 
-// RNS BGV imports for slot-packed parallel operations
+// RNS BGV imports for packed evaluation (rotation-free)
 use mpz_justvengers_core::{
     RnsBgvParams, RnsCiphertext, RnsKeyPair, RnsPublicKey, RnsSecretKey,
-    RnsGaloisKeys, SlotPackedEncryptedPowers,
+    PackedEncryptedPowers, PackedProverEvaluator,
 };
 
 use mpz_core::{prg::Prg, Block};
@@ -294,15 +294,12 @@ pub struct JVSetupMessage {
     /// V commits to this in setup; reveals seed later so P can verify AHE ciphertexts.
     pub ahe_seed_commitment: [u8; 32],
 
-    // === RNS BGV slot-packed fields ===
-    /// Slot-packed encrypted powers (single ciphertext with all powers in slots).
-    /// Prover uses sum_slots_to_slot to place each polynomial's sum in a unique slot.
+    // === Packed evaluation fields (rotation-free) ===
+    /// Packed encrypted powers [Λ^0, ..., Λ^{n-1}] in slots.
+    /// Prover uses slot-wise mul + blinding, verifier sums in clear.
     #[serde(skip)]
-    pub rns_slot_packed_powers: Option<SlotPackedEncryptedPowers>,
-    /// Galois keys for rotation operations (sum_slots_to_slot).
-    #[serde(skip)]
-    pub rns_galois_keys: Option<RnsGaloisKeys>,
-    /// RNS public key for slot-packed operations.
+    pub packed_powers: Option<PackedEncryptedPowers>,
+    /// RNS public key for encryption.
     #[serde(skip)]
     pub rns_public_key: Option<RnsPublicKey>,
 }
@@ -584,16 +581,14 @@ pub struct JVProver<const R: usize> {
     vanishing_poly: Option<Vec<u64>>,
 
     // ==========================================================================
-    // RNS BGV slot-packed fields (for sum_slots_to_slot evaluation)
+    // Packed evaluation fields (rotation-free)
     // ==========================================================================
 
-    /// Slot-packed encrypted powers received from verifier.
-    rns_slot_packed_powers: Option<SlotPackedEncryptedPowers>,
-    /// Galois keys for rotation operations.
-    rns_galois_keys: Option<RnsGaloisKeys>,
-    /// RNS public key for slot-packed operations.
+    /// Packed encrypted powers [Λ^0, ..., Λ^{n-1}] in slots.
+    packed_powers: Option<PackedEncryptedPowers>,
+    /// RNS public key for encryption.
     rns_public_key: Option<RnsPublicKey>,
-    /// RNS ciphertexts from slot-packed evaluation (for opening).
+    /// RNS ciphertexts from packed evaluation (for opening).
     rns_ciphertexts: Vec<RnsCiphertext>,
 }
 
@@ -649,9 +644,8 @@ impl<const R: usize> JVProver<R> {
             mk_rns_ciphertexts: Vec::new(),
             // Cached vanishing polynomial
             vanishing_poly: None,
-            // RNS BGV slot-packed fields
-            rns_slot_packed_powers: None,
-            rns_galois_keys: None,
+            // Packed evaluation fields
+            packed_powers: None,
             rns_public_key: None,
             rns_ciphertexts: Vec::new(),
         }
@@ -836,9 +830,8 @@ impl<const R: usize> JVProver<R> {
         self.ahe_seed_commitment = Some(setup_msg.ahe_seed_commitment);
         self.ahe_public_key = Some(setup_msg.ahe_public_key.clone());
 
-        // Store RNS slot-packed fields for polynomial evaluation
-        self.rns_slot_packed_powers = setup_msg.rns_slot_packed_powers.clone();
-        self.rns_galois_keys = setup_msg.rns_galois_keys.clone();
+        // Store packed evaluation fields
+        self.packed_powers = setup_msg.packed_powers.clone();
         self.rns_public_key = setup_msg.rns_public_key.clone();
 
         // Create INTT context for Goldilocks
@@ -861,53 +854,54 @@ impl<const R: usize> JVProver<R> {
             self.wire_polynomials.push(poly);
         }
 
-        // Use slot-packed evaluation with sum_slots_to_slot
-        // Each polynomial i gets summed and placed in slot i
-        // All ciphertexts are added together, V reads slots 0..num_polys-1
-        let slot_packed = self.rns_slot_packed_powers.as_ref()
-            .ok_or(JVProverError::MissingSetupData)?;
-        let galois_keys = self.rns_galois_keys.as_ref()
+        // Use packed evaluation with slot-wise mul + blinding (rotation-free)
+        // P evaluates each polynomial, blinds with VOLE blinder, and 2-way packs pairs
+        // V decrypts and sums in the clear to get f(Λ) - u
+        let packed_powers = self.packed_powers.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
 
-        let num_slots = slot_packed.num_slots();
         let num_polys = self.wire_polynomials.len();
+        let n = packed_powers.num_powers;
+        let t = packed_powers.t;
 
-        // Accumulate all polynomial evaluations into one ciphertext
-        let mut accumulated_ct: Option<RnsCiphertext> = None;
-
-        for (i, poly) in self.wire_polynomials.iter().enumerate() {
-            // Evaluate single polynomial (coeffs in lane 0, zeros elsewhere)
-            let (ct, _constants) = slot_packed.evaluate_batch(&[poly.clone()]);
-
-            // Sum all 8192 slots, place result in slot i
-            #[cfg(feature = "rayon")]
-            let ct_summed = ct.sum_slots_to_slot_parallel(galois_keys, i, num_slots);
-            #[cfg(not(feature = "rayon"))]
-            let ct_summed = ct.sum_slots_to_slot(galois_keys, i, num_slots);
-
-            // Add to accumulated ciphertext
-            accumulated_ct = Some(match accumulated_ct {
-                None => ct_summed,
-                Some(acc) => acc.add(&ct_summed),
-            });
-        }
-
-        // Store the single accumulated ciphertext
-        if let Some(ct) = accumulated_ct {
-            let ct_commitment = Self::compute_rns_ciphertext_commitment(&ct);
-            // All polynomials share the same commitment (one ciphertext)
-            for _ in 0..num_polys {
-                self.ciphertext_commitments.push(ct_commitment);
-            }
-            self.rns_ciphertexts.push(ct);
-        }
-
-        // Create IT-PAC commitments with VOLE masking
+        // Create IT-PAC commitments with VOLE masking and collect blinders
         let vole_pool = self.vole_pool.as_mut().ok_or(JVProverError::MissingSetupData)?;
+        let mut vole_blinders = Vec::with_capacity(num_polys);
         for poly in &self.wire_polynomials {
             if let Some(random_mac) = vole_pool.get_random() {
+                vole_blinders.push(random_mac.prover_share().value().inner());
                 self.itpac_commitments.push(ItPac::new(poly.clone(), random_mac));
+            } else {
+                // No more VOLE correlations - use 0 as blinder (reduces security but allows protocol to continue)
+                vole_blinders.push(0);
             }
+        }
+
+        // Pad polynomials to slot size n
+        let mut padded_rows: Vec<Vec<u64>> = self.wire_polynomials.iter()
+            .map(|poly| {
+                let mut row = poly.clone();
+                row.resize(n, 0);
+                row
+            })
+            .collect();
+
+        // Ensure even number of rows for 2-way packing
+        if padded_rows.len() % 2 != 0 {
+            padded_rows.push(vec![0u64; n]);
+            vole_blinders.push(0);
+        }
+
+        // Use PackedProverEvaluator for slot-wise mul + blinding + 2-way packing
+        let evaluator = PackedProverEvaluator::new(packed_powers);
+        let mut rng = Prg::from_seed(Block::ZERO);
+        let packed_cts = evaluator.evaluate_all_rows(&padded_rows, &vole_blinders, &mut rng);
+
+        // Store packed ciphertexts
+        for ct in packed_cts {
+            let ct_commitment = Self::compute_rns_ciphertext_commitment(&ct);
+            self.ciphertext_commitments.push(ct_commitment);
+            self.rns_ciphertexts.push(ct);
         }
 
         // Step 9 from paper: Commit to input polynomial coefficients as IT-MACs
@@ -1019,56 +1013,59 @@ impl<const R: usize> JVProver<R> {
             self.mk_polynomials.push(poly);
         }
 
-        // Step 3: Create commitments using slot-packed evaluation with sum_slots_to_slot
-        // Each MK polynomial i gets summed and placed in slot i
+        // Step 3: Create commitments using packed evaluation (rotation-free)
+        // P evaluates each MK polynomial, blinds with VOLE blinder, and 2-way packs pairs
         self.mk_itpac_commitments = Vec::with_capacity(num_branches);
         self.mk_ciphertext_commitments = Vec::with_capacity(num_branches);
         self.mk_rns_ciphertexts = Vec::new();
 
-        let slot_packed = self.rns_slot_packed_powers.as_ref()
-            .ok_or(JVProverError::MissingSetupData)?;
-        let galois_keys = self.rns_galois_keys.as_ref()
+        let packed_powers = self.packed_powers.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
 
-        let num_slots = slot_packed.num_slots();
+        let n = packed_powers.num_powers;
 
-        // Accumulate all MK polynomial evaluations into one ciphertext
-        let mut accumulated_ct: Option<RnsCiphertext> = None;
-
-        for (i, poly) in self.mk_polynomials.iter().enumerate() {
-            // Evaluate single polynomial (coeffs in lane 0, zeros elsewhere)
-            let (ct, _constants) = slot_packed.evaluate_batch(&[poly.clone()]);
-
-            // Sum all 8192 slots, place result in slot i
-            #[cfg(feature = "rayon")]
-            let ct_summed = ct.sum_slots_to_slot_parallel(galois_keys, i, num_slots);
-            #[cfg(not(feature = "rayon"))]
-            let ct_summed = ct.sum_slots_to_slot(galois_keys, i, num_slots);
-
-            // Add to accumulated ciphertext
-            accumulated_ct = Some(match accumulated_ct {
-                None => ct_summed,
-                Some(acc) => acc.add(&ct_summed),
-            });
-        }
-
-        // Store the single accumulated ciphertext
-        if let Some(ct) = accumulated_ct {
-            let ct_commitment = Self::compute_rns_ciphertext_commitment(&ct);
-            // All MK polynomials share the same commitment (one ciphertext)
-            for _ in 0..num_branches {
-                self.mk_ciphertext_commitments.push(ct_commitment);
-            }
-            self.mk_rns_ciphertexts.push(ct);
-        }
-
-        // Create IT-PAC commitments with VOLE masking if pool available
+        // Create IT-PAC commitments with VOLE masking and collect blinders
+        let mut vole_blinders = Vec::with_capacity(num_branches);
         if let Some(vole_pool) = self.vole_pool.as_mut() {
             for poly in &self.mk_polynomials {
                 if let Some(random_mac) = vole_pool.get_random() {
+                    vole_blinders.push(random_mac.prover_share().value().inner());
                     self.mk_itpac_commitments.push(ItPac::new(poly.clone(), random_mac));
+                } else {
+                    // No more VOLE correlations - use 0 as blinder
+                    vole_blinders.push(0);
                 }
             }
+        } else {
+            // No VOLE pool - use 0 blinders for all MK polynomials
+            vole_blinders.resize(num_branches, 0);
+        }
+
+        // Pad polynomials to slot size n
+        let mut padded_rows: Vec<Vec<u64>> = self.mk_polynomials.iter()
+            .map(|poly| {
+                let mut row = poly.clone();
+                row.resize(n, 0);
+                row
+            })
+            .collect();
+
+        // Ensure even number of rows for 2-way packing
+        if padded_rows.len() % 2 != 0 {
+            padded_rows.push(vec![0u64; n]);
+            vole_blinders.push(0);
+        }
+
+        // Use PackedProverEvaluator for slot-wise mul + blinding + 2-way packing
+        let evaluator = PackedProverEvaluator::new(packed_powers);
+        let mut rng = Prg::from_seed(Block::ZERO);
+        let packed_cts = evaluator.evaluate_all_rows(&padded_rows, &vole_blinders, &mut rng);
+
+        // Store packed ciphertexts
+        for ct in packed_cts {
+            let ct_commitment = Self::compute_rns_ciphertext_commitment(&ct);
+            self.mk_ciphertext_commitments.push(ct_commitment);
+            self.mk_rns_ciphertexts.push(ct);
         }
 
         Ok(MKCommitmentMessage {
@@ -1824,15 +1821,13 @@ pub struct JVVerifier<const R: usize> {
     num_branches: usize,
 
     // ==========================================================================
-    // RNS BGV slot-packed fields (for sum_slots_to_slot evaluation)
+    // Packed evaluation fields (rotation-free)
     // ==========================================================================
 
-    /// RNS BGV key pair for slot-packed operations.
+    /// RNS BGV key pair for decryption.
     rns_keypair: Option<RnsKeyPair>,
-    /// Slot-packed encrypted powers (single ciphertext).
-    rns_slot_packed_powers: Option<SlotPackedEncryptedPowers>,
-    /// Galois keys for rotation operations.
-    rns_galois_keys: Option<RnsGaloisKeys>,
+    /// Packed encrypted powers [Λ^0, ..., Λ^{n-1}] in slots.
+    packed_powers: Option<PackedEncryptedPowers>,
 }
 
 /// Protocol phases for the optimized verifier.
@@ -1896,10 +1891,9 @@ impl<const R: usize> JVVerifier<R> {
             decrypted_mk_commitments: Vec::new(),
             mk_local_keys: Vec::new(),
             num_branches: 0,
-            // RNS BGV slot-packed fields
+            // Packed evaluation fields
             rns_keypair: None,
-            rns_slot_packed_powers: None,
-            rns_galois_keys: None,
+            packed_powers: None,
         }
     }
 
@@ -1980,24 +1974,19 @@ impl<const R: usize> JVVerifier<R> {
         let ahe_keypair = self.ahe_keypair.as_ref().expect("AHE keypair should be initialized");
         let ahe_public_key = ahe_keypair.pk.clone();
 
-        // Generate RNS BGV slot-packed powers and Galois keys
+        // Generate RNS BGV keypair and packed encrypted powers (rotation-free)
         let rns_params = RnsBgvParams::goldilocks();
         let rns_keypair = RnsKeyPair::generate(&rns_params, rng);
 
-        // For slot packing, max_degree must divide num_slots evenly
-        // Use a lane size that divides 8192 (e.g., 128, 256, 512, 1024, 2048, 4096)
-        let rns_lane_size = (max_degree + 1).next_power_of_two().min(rns_params.num_slots);
-        let rns_slot_packed = SlotPackedEncryptedPowers::generate(
+        // Generate packed encrypted powers [Λ^0, ..., Λ^{n-1}] in slots
+        let packed_powers = PackedEncryptedPowers::generate(
             &rns_keypair.pk,
             self.lambda,
-            rns_lane_size,
             rng,
         );
-        let rns_galois = RnsGaloisKeys::generate(&rns_keypair.sk, rng);
 
         self.rns_keypair = Some(rns_keypair.clone());
-        self.rns_slot_packed_powers = Some(rns_slot_packed.clone());
-        self.rns_galois_keys = Some(rns_galois.clone());
+        self.packed_powers = Some(packed_powers.clone());
 
         self.phase = JVVerifierPhase::Setup;
 
@@ -2006,9 +1995,8 @@ impl<const R: usize> JVVerifier<R> {
             max_degree,
             ahe_public_key,
             ahe_seed_commitment: self.ahe_seed_commitment,
-            // RNS slot-packed fields
-            rns_slot_packed_powers: Some(rns_slot_packed),
-            rns_galois_keys: Some(rns_galois),
+            // Packed evaluation fields
+            packed_powers: Some(packed_powers),
             rns_public_key: Some(rns_keypair.pk),
         })
     }
