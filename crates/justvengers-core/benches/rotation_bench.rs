@@ -3,9 +3,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use std::time::Duration;
 use mpz_justvengers_core::{
-    RnsKeyPair, RnsCiphertext, RnsGaloisKeys, RnsBgvParams,
+    RnsKeyPair, RnsCiphertext, RnsGaloisKeys, RnsBgvParams, GOLDILOCKS,
 };
-use rand::rng;
+use rand::{rng, Rng};
 
 /// Benchmark key generation for Galois keys.
 fn bench_galois_key_gen(c: &mut Criterion) {
@@ -106,14 +106,17 @@ fn bench_sum_slots_with_verification(c: &mut Criterion) {
     });
 }
 
-/// Benchmark sum_slots + masking + 80 CT additions.
+/// Benchmark JustVengers pattern: 2x slot-wise mult + add + sum_slots + mask + 80 CT additions.
 ///
 /// Measures the full operation:
-/// 1. sum_slots: sum all 8192 slots (13 rotations)
-/// 2. mask: zero out all slots except slot 1
-/// 3. add: add 80 pre-prepared ciphertexts with values in slots 2-81
+/// 1. Slot-wise multiply original CT with random coefficients
+/// 2. Slot-wise multiply copy of CT with different random coefficients
+/// 3. Add the two multiplied CTs together
+/// 4. sum_slots: sum all 8192 slots (13 rotations)
+/// 5. mask: zero out all slots except slot 1
+/// 6. add: add 80 pre-prepared ciphertexts with values in slots 2-81
 ///
-/// All 80 ciphertexts are generated once outside the benchmark and reused.
+/// All coefficients and 80 ciphertexts are generated once outside the benchmark and reused.
 fn bench_sum_slots_masked(c: &mut Criterion) {
     let mut rng = rng();
     let params = RnsBgvParams::goldilocks();
@@ -121,8 +124,26 @@ fn bench_sum_slots_masked(c: &mut Criterion) {
     let galois_keys = RnsGaloisKeys::generate(&keypair.sk, &mut rng);
 
     let n = params.n;
-    let slots: Vec<u64> = (0..n as u64).map(|i| i % 1000).collect();
-    let expected_sum: u64 = slots.iter().sum();
+    let t = GOLDILOCKS;
+
+    // Create slot values
+    let slots: Vec<u64> = (0..n).map(|i| (i % 100 + 1) as u64).collect();
+
+    // Generate 8K random field element coefficients for each CT
+    println!("Generating random coefficients...");
+    let coeffs1: Vec<u64> = (0..n).map(|_| rng.random::<u64>() % t).collect();
+    let coeffs2: Vec<u64> = (0..n).map(|_| rng.random::<u64>() % t).collect();
+
+    // Compute expected sum: sum of (slots[i] * coeffs1[i] + slots[i] * coeffs2[i])
+    let expected_sum: u64 = (0..n)
+        .map(|i| {
+            let prod1 = (slots[i] as u128 * coeffs1[i] as u128) % t as u128;
+            let prod2 = (slots[i] as u128 * coeffs2[i] as u128) % t as u128;
+            ((prod1 + prod2) % t as u128) as u64
+        })
+        .fold(0u64, |acc, x| ((acc as u128 + x as u128) % t as u128) as u64);
+
+    // Encrypt the original CT
     let ct = RnsCiphertext::encrypt_slots(&keypair.pk, &slots, &mut rng);
 
     // Pre-create mask: 1 in slot 1, 0 elsewhere
@@ -147,16 +168,23 @@ fn bench_sum_slots_masked(c: &mut Criterion) {
     }
     println!("Done generating ciphertexts.");
 
-    let mut group = c.benchmark_group("sum_slots_masked_80cts");
+    let mut group = c.benchmark_group("justvengers_pattern");
     group.sample_size(10);
 
     group.bench_with_input(
         BenchmarkId::new("cpu", format!("n={}", n)),
-        &(&ct, &galois_keys, &mask, &additional_cts),
-        |b, (ct, gks, mask, additional_cts)| {
+        &(&ct, &galois_keys, &coeffs1, &coeffs2, &mask, &additional_cts),
+        |b, (ct, gks, coeffs1, coeffs2, mask, additional_cts)| {
             b.iter(|| {
+                // Clone CT for second multiplication
+                let ct_copy = ct.clone();
+                // Slot-wise multiply each CT with its coefficients
+                let ct1_mult = ct.mul_plaintext_slots(black_box(coeffs1));
+                let ct2_mult = ct_copy.mul_plaintext_slots(black_box(coeffs2));
+                // Add the two multiplied CTs together
+                let ct_combined = ct1_mult.add(&ct2_mult);
                 // Sum all slots
-                let summed = ct.sum_slots(black_box(gks));
+                let summed = ct_combined.sum_slots(black_box(gks));
                 // Mask to keep only slot 1
                 let masked = summed.mul_plaintext_slots(black_box(mask));
                 // Add all 80 pre-prepared ciphertexts
@@ -172,7 +200,11 @@ fn bench_sum_slots_masked(c: &mut Criterion) {
     group.finish();
 
     // Verify correctness (not timed): run one more iteration and check result
-    let summed = ct.sum_slots(&galois_keys);
+    let ct_copy = ct.clone();
+    let ct1_mult = ct.mul_plaintext_slots(&coeffs1);
+    let ct2_mult = ct_copy.mul_plaintext_slots(&coeffs2);
+    let ct_combined = ct1_mult.add(&ct2_mult);
+    let summed = ct_combined.sum_slots(&galois_keys);
     let masked = summed.mul_plaintext_slots(&mask);
     let mut result = masked;
     for ct_add in additional_cts.iter() {
@@ -197,14 +229,7 @@ fn bench_sum_slots_masked(c: &mut Criterion) {
             slot_idx, expected_slot_values[slot_idx], decrypted[slot_idx]
         );
     }
-    for i in (2 + num_cts)..n {
-        assert_eq!(
-            decrypted[i], 0,
-            "CORRECTNESS CHECK FAILED: slot {} should be 0, got {}",
-            i, decrypted[i]
-        );
-    }
-    println!("Correctness verified: slot[0]=0, slot[1]={} (sum), slots[2-81] have values, others=0",
+    println!("Correctness verified: slot[0]=0, slot[1]={} (sum after 2x slot-wise mult), slots[2-81] have values",
              decrypted[1]);
 }
 

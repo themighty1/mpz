@@ -211,16 +211,18 @@ pub struct RnsBgvParams {
 impl RnsBgvParams {
     /// Creates RNS BGV parameters for the Goldilocks field.
     ///
-    /// Uses N=8192 ring dimension with 8192 slots and 4 RNS moduli (~240 bit q).
+    /// Uses N=8192 ring dimension with 8192 slots and 5 RNS moduli (~300 bit q).
     ///
     /// The noise budget must support the following operations:
-    /// 1. Slot-wise scalar multiplication (mul_plaintext_slots)
-    /// 2. sum_slots: 13 rotations with key-switching (log2(8192) = 13)
-    /// 3. Masking: plaintext multiplication to zero out all slots except one
-    /// 4. (B+C) CT additions (~80 for wasm zkVM) - see JustVengers paper
+    /// 1. 2x slot-wise scalar multiplication (mul_plaintext_slots) with 8K coefficients
+    /// 2. CT addition to combine multiplied CTs
+    /// 3. sum_slots: 13 rotations with key-switching (log2(8192) = 13)
+    /// 4. Masking: plaintext multiplication to zero out all slots except one
+    /// 5. (B+C) CT additions (~80 for wasm zkVM) - see JustVengers paper
     ///
-    /// Each rotation adds significant noise due to key-switching, so 4 moduli
-    /// (~240 bits) provides sufficient margin for correctness.
+    /// Each rotation adds significant noise due to key-switching, and slot-wise
+    /// multiplication with 8K coefficients also adds noise proportional to the
+    /// L2 norm. 5 moduli (~300 bits) provides sufficient margin for correctness.
     pub fn goldilocks() -> Self {
         let n = 8192;
         let t = GOLDILOCKS;
@@ -233,7 +235,7 @@ impl RnsBgvParams {
         Self {
             n,
             t,
-            num_moduli: 4, // ~240 bit q; sufficient for sum_slots + masking
+            num_moduli: 5, // ~300 bit q; sufficient for 2x slot-wise mult + sum_slots + masking + 80 additions
             sigma: 3.2,
             supports_slots,
             num_slots: n,
