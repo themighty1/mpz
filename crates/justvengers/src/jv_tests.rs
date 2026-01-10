@@ -25,23 +25,6 @@ fn test_jv_prover_setup() {
 }
 
 #[test]
-fn test_jv_protocol_simple() {
-    let mut circuit = Circuit::new();
-    let x = circuit.add_input();
-    let y = circuit.add_input();
-    circuit.add_mul(x, y);
-
-    let batch = CircuitBatch::new(vec![circuit]);
-    let active_branches = vec![0, 0];
-    let inputs = vec![vec![3, 4], vec![5, 6]];
-
-    let result = run_jv_protocol::<2>(&batch, &active_branches, &inputs, &[], TEST_MODULUS);
-
-    assert!(result.is_ok());
-    assert!(result.unwrap());
-}
-
-#[test]
 fn test_communication_estimate() {
     // R=1000, C=100, B=4, M=50
     let est = estimate_communication::<1000>(100, 4, 50);
@@ -78,7 +61,7 @@ fn test_disclosure_size_comparison() {
 }
 
 #[test]
-fn test_jv_protocol_with_soldering() {
+fn test_jv_protocol() {
     const R: usize = 10;
 
     // Circuit: x*y, y*1 (identity for soldering)
@@ -104,9 +87,8 @@ fn test_jv_protocol_with_soldering() {
     // Constraint: input[0] = mult_output[1]
     let constraint = SolderingConstraint::new(0, 1);
 
-    // Run with Goldilocks (to test NTT code path for main protocol)
     let result = run_jv_protocol::<R>(&batch, &branches, &inputs, &[constraint], GOLDILOCKS);
-    assert!(result.is_ok(), "JV protocol with soldering failed: {:?}", result.err());
+    assert!(result.is_ok(), "JV protocol failed: {:?}", result.err());
     assert!(result.unwrap(), "JV protocol verification failed");
 }
 

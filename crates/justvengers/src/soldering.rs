@@ -441,7 +441,7 @@ fn interpolate_naive(points: &[u64], values: &[u64], modulus: u64) -> Vec<u64> {
 
         for (k, &coeff) in basis.iter().enumerate() {
             let term = ((coeff as u128 * scale as u128) % modulus as u128) as u64;
-            result[k] = (result[k] + term) % modulus;
+            result[k] = ((result[k] as u128 + term as u128) % modulus as u128) as u64;
         }
     }
 
