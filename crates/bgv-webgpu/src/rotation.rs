@@ -338,6 +338,16 @@ struct FusedScaleParams {
     _pad1: u32,
 }
 
+/// Parameters for shared memory NTT shader.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SharedMemNttParams {
+    n: u32,
+    log_n: u32,
+    is_inverse: u32,  // 0 = forward, 1 = inverse
+    _pad: u32,
+}
+
 /// GPU context for rotation operations with NTT support.
 pub struct GpuRotationContext {
     device: Device,
@@ -376,6 +386,9 @@ pub struct GpuRotationContext {
     all_twiddles_buffer: Buffer,      // [mod*n*2]: all twiddles concatenated
     all_inv_twiddles_buffer: Buffer,
     all_n_inv_buffer: Buffer,         // [mod*2]: n_inv for each modulus
+    // Shared memory NTT (all stages in one dispatch)
+    shared_mem_ntt_pipeline: ComputePipeline,
+    max_shared_mem: u32,              // GPU's max workgroup storage size
 }
 
 impl GpuRotationContext {
@@ -399,12 +412,19 @@ impl GpuRotationContext {
             .await
             .ok_or(GpuError::AdapterNotFound)?;
 
+        // Request higher limits for shared memory NTT (1024 threads per workgroup)
+        let mut limits = wgpu::Limits::default();
+        let adapter_limits = adapter.limits();
+        limits.max_compute_workgroup_size_x = adapter_limits.max_compute_workgroup_size_x.min(1024);
+        limits.max_compute_invocations_per_workgroup = adapter_limits.max_compute_invocations_per_workgroup.min(1024);
+        limits.max_compute_workgroup_storage_size = adapter_limits.max_compute_workgroup_storage_size;
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("rotation device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    required_limits: limits,
                     memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
@@ -577,6 +597,22 @@ impl GpuRotationContext {
             compilation_options: Default::default(),
             cache: None,
         });
+
+        // Shared memory NTT - all stages in one dispatch
+        use crate::rotation_shader::shared_mem_ntt;
+        let shared_mem_ntt_shader = create_shader_module(&device, shared_mem_ntt::SHARED_MEM_NTT_SHADER, "shared_mem_ntt.wgsl")
+            .expect("Failed to compose shared memory NTT shader");
+        let shared_mem_ntt_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("shared mem ntt pipeline"),
+            layout: None,
+            module: &shared_mem_ntt_shader,
+            entry_point: Some("shared_mem_ntt"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // Query GPU shared memory limit for adaptive strategy
+        let max_shared_mem = device.limits().max_compute_workgroup_storage_size;
 
         // Upload moduli
         let moduli_u32: Vec<u32> = params
@@ -759,6 +795,9 @@ impl GpuRotationContext {
             all_twiddles_buffer,
             all_inv_twiddles_buffer,
             all_n_inv_buffer,
+            // Shared memory NTT
+            shared_mem_ntt_pipeline,
+            max_shared_mem,
         })
     }
 
@@ -3291,7 +3330,7 @@ fn gpu_sum_slots_batched_inner(
 
                 // NTT multiply: term_b = digit * keys_b[limb][digit]
                 // NTT multiply: term_a = digit * keys_a[limb][digit]
-                // TEMPORARILY use non-fused to verify bug location
+                // TODO: Switch to encode_ntt_mul_shared_mem once shader is debugged
                 encode_ntt_mul_rns_fast(
                     ctx, &mut encoder, workspace,
                     &workspace.digit_rns,
@@ -4220,6 +4259,162 @@ fn encode_scale(
     pass.set_pipeline(&ctx.scale_pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     pass.dispatch_workgroups(workgroups, 1, 1);
+}
+
+/// Encodes a full NTT using shared memory (single dispatch for all 13 stages).
+/// This is much faster than 13 separate butterfly dispatches.
+///
+/// Performs: data = NTT(data) or data = INTT(data) depending on is_inverse.
+/// The data buffer is modified in-place.
+#[allow(dead_code)]
+fn encode_shared_mem_ntt(
+    ctx: &GpuRotationContext,
+    encoder: &mut wgpu::CommandEncoder,
+    data: &Buffer,
+    mod_idx: usize,
+    is_inverse: bool,
+) {
+    let n = ctx.params.n;
+    let log_n = (n as f64).log2() as u32;
+    let ntt = &ctx.ntt_data[mod_idx];
+
+    // Create params buffer
+    let params = SharedMemNttParams {
+        n: n as u32,
+        log_n,
+        is_inverse: if is_inverse { 1 } else { 0 },
+        _pad: 0,
+    };
+    let params_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("shared mem ntt params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: BufferUsages::UNIFORM,
+    });
+
+    // q as vec2<u32>
+    let q_data = [ntt.modulus as u32, (ntt.modulus >> 32) as u32];
+    let q_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("q buffer"),
+        contents: bytemuck::cast_slice(&q_data),
+        usage: BufferUsages::UNIFORM,
+    });
+
+    // Barrett params as vec4<u32>
+    let barrett_data = [
+        ntt.mu_lo as u32,
+        (ntt.mu_lo >> 32) as u32,
+        ntt.mu_hi as u32,
+        (ntt.mu_hi >> 32) as u32,
+    ];
+    let barrett_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("barrett buffer"),
+        contents: bytemuck::cast_slice(&barrett_data),
+        usage: BufferUsages::UNIFORM,
+    });
+
+    // n_inv as vec2<u32>
+    let n_inv_data = [ntt.n_inv as u32, (ntt.n_inv >> 32) as u32];
+    let n_inv_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("n_inv buffer"),
+        contents: bytemuck::cast_slice(&n_inv_data),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+
+    // Select twiddles and psi powers based on direction
+    let twiddle_buffer = if is_inverse {
+        &ctx.inv_twiddle_buffers[mod_idx]
+    } else {
+        &ctx.twiddle_buffers[mod_idx]
+    };
+    let psi_buffer = if is_inverse {
+        &ctx.psi_inv_power_buffers[mod_idx]
+    } else {
+        &ctx.psi_power_buffers[mod_idx]
+    };
+
+    // Create bind group
+    // Bindings: 0=params, 1=data, 2=twiddles, 3=psi_powers, 4=n_inv, 5=q_val, 6=barrett
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shared mem ntt bind group"),
+        layout: &ctx.shared_mem_ntt_pipeline.get_bind_group_layout(0),
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: data.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: twiddle_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: psi_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: n_inv_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: q_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: barrett_buffer.as_entire_binding() },
+        ],
+    });
+
+    // Dispatch single workgroup with 1024 threads
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("shared mem ntt pass"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&ctx.shared_mem_ntt_pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    pass.dispatch_workgroups(1, 1, 1);  // Single workgroup handles entire NTT
+}
+
+/// Encodes NTT multiply using shared memory NTT (3 dispatches per modulus instead of ~40).
+/// Performs: result = INTT(NTT(a) * NTT(b))
+#[allow(dead_code)]
+fn encode_ntt_mul_shared_mem(
+    ctx: &GpuRotationContext,
+    encoder: &mut wgpu::CommandEncoder,
+    workspace: &SumSlotsWorkspace,
+    a: &Buffer,
+    b: &Buffer,
+    result: &Buffer,
+) {
+    let n = workspace.n;
+    let num_moduli = workspace.num_moduli;
+
+    for mod_idx in 0..num_moduli {
+        let offset = (mod_idx * n * 2 * std::mem::size_of::<u32>()) as u64;
+
+        // Copy inputs to working buffers
+        encoder.copy_buffer_to_buffer(
+            a, offset,
+            &workspace.ntt_a_twisted[mod_idx], 0,
+            workspace.single_mod_size,
+        );
+        encoder.copy_buffer_to_buffer(
+            b, offset,
+            &workspace.ntt_b_twisted[mod_idx], 0,
+            workspace.single_mod_size,
+        );
+
+        // Forward NTT on a (1 dispatch instead of ~16)
+        encode_shared_mem_ntt(ctx, encoder, &workspace.ntt_a_twisted[mod_idx], mod_idx, false);
+
+        // Forward NTT on b (1 dispatch instead of ~16)
+        encode_shared_mem_ntt(ctx, encoder, &workspace.ntt_b_twisted[mod_idx], mod_idx, false);
+
+        // Pointwise multiply (reuse existing)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pointwise"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&ctx.pointwise_mul_pipeline);
+            pass.set_bind_group(0, &workspace.pointwise_bg[mod_idx], &[]);
+            let workgroups = (n as u32 + 255) / 256;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
+        // Inverse NTT on result (1 dispatch instead of ~16)
+        encode_shared_mem_ntt(ctx, encoder, &workspace.ntt_result[mod_idx], mod_idx, true);
+
+        // Copy result back
+        encoder.copy_buffer_to_buffer(
+            &workspace.ntt_result[mod_idx], 0,
+            result, offset,
+            workspace.single_mod_size,
+        );
+    }
 }
 
 #[cfg(test)]
