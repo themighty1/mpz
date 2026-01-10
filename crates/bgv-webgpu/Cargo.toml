@@ -7,6 +7,8 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 wgpu = { version = "23", features = ["wgsl"] }
+naga_oil = "0.20"
+naga = "27"
 bytemuck = { workspace = true }
 pollster = { workspace = true }
 thiserror = { workspace = true }

@@ -2756,58 +2756,63 @@ fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
 }
 
 fn barrett_reduce_fused(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
-    var r0 = x.x;
-    var r1 = x.y;
+    var r0 = x.x; var r1 = x.y;
+    if x.w == 0u && x.z == 0u && (r1 < q.y || (r1 == q.y && r0 < q.x)) { return vec2<u32>(r0, r1); }
 
-    if x.w == 0u && x.z == 0u {
-        if r1 < q.y || (r1 == q.y && r0 < q.x) {
-            return vec2<u32>(r0, r1);
-        }
-    }
+    // Compute all 8 partial products
+    let p00 = u64_mul(r0, mu0); let p01 = u64_mul(r0, mu1);
+    let p02 = u64_mul(r0, mu2); let p03 = u64_mul(r0, mu3);
+    let p10 = u64_mul(r1, mu0); let p11 = u64_mul(r1, mu1);
+    let p12 = u64_mul(r1, mu2); let p13 = u64_mul(r1, mu3);
 
-    // Simplified Barrett for 64-bit products
-    let p00 = u64_mul(r0, mu0);
-    let p01 = u64_mul(r0, mu1);
-    let p10 = u64_mul(r1, mu0);
-    let p11 = u64_mul(r1, mu1);
-    let p02 = u64_mul(r0, mu2);
-    let p03 = u64_mul(r0, mu3);
-    let p12 = u64_mul(r1, mu2);
-    let p13 = u64_mul(r1, mu3);
+    // Accumulate bits 64-95 with carries
+    var acc64: u32 = p02.x; var c: u32 = 0u; var t: u32;
+    t = acc64 + p01.y; if t < acc64 { c = 1u; } acc64 = t;
+    t = acc64 + p10.y; if t < acc64 { c = c + 1u; } acc64 = t;
+    t = acc64 + p11.x; if t < acc64 { c = c + 1u; } acc64 = t;
+    var mid32 = p00.y; var mid_c: u32 = 0u;
+    var mt = mid32 + p01.x; if mt < mid32 { mid_c = 1u; } mid32 = mt;
+    mt = mid32 + p10.x; if mt < mid32 { mid_c = mid_c + 1u; }
+    t = acc64 + mid_c; if t < acc64 { c = c + 1u; } acc64 = t;
 
-    var acc96: u32 = p02.y + p03.x + p11.y + p12.x;
-    var acc128: u32 = p13.x + p03.y + p12.y;
-    var acc160: u32 = p13.y;
+    // Accumulate bits 96-127
+    var acc96: u32 = p02.y; var c2: u32 = 0u;
+    t = acc96 + p03.x; if t < acc96 { c2 = 1u; } acc96 = t;
+    t = acc96 + p11.y; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+    t = acc96 + p12.x; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+    t = acc96 + c; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
 
-    // Simplified quotient estimate
-    var q_est_lo = acc128;
-    var q_est_hi = acc160;
+    // Accumulate bits 128-159
+    var acc128: u32 = p13.x; var c3: u32 = 0u;
+    t = acc128 + p03.y; if t < acc128 { c3 = 1u; } acc128 = t;
+    t = acc128 + p12.y; if t < acc128 { c3 = c3 + 1u; } acc128 = t;
+    t = acc128 + c2; if t < acc128 { c3 = c3 + 1u; } acc128 = t;
 
-    let qe0 = u64_mul(q_est_lo, q.x);
-    let qe1 = u64_mul(q_est_lo, q.y);
+    var acc160: u32 = p13.y + c3;
+    var q_est_lo = acc128; var q_est_hi = acc160;
+
+    // Compute q_est * q
+    let qe0 = u64_mul(q_est_lo, q.x); let qe1 = u64_mul(q_est_lo, q.y);
     let qe2 = u64_mul(q_est_hi, q.x);
+    var p0 = qe0.x; var p1 = qe0.y; var p2: u32 = 0u;
+    t = p1 + qe1.x; c = 0u; if t < p1 { c = 1u; } p1 = t; p2 = qe1.y + c;
+    t = p1 + qe2.x; c = 0u; if t < p1 { c = 1u; } p1 = t; p2 = p2 + qe2.y + c;
 
-    var sub0 = qe0.x;
-    var sub1 = qe0.y + qe1.x + qe2.x;
-
-    // r - q_est * q
-    var diff0 = r0 - sub0;
+    // Subtract
     var borrow: u32 = 0u;
-    if r0 < sub0 { borrow = 1u; }
-    var diff1 = r1 - sub1 - borrow;
+    if r0 >= p0 { r0 = r0 - p0; } else { r0 = r0 + (0xFFFFFFFFu - p0) + 1u; borrow = 1u; }
+    var sub1 = p1 + borrow;
+    if r1 >= sub1 { r1 = r1 - sub1; } else { r1 = r1 + (0xFFFFFFFFu - sub1) + 1u; }
 
-    // Final reduction
-    while diff1 > q.y || (diff1 == q.y && diff0 >= q.x) {
-        if diff0 >= q.x {
-            diff0 = diff0 - q.x;
-        } else {
-            diff0 = 0xFFFFFFFFu - (q.x - diff0 - 1u);
-            diff1 = diff1 - 1u;
-        }
-        diff1 = diff1 - q.y;
+    // Final correction
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        if r1 < q.y || (r1 == q.y && r0 < q.x) { break; }
+        borrow = 0u;
+        if r0 >= q.x { r0 = r0 - q.x; } else { r0 = r0 + (0xFFFFFFFFu - q.x) + 1u; borrow = 1u; }
+        sub1 = q.y + borrow;
+        if r1 >= sub1 { r1 = r1 - sub1; } else { r1 = r1 + (0xFFFFFFFFu - sub1) + 1u; }
     }
-
-    return vec2<u32>(diff0, diff1);
+    return vec2<u32>(r0, r1);
 }
 
 @compute @workgroup_size(256, 1, 1)
@@ -2946,18 +2951,61 @@ fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
 fn barrett_reduce_bf(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
     var r0 = x.x; var r1 = x.y;
     if x.w == 0u && x.z == 0u && (r1 < q.y || (r1 == q.y && r0 < q.x)) { return vec2<u32>(r0, r1); }
-    let p13 = u64_mul(r1, mu3); let p03 = u64_mul(r0, mu3); let p12 = u64_mul(r1, mu2);
-    var acc128 = p13.x + p03.y + p12.y;
-    var q_est_lo = acc128;
+
+    // Compute all 8 partial products
+    let p00 = u64_mul(r0, mu0); let p01 = u64_mul(r0, mu1);
+    let p02 = u64_mul(r0, mu2); let p03 = u64_mul(r0, mu3);
+    let p10 = u64_mul(r1, mu0); let p11 = u64_mul(r1, mu1);
+    let p12 = u64_mul(r1, mu2); let p13 = u64_mul(r1, mu3);
+
+    // Accumulate bits 64-95 with carries
+    var acc64: u32 = p02.x; var c: u32 = 0u; var t: u32;
+    t = acc64 + p01.y; if t < acc64 { c = 1u; } acc64 = t;
+    t = acc64 + p10.y; if t < acc64 { c = c + 1u; } acc64 = t;
+    t = acc64 + p11.x; if t < acc64 { c = c + 1u; } acc64 = t;
+    var mid32 = p00.y; var mid_c: u32 = 0u;
+    var mt = mid32 + p01.x; if mt < mid32 { mid_c = 1u; } mid32 = mt;
+    mt = mid32 + p10.x; if mt < mid32 { mid_c = mid_c + 1u; }
+    t = acc64 + mid_c; if t < acc64 { c = c + 1u; } acc64 = t;
+
+    // Accumulate bits 96-127
+    var acc96: u32 = p02.y; var c2: u32 = 0u;
+    t = acc96 + p03.x; if t < acc96 { c2 = 1u; } acc96 = t;
+    t = acc96 + p11.y; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+    t = acc96 + p12.x; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+    t = acc96 + c; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+
+    // Accumulate bits 128-159
+    var acc128: u32 = p13.x; var c3: u32 = 0u;
+    t = acc128 + p03.y; if t < acc128 { c3 = 1u; } acc128 = t;
+    t = acc128 + p12.y; if t < acc128 { c3 = c3 + 1u; } acc128 = t;
+    t = acc128 + c2; if t < acc128 { c3 = c3 + 1u; } acc128 = t;
+
+    var acc160: u32 = p13.y + c3;
+    var q_est_lo = acc128; var q_est_hi = acc160;
+
+    // Compute q_est * q
     let qe0 = u64_mul(q_est_lo, q.x); let qe1 = u64_mul(q_est_lo, q.y);
-    var sub0 = qe0.x; var sub1 = qe0.y + qe1.x;
-    var diff0 = r0 - sub0; var borrow: u32 = 0u; if r0 < sub0 { borrow = 1u; }
-    var diff1 = r1 - sub1 - borrow;
-    while diff1 > q.y || (diff1 == q.y && diff0 >= q.x) {
-        if diff0 >= q.x { diff0 = diff0 - q.x; } else { diff0 = 0xFFFFFFFFu - (q.x - diff0 - 1u); diff1 = diff1 - 1u; }
-        diff1 = diff1 - q.y;
+    let qe2 = u64_mul(q_est_hi, q.x);
+    var p0 = qe0.x; var p1 = qe0.y; var p2: u32 = 0u;
+    t = p1 + qe1.x; c = 0u; if t < p1 { c = 1u; } p1 = t; p2 = qe1.y + c;
+    t = p1 + qe2.x; c = 0u; if t < p1 { c = 1u; } p1 = t; p2 = p2 + qe2.y + c;
+
+    // Subtract
+    var borrow: u32 = 0u;
+    if r0 >= p0 { r0 = r0 - p0; } else { r0 = r0 + (0xFFFFFFFFu - p0) + 1u; borrow = 1u; }
+    var sub1 = p1 + borrow;
+    if r1 >= sub1 { r1 = r1 - sub1; } else { r1 = r1 + (0xFFFFFFFFu - sub1) + 1u; }
+
+    // Final correction
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        if r1 < q.y || (r1 == q.y && r0 < q.x) { break; }
+        borrow = 0u;
+        if r0 >= q.x { r0 = r0 - q.x; } else { r0 = r0 + (0xFFFFFFFFu - q.x) + 1u; borrow = 1u; }
+        sub1 = q.y + borrow;
+        if r1 >= sub1 { r1 = r1 - sub1; } else { r1 = r1 + (0xFFFFFFFFu - sub1) + 1u; }
     }
-    return vec2<u32>(diff0, diff1);
+    return vec2<u32>(r0, r1);
 }
 
 fn addmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
@@ -3080,17 +3128,54 @@ fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
 fn barrett_reduce_pw(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
     var r0 = x.x; var r1 = x.y;
     if x.w == 0u && x.z == 0u && (r1 < q.y || (r1 == q.y && r0 < q.x)) { return vec2<u32>(r0, r1); }
-    let p13 = u64_mul(r1, mu3); let p03 = u64_mul(r0, mu3); let p12 = u64_mul(r1, mu2);
-    var q_est_lo = p13.x + p03.y + p12.y;
+
+    let p00 = u64_mul(r0, mu0); let p01 = u64_mul(r0, mu1);
+    let p02 = u64_mul(r0, mu2); let p03 = u64_mul(r0, mu3);
+    let p10 = u64_mul(r1, mu0); let p11 = u64_mul(r1, mu1);
+    let p12 = u64_mul(r1, mu2); let p13 = u64_mul(r1, mu3);
+
+    var acc64: u32 = p02.x; var c: u32 = 0u; var t: u32;
+    t = acc64 + p01.y; if t < acc64 { c = 1u; } acc64 = t;
+    t = acc64 + p10.y; if t < acc64 { c = c + 1u; } acc64 = t;
+    t = acc64 + p11.x; if t < acc64 { c = c + 1u; } acc64 = t;
+    var mid32 = p00.y; var mid_c: u32 = 0u;
+    var mt = mid32 + p01.x; if mt < mid32 { mid_c = 1u; } mid32 = mt;
+    mt = mid32 + p10.x; if mt < mid32 { mid_c = mid_c + 1u; }
+    t = acc64 + mid_c; if t < acc64 { c = c + 1u; } acc64 = t;
+
+    var acc96: u32 = p02.y; var c2: u32 = 0u;
+    t = acc96 + p03.x; if t < acc96 { c2 = 1u; } acc96 = t;
+    t = acc96 + p11.y; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+    t = acc96 + p12.x; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+    t = acc96 + c; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+
+    var acc128: u32 = p13.x; var c3: u32 = 0u;
+    t = acc128 + p03.y; if t < acc128 { c3 = 1u; } acc128 = t;
+    t = acc128 + p12.y; if t < acc128 { c3 = c3 + 1u; } acc128 = t;
+    t = acc128 + c2; if t < acc128 { c3 = c3 + 1u; } acc128 = t;
+
+    var acc160: u32 = p13.y + c3;
+    var q_est_lo = acc128; var q_est_hi = acc160;
+
     let qe0 = u64_mul(q_est_lo, q.x); let qe1 = u64_mul(q_est_lo, q.y);
-    var sub0 = qe0.x; var sub1 = qe0.y + qe1.x;
-    var diff0 = r0 - sub0; var borrow: u32 = 0u; if r0 < sub0 { borrow = 1u; }
-    var diff1 = r1 - sub1 - borrow;
-    while diff1 > q.y || (diff1 == q.y && diff0 >= q.x) {
-        if diff0 >= q.x { diff0 = diff0 - q.x; } else { diff0 = 0xFFFFFFFFu - (q.x - diff0 - 1u); diff1 = diff1 - 1u; }
-        diff1 = diff1 - q.y;
+    let qe2 = u64_mul(q_est_hi, q.x);
+    var p0 = qe0.x; var p1 = qe0.y; var p2: u32 = 0u;
+    t = p1 + qe1.x; c = 0u; if t < p1 { c = 1u; } p1 = t; p2 = qe1.y + c;
+    t = p1 + qe2.x; c = 0u; if t < p1 { c = 1u; } p1 = t; p2 = p2 + qe2.y + c;
+
+    var borrow: u32 = 0u;
+    if r0 >= p0 { r0 = r0 - p0; } else { r0 = r0 + (0xFFFFFFFFu - p0) + 1u; borrow = 1u; }
+    var sub1 = p1 + borrow;
+    if r1 >= sub1 { r1 = r1 - sub1; } else { r1 = r1 + (0xFFFFFFFFu - sub1) + 1u; }
+
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        if r1 < q.y || (r1 == q.y && r0 < q.x) { break; }
+        borrow = 0u;
+        if r0 >= q.x { r0 = r0 - q.x; } else { r0 = r0 + (0xFFFFFFFFu - q.x) + 1u; borrow = 1u; }
+        sub1 = q.y + borrow;
+        if r1 >= sub1 { r1 = r1 - sub1; } else { r1 = r1 + (0xFFFFFFFFu - sub1) + 1u; }
     }
-    return vec2<u32>(diff0, diff1);
+    return vec2<u32>(r0, r1);
 }
 
 @compute @workgroup_size(256, 1, 1)
@@ -3164,17 +3249,54 @@ fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
 fn barrett_reduce_sc(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
     var r0 = x.x; var r1 = x.y;
     if x.w == 0u && x.z == 0u && (r1 < q.y || (r1 == q.y && r0 < q.x)) { return vec2<u32>(r0, r1); }
-    let p13 = u64_mul(r1, mu3); let p03 = u64_mul(r0, mu3); let p12 = u64_mul(r1, mu2);
-    var q_est_lo = p13.x + p03.y + p12.y;
+
+    let p00 = u64_mul(r0, mu0); let p01 = u64_mul(r0, mu1);
+    let p02 = u64_mul(r0, mu2); let p03 = u64_mul(r0, mu3);
+    let p10 = u64_mul(r1, mu0); let p11 = u64_mul(r1, mu1);
+    let p12 = u64_mul(r1, mu2); let p13 = u64_mul(r1, mu3);
+
+    var acc64: u32 = p02.x; var c: u32 = 0u; var t: u32;
+    t = acc64 + p01.y; if t < acc64 { c = 1u; } acc64 = t;
+    t = acc64 + p10.y; if t < acc64 { c = c + 1u; } acc64 = t;
+    t = acc64 + p11.x; if t < acc64 { c = c + 1u; } acc64 = t;
+    var mid32 = p00.y; var mid_c: u32 = 0u;
+    var mt = mid32 + p01.x; if mt < mid32 { mid_c = 1u; } mid32 = mt;
+    mt = mid32 + p10.x; if mt < mid32 { mid_c = mid_c + 1u; }
+    t = acc64 + mid_c; if t < acc64 { c = c + 1u; } acc64 = t;
+
+    var acc96: u32 = p02.y; var c2: u32 = 0u;
+    t = acc96 + p03.x; if t < acc96 { c2 = 1u; } acc96 = t;
+    t = acc96 + p11.y; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+    t = acc96 + p12.x; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+    t = acc96 + c; if t < acc96 { c2 = c2 + 1u; } acc96 = t;
+
+    var acc128: u32 = p13.x; var c3: u32 = 0u;
+    t = acc128 + p03.y; if t < acc128 { c3 = 1u; } acc128 = t;
+    t = acc128 + p12.y; if t < acc128 { c3 = c3 + 1u; } acc128 = t;
+    t = acc128 + c2; if t < acc128 { c3 = c3 + 1u; } acc128 = t;
+
+    var acc160: u32 = p13.y + c3;
+    var q_est_lo = acc128; var q_est_hi = acc160;
+
     let qe0 = u64_mul(q_est_lo, q.x); let qe1 = u64_mul(q_est_lo, q.y);
-    var sub0 = qe0.x; var sub1 = qe0.y + qe1.x;
-    var diff0 = r0 - sub0; var borrow: u32 = 0u; if r0 < sub0 { borrow = 1u; }
-    var diff1 = r1 - sub1 - borrow;
-    while diff1 > q.y || (diff1 == q.y && diff0 >= q.x) {
-        if diff0 >= q.x { diff0 = diff0 - q.x; } else { diff0 = 0xFFFFFFFFu - (q.x - diff0 - 1u); diff1 = diff1 - 1u; }
-        diff1 = diff1 - q.y;
+    let qe2 = u64_mul(q_est_hi, q.x);
+    var p0 = qe0.x; var p1 = qe0.y; var p2: u32 = 0u;
+    t = p1 + qe1.x; c = 0u; if t < p1 { c = 1u; } p1 = t; p2 = qe1.y + c;
+    t = p1 + qe2.x; c = 0u; if t < p1 { c = 1u; } p1 = t; p2 = p2 + qe2.y + c;
+
+    var borrow: u32 = 0u;
+    if r0 >= p0 { r0 = r0 - p0; } else { r0 = r0 + (0xFFFFFFFFu - p0) + 1u; borrow = 1u; }
+    var sub1 = p1 + borrow;
+    if r1 >= sub1 { r1 = r1 - sub1; } else { r1 = r1 + (0xFFFFFFFFu - sub1) + 1u; }
+
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        if r1 < q.y || (r1 == q.y && r0 < q.x) { break; }
+        borrow = 0u;
+        if r0 >= q.x { r0 = r0 - q.x; } else { r0 = r0 + (0xFFFFFFFFu - q.x) + 1u; borrow = 1u; }
+        sub1 = q.y + borrow;
+        if r1 >= sub1 { r1 = r1 - sub1; } else { r1 = r1 + (0xFFFFFFFFu - sub1) + 1u; }
     }
-    return vec2<u32>(diff0, diff1);
+    return vec2<u32>(r0, r1);
 }
 
 @compute @workgroup_size(256, 1, 1)

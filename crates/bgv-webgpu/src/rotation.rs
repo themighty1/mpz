@@ -15,10 +15,9 @@ use crate::error::GpuError;
 use crate::rotation_shader::{
     BIT_REVERSE_SHADER, DIGIT_DECOMPOSE_SHADER, NTT_BUTTERFLY_SHADER, POINTWISE_MUL_SHADER,
     SCALE_SHADER, TWIST_SHADER,
-    // Fused shaders (process all moduli in single dispatch)
-    FUSED_TWIST_SHADER, FUSED_BITREV_SHADER, FUSED_BUTTERFLY_SHADER,
-    FUSED_POINTWISE_SHADER, FUSED_SCALE_SHADER,
 };
+// New modular fused shaders with shared math (composed via naga_oil)
+use crate::rotation_shader::{fused, create_shader_module};
 
 /// Parameters for RNS BGV on GPU.
 #[derive(Clone, Debug)]
@@ -523,10 +522,9 @@ impl GpuRotationContext {
         });
 
         // Compile fused shaders (process all moduli in single dispatch)
-        let fused_twist_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("fused twist shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(FUSED_TWIST_SHADER)),
-        });
+        // Use naga_oil composer to import shared math module
+        let fused_twist_shader = create_shader_module(&device, fused::FUSED_TWIST_SHADER, "fused_twist.wgsl")
+            .expect("Failed to compose fused twist shader");
         let fused_twist_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("fused twist pipeline"),
             layout: None,
@@ -536,10 +534,8 @@ impl GpuRotationContext {
             cache: None,
         });
 
-        let fused_bitrev_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("fused bitrev shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(FUSED_BITREV_SHADER)),
-        });
+        let fused_bitrev_shader = create_shader_module(&device, fused::FUSED_BITREV_SHADER, "fused_bitrev.wgsl")
+            .expect("Failed to compose fused bitrev shader");
         let fused_bitrev_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("fused bitrev pipeline"),
             layout: None,
@@ -549,10 +545,8 @@ impl GpuRotationContext {
             cache: None,
         });
 
-        let fused_butterfly_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("fused butterfly shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(FUSED_BUTTERFLY_SHADER)),
-        });
+        let fused_butterfly_shader = create_shader_module(&device, fused::FUSED_BUTTERFLY_SHADER, "fused_butterfly.wgsl")
+            .expect("Failed to compose fused butterfly shader");
         let fused_butterfly_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("fused butterfly pipeline"),
             layout: None,
@@ -562,10 +556,8 @@ impl GpuRotationContext {
             cache: None,
         });
 
-        let fused_pointwise_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("fused pointwise shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(FUSED_POINTWISE_SHADER)),
-        });
+        let fused_pointwise_shader = create_shader_module(&device, fused::FUSED_POINTWISE_SHADER, "fused_pointwise.wgsl")
+            .expect("Failed to compose fused pointwise shader");
         let fused_pointwise_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("fused pointwise pipeline"),
             layout: None,
@@ -575,10 +567,8 @@ impl GpuRotationContext {
             cache: None,
         });
 
-        let fused_scale_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("fused scale shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(FUSED_SCALE_SHADER)),
-        });
+        let fused_scale_shader = create_shader_module(&device, fused::FUSED_SCALE_SHADER, "fused_scale.wgsl")
+            .expect("Failed to compose fused scale shader");
         let fused_scale_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("fused scale pipeline"),
             layout: None,
@@ -3301,14 +3291,14 @@ fn gpu_sum_slots_batched_inner(
 
                 // NTT multiply: term_b = digit * keys_b[limb][digit]
                 // NTT multiply: term_a = digit * keys_a[limb][digit]
-                // Uses fused kernels that process all 3 moduli in single dispatch
-                encode_ntt_mul_rns_fused(
+                // TEMPORARILY use non-fused to verify bug location
+                encode_ntt_mul_rns_fast(
                     ctx, &mut encoder, workspace,
                     &workspace.digit_rns,
                     &galois_key.keys_b[limb_idx][digit_idx],
                     &workspace.term_b,
                 );
-                encode_ntt_mul_rns_fused(
+                encode_ntt_mul_rns_fast(
                     ctx, &mut encoder, workspace,
                     &workspace.digit_rns,
                     &galois_key.keys_a[limb_idx][digit_idx],
