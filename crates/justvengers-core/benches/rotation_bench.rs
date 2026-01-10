@@ -39,11 +39,22 @@ fn bench_sum_slots(c: &mut Criterion) {
     let ct = RnsCiphertext::encrypt_slots(&keypair.pk, &slots, &mut rng);
 
     group.bench_with_input(
-        BenchmarkId::new("cpu", format!("n={}", n)),
+        BenchmarkId::new("sequential", format!("n={}", n)),
         &ct,
         |b, ct| {
             b.iter(|| {
                 ct.sum_slots(black_box(&galois_keys))
+            });
+        },
+    );
+
+    #[cfg(feature = "rayon")]
+    group.bench_with_input(
+        BenchmarkId::new("parallel", format!("n={}", n)),
+        &ct,
+        |b, ct| {
+            b.iter(|| {
+                ct.sum_slots_parallel(black_box(&galois_keys))
             });
         },
     );
@@ -67,11 +78,22 @@ fn bench_single_rotation(c: &mut Criterion) {
     // Get the first Galois key (for σ_5)
     let gk = galois_keys.get_key(0).unwrap();
 
-    c.bench_function("single_rotation", |b| {
+    let mut group = c.benchmark_group("single_rotation");
+
+    group.bench_function("sequential", |b| {
         b.iter(|| {
             ct.apply_automorphism(black_box(gk))
         });
     });
+
+    #[cfg(feature = "rayon")]
+    group.bench_function("parallel", |b| {
+        b.iter(|| {
+            ct.apply_automorphism_parallel(black_box(gk))
+        });
+    });
+
+    group.finish();
 }
 
 /// Verify correctness of sum_slots by decrypting and checking result.
@@ -177,7 +199,7 @@ fn bench_sum_slots_masked(c: &mut Criterion) {
     group.sample_size(10);
 
     group.bench_with_input(
-        BenchmarkId::new("cpu", format!("n={}_copies={}", n, NUM_COPIES)),
+        BenchmarkId::new("sequential", format!("n={}_copies={}", n, NUM_COPIES)),
         &(&ct_main, &galois_keys, &all_coeffs, &mask, &additional_cts),
         |b, (ct_main, gks, all_coeffs, mask, additional_cts)| {
             b.iter(|| {
@@ -192,6 +214,37 @@ fn bench_sum_slots_masked(c: &mut Criterion) {
 
                 // Sum all slots
                 let summed = ct_combined.sum_slots(black_box(gks));
+
+                // Mask to keep only slot 1
+                let masked = summed.mul_plaintext_slots(black_box(mask));
+
+                // Add all 80 pre-prepared ciphertexts
+                let mut result = masked;
+                for ct_add in additional_cts.iter() {
+                    result = result.add(black_box(ct_add));
+                }
+                black_box(result)
+            });
+        },
+    );
+
+    #[cfg(feature = "rayon")]
+    group.bench_with_input(
+        BenchmarkId::new("parallel", format!("n={}_copies={}", n, NUM_COPIES)),
+        &(&ct_main, &galois_keys, &all_coeffs, &mask, &additional_cts),
+        |b, (ct_main, gks, all_coeffs, mask, additional_cts)| {
+            b.iter(|| {
+                // Copy and slot-wise multiply each copy with its coefficients
+                let multiplied: Vec<RnsCiphertext> = all_coeffs.iter()
+                    .map(|coeffs| (*ct_main).clone().mul_plaintext_slots(black_box(coeffs)))
+                    .collect();
+
+                // Add all multiplied copies together
+                let ct_combined = multiplied.iter().skip(1)
+                    .fold(multiplied[0].clone(), |acc, ct| acc.add(ct));
+
+                // Sum all slots using parallel key-switching
+                let summed = ct_combined.sum_slots_parallel(black_box(gks));
 
                 // Mask to keep only slot 1
                 let masked = summed.mul_plaintext_slots(black_box(mask));

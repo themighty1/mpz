@@ -12,6 +12,9 @@
 
 use rand::Rng;
 
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
+
 use super::params::{RnsBgvParams, GOLDILOCKS};
 use super::rns::{RnsParams, RnsPoly};
 use super::slot::SlotEncoder;
@@ -311,6 +314,53 @@ impl RnsGaloisKey {
 
         (c0_acc, c1_acc)
     }
+
+    /// Parallel version of key_switch using rayon.
+    #[cfg(feature = "rayon")]
+    fn key_switch_parallel(&self, c1_auto: &RnsPoly) -> (RnsPoly, RnsPoly) {
+        let n = self.rns_params.ring_dim();
+
+        // Generate all (limb_idx, digit_idx) pairs
+        let pairs: Vec<(usize, usize)> = (0..self.num_limbs)
+            .flat_map(|l| (0..DIGITS_PER_LIMB).map(move |d| (l, d)))
+            .collect();
+
+        // Parallel map: compute each (term_c0, term_c1) independently
+        let terms: Vec<(RnsPoly, RnsPoly)> = pairs
+            .par_iter()
+            .map(|&(limb_idx, digit_idx)| {
+                // Create polynomial for this digit from limb_idx's residue
+                let mut digit_poly = RnsPoly::zero(&self.rns_params);
+
+                // Extract digit from the limb_idx residue of c1_auto
+                for coeff_idx in 0..n {
+                    let coeff = c1_auto.residues()[limb_idx][coeff_idx];
+                    let shifted = coeff >> (DECOMP_BASE_LOG * digit_idx as u32);
+                    let digit = shifted & (DECOMP_BASE - 1);
+
+                    for mod_idx in 0..self.num_limbs {
+                        digit_poly.residues_mut()[mod_idx][coeff_idx] = digit;
+                    }
+                }
+
+                let key_idx = limb_idx * DIGITS_PER_LIMB + digit_idx;
+                let term_c0 = digit_poly.mul(&self.keys_b[key_idx]);
+                let term_c1 = digit_poly.mul(&self.keys_a[key_idx]);
+
+                (term_c0, term_c1)
+            })
+            .collect();
+
+        // Reduce: sum all terms
+        let mut c0_acc = RnsPoly::zero(&self.rns_params);
+        let mut c1_acc = RnsPoly::zero(&self.rns_params);
+        for (t0, t1) in terms {
+            c0_acc = c0_acc.add(&t0);
+            c1_acc = c1_acc.add(&t1);
+        }
+
+        (c0_acc, c1_acc)
+    }
 }
 
 /// Computes P_i * P_i^* in RNS form for each limb i.
@@ -548,6 +598,33 @@ impl RnsCiphertext {
     /// Returns the c1 component.
     pub fn c1(&self) -> &RnsPoly {
         &self.c1
+    }
+
+    /// Returns the RNS parameters.
+    pub fn rns_params(&self) -> &RnsParams {
+        &self.rns_params
+    }
+
+    /// Returns the BGV parameters.
+    pub fn bgv_params(&self) -> &RnsBgvParams {
+        &self.bgv_params
+    }
+
+    /// Creates a ciphertext from residue arrays.
+    pub fn from_residues(
+        c0_residues: Vec<Vec<u64>>,
+        c1_residues: Vec<Vec<u64>>,
+        rns_params: RnsParams,
+        bgv_params: RnsBgvParams,
+    ) -> Self {
+        let c0 = RnsPoly::from_residue_vecs(c0_residues, &rns_params);
+        let c1 = RnsPoly::from_residue_vecs(c1_residues, &rns_params);
+        Self {
+            c0,
+            c1,
+            rns_params,
+            bgv_params,
+        }
     }
 
     /// Encrypts a single scalar value.
@@ -948,6 +1025,28 @@ impl RnsCiphertext {
         }
     }
 
+    /// Applies automorphism with parallel key-switching.
+    #[cfg(feature = "rayon")]
+    pub fn apply_automorphism_parallel(&self, galois_key: &RnsGaloisKey) -> Self {
+        let k = galois_key.k;
+
+        // Step 1: Apply automorphism to ciphertext components
+        let c0_auto = apply_automorphism_rns(&self.c0, k);
+        let c1_auto = apply_automorphism_rns(&self.c1, k);
+
+        // Step 2: Parallel key-switch
+        let (ks_c0, ks_c1) = galois_key.key_switch_parallel(&c1_auto);
+
+        let new_c0 = c0_auto.add(&ks_c0);
+
+        Self {
+            c0: new_c0,
+            c1: ks_c1,
+            rns_params: self.rns_params.clone(),
+            bgv_params: self.bgv_params.clone(),
+        }
+    }
+
     /// Sums all slots using the Galois group structure.
     ///
     /// Given ciphertext with slots [s_0, s_1, ..., s_{n-1}],
@@ -980,6 +1079,29 @@ impl RnsCiphertext {
         // This doubles the sum to include all n slots
         if let Some(gk) = galois_keys.get_conjugation_key() {
             let conjugated = result.apply_automorphism(gk);
+            result = result.add(&conjugated);
+        }
+
+        result
+    }
+
+    /// Parallel version of sum_slots using rayon for key-switching.
+    #[cfg(feature = "rayon")]
+    pub fn sum_slots_parallel(&self, galois_keys: &RnsGaloisKeys) -> Self {
+        let mut result = self.clone();
+        let num_keys = galois_keys.num_keys();
+
+        // Phase 1: Tree-based summation with parallel key-switching
+        for i in 0..(num_keys - 1) {
+            if let Some(gk) = galois_keys.get_key(i) {
+                let permuted = result.apply_automorphism_parallel(gk);
+                result = result.add(&permuted);
+            }
+        }
+
+        // Phase 2: Add conjugate
+        if let Some(gk) = galois_keys.get_conjugation_key() {
+            let conjugated = result.apply_automorphism_parallel(gk);
             result = result.add(&conjugated);
         }
 

@@ -209,6 +209,8 @@ function getAllBenchmarkDefs(concurrency = 8) {
         // bgv_justvengers benchmarks (BGV homomorphic encryption pattern)
         // 10 copies, 8192 slots, 5 RNS moduli, sum_slots + mask + 80 CT additions
         { category: "bgv", name: "bgv/justvengers_pattern", fn: (n) => wasm.bgv_justvengers_pattern(n), async: false, returnsBenchResult: true, warmup: 0 },
+        { category: "bgv", name: "bgv/justvengers_pattern_parallel", fn: (n) => wasm.bgv_justvengers_pattern_parallel(n, concurrency), async: true, returnsBenchResult: true, warmup: 0, mt: true },
+        { category: "bgv", name: "bgv/justvengers_pattern_webgpu", fn: (n) => wasm.bgv_justvengers_pattern_webgpu(n), async: true, returnsBenchResult: true, warmup: 0 },
     ];
 }
 

@@ -79,6 +79,8 @@ const ALL_BENCHMARKS: &[&str] = &[
     "jv_vm_prover/2k",
     "jv_vm_prover/3k",
     "bgv/justvengers_pattern",
+    "bgv/justvengers_pattern_parallel",
+    "bgv/justvengers_pattern_webgpu",
 ];
 
 /// Get all benchmarks in a group

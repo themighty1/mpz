@@ -26,6 +26,9 @@ use rand::{Rng, SeedableRng};
 use crate::BenchResult;
 
 #[cfg(target_arch = "wasm32")]
+use std::sync::Arc;
+
+#[cfg(target_arch = "wasm32")]
 const NUM_COPIES: usize = 10;
 
 #[cfg(target_arch = "wasm32")]
@@ -86,7 +89,7 @@ fn setup_bgv_bench() -> BgvBenchData {
     }
 }
 
-/// Runs a single iteration of the JustVengers BGV pattern.
+/// Runs a single iteration of the JustVengers BGV pattern (sequential).
 #[cfg(target_arch = "wasm32")]
 fn run_bgv_iteration(data: &BgvBenchData) {
     // Copy and slot-wise multiply each copy with its coefficients
@@ -98,7 +101,7 @@ fn run_bgv_iteration(data: &BgvBenchData) {
     let ct_combined = multiplied.iter().skip(1)
         .fold(multiplied[0].clone(), |acc, ct| acc.add(ct));
 
-    // Sum all slots
+    // Sum all slots (sequential)
     let summed = ct_combined.sum_slots(&data.galois_keys);
 
     // Mask to keep only slot 1
@@ -114,7 +117,35 @@ fn run_bgv_iteration(data: &BgvBenchData) {
     std::hint::black_box(result);
 }
 
-/// Benchmark JustVengers BGV pattern in WASM.
+/// Runs a single iteration of the JustVengers BGV pattern (parallel sum_slots).
+#[cfg(target_arch = "wasm32")]
+fn run_bgv_iteration_parallel(data: &BgvBenchData) {
+    // Copy and slot-wise multiply each copy with its coefficients
+    let multiplied: Vec<RnsCiphertext> = data.all_coeffs.iter()
+        .map(|coeffs| data.ct_main.clone().mul_plaintext_slots(coeffs))
+        .collect();
+
+    // Add all multiplied copies together
+    let ct_combined = multiplied.iter().skip(1)
+        .fold(multiplied[0].clone(), |acc, ct| acc.add(ct));
+
+    // Sum all slots (parallel key-switching)
+    let summed = ct_combined.sum_slots_parallel(&data.galois_keys);
+
+    // Mask to keep only slot 1
+    let masked = summed.mul_plaintext_slots(&data.mask);
+
+    // Add all additional ciphertexts
+    let mut result = masked;
+    for ct_add in data.additional_cts.iter() {
+        result = result.add(ct_add);
+    }
+
+    // Prevent optimization
+    std::hint::black_box(result);
+}
+
+/// Benchmark JustVengers BGV pattern in WASM (sequential).
 ///
 /// Pattern: NUM_COPIES x (copy + slot-wise mult) + sum_slots + mask + 80 CT additions
 ///
@@ -176,4 +207,109 @@ pub fn bgv_justvengers_pattern(n: u32) -> Result<BenchResult, JsValue> {
         elapsed_ms: total_elapsed_ms,
         and_gates: 0, // Not applicable for BGV
     })
+}
+
+/// Benchmark JustVengers BGV pattern in WASM with parallel key-switching.
+///
+/// Uses rayon thread pool in a web worker for parallel sum_slots.
+///
+/// # Arguments
+/// * `n` - Number of benchmark iterations
+/// * `concurrency` - Number of threads for rayon pool
+///
+/// # Returns
+/// BenchResult with elapsed_ms
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn bgv_justvengers_pattern_parallel(n: u32, concurrency: u32) -> BenchResult {
+    use std::sync::Mutex;
+    use wasm_bindgen_futures::JsFuture;
+
+    let result: Arc<Mutex<Option<BenchResult>>> = Arc::new(Mutex::new(None));
+    let result_clone = result.clone();
+
+    let _handle = web_spawn::spawn(move || {
+        // Create a local thread pool for rayon
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrency as usize)
+            .spawn_handler(|thread| {
+                let _ = web_spawn::spawn(move || thread.run());
+                Ok(())
+            })
+            .build()
+            .expect("failed to build rayon pool");
+
+        let bench_result = pool.install(|| {
+            let global = js_sys::global();
+            let performance: web_sys::Performance =
+                js_sys::Reflect::get(&global, &"performance".into())
+                    .expect("performance should exist")
+                    .unchecked_into();
+
+            web_sys::console::log_1(
+                &format!(
+                    "[bgv-parallel] Setting up: {} copies, {} additional CTs, 8192 slots, 5 RNS moduli, {} threads",
+                    NUM_COPIES, NUM_ADDITIONAL_CTS, concurrency
+                ).into(),
+            );
+
+            let setup_start = performance.now();
+            let data = setup_bgv_bench();
+            let setup_time = performance.now() - setup_start;
+
+            web_sys::console::log_1(
+                &format!("[bgv-parallel] Setup complete in {:.2}ms, starting {} iterations", setup_time, n).into(),
+            );
+
+            let mut total_elapsed_ms = 0.0;
+
+            for i in 0..n {
+                let start = performance.now();
+                run_bgv_iteration_parallel(&data);
+                total_elapsed_ms += performance.now() - start;
+
+                if (i + 1) % 5 == 0 || i == 0 {
+                    web_sys::console::log_1(
+                        &format!(
+                            "[bgv-parallel] Iteration {}/{} done, avg {:.2}ms/iter",
+                            i + 1, n, total_elapsed_ms / (i + 1) as f64
+                        ).into(),
+                    );
+                }
+            }
+
+            web_sys::console::log_1(
+                &format!(
+                    "[bgv-parallel] Done: {:.2}ms total, {:.2}ms/iter",
+                    total_elapsed_ms,
+                    total_elapsed_ms / n as f64
+                ).into(),
+            );
+
+            BenchResult {
+                elapsed_ms: total_elapsed_ms,
+                and_gates: 0,
+            }
+        });
+
+        *result_clone.lock().unwrap() = Some(bench_result);
+    });
+
+    // Poll for result from main thread
+    loop {
+        JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL))
+            .await
+            .unwrap();
+        if let Some(r) = result.lock().unwrap().take() {
+            return r;
+        }
+        // Small delay before next poll
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 10)
+                .unwrap();
+        });
+        JsFuture::from(promise).await.unwrap();
+    }
 }

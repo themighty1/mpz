@@ -403,6 +403,18 @@ impl RnsPoly {
         }
     }
 
+    /// Creates an RnsPoly from pre-computed residue vectors.
+    pub fn from_residue_vecs(residues: Vec<Vec<u64>>, params: &RnsParams) -> Self {
+        assert_eq!(residues.len(), params.num_moduli());
+        for r in &residues {
+            assert_eq!(r.len(), params.ring_dim());
+        }
+        Self {
+            residues,
+            params: params.clone(),
+        }
+    }
+
     /// Returns the residues.
     pub fn residues(&self) -> &[Vec<u64>] {
         &self.residues
