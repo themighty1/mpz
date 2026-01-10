@@ -56,7 +56,7 @@ use mpz_fields::Field;
 
 // IT-PAC imports for real polynomial commitments
 use mpz_justvengers_core::{
-    ahe::{BgvParams, Ciphertext, KeyPair, PublicKey},
+    ahe::{BgvParams, KeyPair, PublicKey},
     GlobalKey, ItMacField, ItPac, VolePool,
 };
 
@@ -328,18 +328,8 @@ pub struct JVCommitmentMessage {
     /// Number of polynomial commitments (one per wire position).
     pub num_polynomials: usize,
     /// F_Com commitments: hash(⟦f_w(Λ) - u_w⟧) for each wire w.
-    /// Actual ciphertexts are revealed later in JVCiphertextOpenMessage.
+    /// Actual RNS ciphertexts are revealed later via open_rns_ciphertexts().
     pub ciphertext_commitments: Vec<[u8; 32]>,
-}
-
-/// Ciphertext opening message from prover.
-///
-/// Sent after V reveals Λ. V can verify these match the F_Com commitments.
-#[derive(Clone, Debug)]
-pub struct JVCiphertextOpenMessage {
-    /// IT-PAC polynomial commitments: ⟦f_w(Λ) - u_w⟧ for each wire w.
-    /// Each ciphertext represents a committed polynomial encoding R values.
-    pub poly_commitment_ciphertexts: Vec<Ciphertext>,
 }
 
 /// Input coefficient IT-MAC commitment message from prover.
@@ -1307,15 +1297,6 @@ impl<const R: usize> JVProver<R> {
     /// - 256-bit security against collision attacks
     /// - 128-bit security against preimage attacks
     /// - Fast hashing even for large ciphertexts
-    fn compute_ciphertext_commitment(ciphertext: &Ciphertext) -> [u8; 32] {
-        // Serialize ciphertext to bytes
-        let bytes = bincode::serialize(ciphertext).expect("Ciphertext serialization failed");
-
-        // Compute blake3 hash - this is a proper cryptographic hash
-        // that provides binding security for F_Com
-        *blake3::hash(&bytes).as_bytes()
-    }
-
     /// Computes F_Com commitment for an RNS ciphertext (slot-packed).
     fn compute_rns_ciphertext_commitment(ciphertext: &RnsCiphertext) -> [u8; 32] {
         // Hash the RNS ciphertext components
@@ -2084,50 +2065,6 @@ impl<const R: usize> JVVerifier<R> {
         self.phase = JVVerifierPhase::ChallengeChiSent;
 
         Ok(chi)
-    }
-
-    /// Receives and verifies ciphertext opening from prover.
-    ///
-    /// Called after V reveals Λ. Verifies that ciphertexts match F_Com commitments,
-    /// then decrypts to get masked polynomial evaluations.
-    pub fn receive_ciphertext_opening(
-        &mut self,
-        opening: JVCiphertextOpenMessage,
-    ) -> Result<(), JVVerifierError> {
-        // Verify each ciphertext matches its F_Com commitment
-        if opening.poly_commitment_ciphertexts.len() != self.ciphertext_commitments.len() {
-            return Err(JVVerifierError::CiphertextCommitmentMismatch);
-        }
-
-        for (ct, expected_commitment) in opening.poly_commitment_ciphertexts.iter()
-            .zip(self.ciphertext_commitments.iter())
-        {
-            let computed_commitment = Self::compute_ciphertext_commitment(ct);
-            if &computed_commitment != expected_commitment {
-                return Err(JVVerifierError::CiphertextCommitmentMismatch);
-            }
-        }
-
-        // All commitments verified - now decrypt
-        if let Some(ref keypair) = self.ahe_keypair {
-            let decrypted_values: Vec<u64> = opening
-                .poly_commitment_ciphertexts
-                .iter()
-                .map(|ct| ct.decrypt_scalar(&keypair.sk))
-                .collect();
-
-            self.decrypted_commitments = Some(decrypted_values);
-        }
-
-        Ok(())
-    }
-
-    /// Computes F_Com commitment (hash) of a ciphertext using blake3.
-    ///
-    /// Must match the prover's F_Com implementation for verification to work.
-    fn compute_ciphertext_commitment(ciphertext: &Ciphertext) -> [u8; 32] {
-        let bytes = bincode::serialize(ciphertext).expect("Ciphertext serialization failed");
-        *blake3::hash(&bytes).as_bytes()
     }
 
     /// Receives soldering commit and returns challenge.

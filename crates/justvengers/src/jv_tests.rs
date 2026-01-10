@@ -110,55 +110,10 @@ fn test_jv_protocol_with_soldering() {
     assert!(result.unwrap(), "JV protocol verification failed");
 }
 
-#[test]
-fn test_itpac_commitment_decryption() {
-    // Test that IT-PAC ciphertexts are properly decrypted
-    // With F_Com pattern, flow is:
-    // 1. P sends commitment (hashes only)
-    // 2. V sends chi
-    // 3. P opens ciphertexts
-    // 4. V verifies and decrypts
-    let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
-
-    let mut circuit = Circuit::new();
-    let x = circuit.add_input();
-    let y = circuit.add_input();
-    circuit.add_mul(x, y);
-
-    let batch = CircuitBatch::new(vec![circuit]);
-
-    // Setup
-    let mut prover = JVProver::<2>::new(vec![0, 0], GOLDILOCKS);
-    prover.setup(&batch, &[vec![3, 4], vec![5, 6]]).unwrap();
-    prover.setup_soldering(vec![], &mut rng).unwrap();
-
-    let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
-    let setup_msg = verifier.setup(&batch, &mut rng).unwrap();
-
-    // Create VOLE pool and commit
-    let circuit_size = batch.get(0).map(|c| c.num_wires()).unwrap_or(10);
-    let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
-
-    let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
-
-    // Receive commitment (only hashes with F_Com)
-    let _chi = verifier.receive_commitment(commitment).unwrap();
-
-    // Before ciphertext opening, decrypted should be None
-    assert!(verifier.decrypted_commitments().is_none(), "No decryption before ciphertext opening");
-
-    // Open ciphertexts - this triggers decryption
-    let ciphertext_opening = prover.open_ciphertexts();
-    verifier.receive_ciphertext_opening(ciphertext_opening).unwrap();
-
-    // Now check that decrypted values exist
-    let decrypted = verifier.decrypted_commitments();
-    assert!(decrypted.is_some(), "Decrypted commitments should exist after opening");
-    assert!(!decrypted.unwrap().is_empty(), "Should have decrypted values");
-
-    println!("IT-PAC decryption test passed!");
-    println!("Decrypted {} commitment values", decrypted.unwrap().len());
-}
+// NOTE: test_itpac_commitment_decryption was removed because the API changed.
+// The prover now uses RNS ciphertexts (open_rns_ciphertexts) instead of
+// the old Ciphertext-based open_ciphertexts method.
+// The IT-PAC decryption is tested through the full protocol tests.
 
 // Note: test_itpac_verify_poly_at_lambda was removed because it tests private
 // implementation details (verifier.lambda, verifier.ahe_keypair, evaluate_poly_at_lambda).
