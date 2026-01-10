@@ -2873,51 +2873,52 @@ mod rns_bgv_tests {
     #[test]
     fn test_sum_slots_masked_plus_add() {
         // JustVengers pattern test:
-        // 1. Original CT encrypts slot values
-        // 2. Copy CT (same encrypted values)
-        // 3. Generate 8K coefficients for each CT
-        // 4. Slot-wise multiply original with coeffs1, copy with coeffs2
-        // 5. Add the two multiplied CTs together
-        // 6. sum_slots with rotations
-        // 7. Mask to keep only slot 1
-        // 8. Add 80 CTs (B+C pattern from JustVengers paper)
+        // 1. Start with 1 main CT
+        // 2. Copy it NUM_COPIES times
+        // 3. Slot-wise multiply each copy with its random field element coefficients
+        // 4. Add all multiplied copies together
+        // 5. sum_slots with rotations
+        // 6. Mask to keep only slot 1
+        // 7. Add 80 CTs (B+C pattern from JustVengers paper)
         //
-        // Uses Goldilocks params with 4 moduli for sufficient noise budget
+        // Uses Goldilocks params with 5 moduli for sufficient noise budget
+        const NUM_COPIES: usize = 10;
+
         let mut rng = Prg::from_seed(Block::ZERO);
         let keypair = RnsKeyPair::generate_goldilocks(&mut rng);
         let n = 8192;
         let t = crate::ahe::params::GOLDILOCKS;
 
-        // Create slot values: small values to avoid overflow
+        // Create slot values
         let slots: Vec<u64> = (0..n).map(|i| (i % 100 + 1) as u64).collect();
 
-        // Generate 8K random field element coefficients for each CT
-        let coeffs1: Vec<u64> = (0..n).map(|_| rng.random::<u64>() % t).collect();
-        let coeffs2: Vec<u64> = (0..n).map(|_| rng.random::<u64>() % t).collect();
+        // Generate 8K random field element coefficients for each copy
+        let all_coeffs: Vec<Vec<u64>> = (0..NUM_COPIES)
+            .map(|_| (0..n).map(|_| rng.random::<u64>() % t).collect())
+            .collect();
 
-        // Compute expected sum: sum of (slots[i] * coeffs1[i] + slots[i] * coeffs2[i])
+        // Compute expected sum: sum over all copies and all slots
         let expected_sum: u64 = (0..n)
             .map(|i| {
-                let prod1 = (slots[i] as u128 * coeffs1[i] as u128) % t as u128;
-                let prod2 = (slots[i] as u128 * coeffs2[i] as u128) % t as u128;
-                ((prod1 + prod2) % t as u128) as u64
+                let slot_sum: u128 = all_coeffs.iter()
+                    .map(|coeffs| (slots[i] as u128 * coeffs[i] as u128) % t as u128)
+                    .fold(0u128, |acc, x| (acc + x) % t as u128);
+                slot_sum as u64
             })
             .fold(0u64, |acc, x| ((acc as u128 + x as u128) % t as u128) as u64);
 
-        println!("Expected sum after slot-wise mult + add + sum_slots: {}", expected_sum);
+        println!("Expected sum after {}x slot-wise mult + sum_slots: {}", NUM_COPIES, expected_sum);
 
-        // Encrypt the original CT
-        let ct_orig = RnsCiphertext::encrypt_slots(&keypair.pk, &slots, &mut rng);
+        // Main CT
+        let ct_main = RnsCiphertext::encrypt_slots(&keypair.pk, &slots, &mut rng);
 
-        // Copy it (clone)
-        let ct_copy = ct_orig.clone();
+        // Copy and slot-wise multiply each copy with its coefficients
+        let multiplied: Vec<RnsCiphertext> = all_coeffs.iter()
+            .map(|coeffs| ct_main.clone().mul_plaintext_slots(coeffs))
+            .collect();
 
-        // Slot-wise multiply each CT with its coefficients
-        let ct1_mult = ct_orig.mul_plaintext_slots(&coeffs1);
-        let ct2_mult = ct_copy.mul_plaintext_slots(&coeffs2);
-
-        // Add the two multiplied CTs together
-        let ct_combined = ct1_mult.add(&ct2_mult);
+        // Add all multiplied copies together
+        let ct_combined = multiplied.iter().skip(1).fold(multiplied[0].clone(), |acc, ct| acc.add(ct));
 
         // Generate Galois keys and sum all slots
         let gks = RnsGaloisKeys::generate(&keypair.sk, &mut rng);
@@ -2989,7 +2990,7 @@ mod rns_bgv_tests {
         }
 
         println!("JustVengers pattern test passed!");
-        println!("  slot[0]=0, slot[1]={} (sum after 2x slot-wise mult + add)", result_slots[1]);
+        println!("  slot[0]=0, slot[1]={} (sum after {}x slot-wise mult + add)", result_slots[1], NUM_COPIES);
         println!("  slots[2-81] have values from 80 CT additions");
     }
 }

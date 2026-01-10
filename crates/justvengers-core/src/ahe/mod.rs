@@ -35,6 +35,8 @@ mod sample;
 mod slot;
 mod rns;
 mod rns_bgv;
+
+#[cfg(feature = "cl-scheme")]
 pub mod cl_ahe;
 
 pub use params::{BgvParams, ParamSet, RnsBgvParams, GOLDILOCKS};
@@ -52,6 +54,7 @@ pub use rns_bgv::{
 };
 
 // Re-export CL types at top level for convenience
+#[cfg(feature = "cl-scheme")]
 pub use cl_ahe::{CLGroup, CLSecretKey, CLPublicKey, CLKeyPair, CLCiphertext};
 
 #[cfg(test)]

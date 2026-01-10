@@ -43,6 +43,7 @@ const ALL_GROUPS: &[&str] = &[
     "garble",
     "ferret_sender",
     "jv_vm_prover",
+    "bgv",
 ];
 
 /// All available benchmarks
@@ -77,6 +78,7 @@ const ALL_BENCHMARKS: &[&str] = &[
     "jv_vm_prover/1k",
     "jv_vm_prover/2k",
     "jv_vm_prover/3k",
+    "bgv/justvengers_pattern",
 ];
 
 /// Get all benchmarks in a group

@@ -10,7 +10,7 @@ workspace = true
 [features]
 default = []
 rayon = ["dep:rayon"]
-cl-scheme = []
+cl-scheme = ["dep:class_group", "dep:num-bigint"]
 
 [dependencies]
 mpz-core = { workspace = true }
@@ -21,9 +21,9 @@ serde = { workspace = true, features = ["derive"] }
 rayon = { workspace = true, optional = true }
 rand = { workspace = true }
 
-# Class group cryptography for CL-based homomorphic encryption
-class_group = { path = "/home/default2/Desktop/gh_repos/class-group" }
-num-bigint = { workspace = true }
+# Class group cryptography for CL-based homomorphic encryption (optional, not wasm-compatible)
+class_group = { path = "/home/default2/Desktop/gh_repos/class-group", optional = true }
+num-bigint = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }

@@ -106,18 +106,21 @@ fn bench_sum_slots_with_verification(c: &mut Criterion) {
     });
 }
 
-/// Benchmark JustVengers pattern: 2x slot-wise mult + add + sum_slots + mask + 80 CT additions.
+/// Benchmark JustVengers pattern: NUM_COPIES x (copy + slot-wise mult) + sum_slots + mask + 80 CT additions.
 ///
 /// Measures the full operation:
-/// 1. Slot-wise multiply original CT with random coefficients
-/// 2. Slot-wise multiply copy of CT with different random coefficients
-/// 3. Add the two multiplied CTs together
-/// 4. sum_slots: sum all 8192 slots (13 rotations)
-/// 5. mask: zero out all slots except slot 1
-/// 6. add: add 80 pre-prepared ciphertexts with values in slots 2-81
+/// 1. Start with main CT
+/// 2. Copy it NUM_COPIES times
+/// 3. Slot-wise multiply each copy with random field element coefficients
+/// 4. Add all multiplied copies together
+/// 5. sum_slots: sum all 8192 slots (13 rotations)
+/// 6. mask: zero out all slots except slot 1
+/// 7. add: add 80 pre-prepared ciphertexts with values in slots 2-81
 ///
 /// All coefficients and 80 ciphertexts are generated once outside the benchmark and reused.
 fn bench_sum_slots_masked(c: &mut Criterion) {
+    const NUM_COPIES: usize = 10;
+
     let mut rng = rng();
     let params = RnsBgvParams::goldilocks();
     let keypair = RnsKeyPair::generate(&params, &mut rng);
@@ -129,22 +132,24 @@ fn bench_sum_slots_masked(c: &mut Criterion) {
     // Create slot values
     let slots: Vec<u64> = (0..n).map(|i| (i % 100 + 1) as u64).collect();
 
-    // Generate 8K random field element coefficients for each CT
-    println!("Generating random coefficients...");
-    let coeffs1: Vec<u64> = (0..n).map(|_| rng.random::<u64>() % t).collect();
-    let coeffs2: Vec<u64> = (0..n).map(|_| rng.random::<u64>() % t).collect();
+    // Generate 8K random field element coefficients for each copy
+    println!("Generating random coefficients for {} copies...", NUM_COPIES);
+    let all_coeffs: Vec<Vec<u64>> = (0..NUM_COPIES)
+        .map(|_| (0..n).map(|_| rng.random::<u64>() % t).collect())
+        .collect();
 
-    // Compute expected sum: sum of (slots[i] * coeffs1[i] + slots[i] * coeffs2[i])
+    // Compute expected sum: sum over all copies and all slots
     let expected_sum: u64 = (0..n)
         .map(|i| {
-            let prod1 = (slots[i] as u128 * coeffs1[i] as u128) % t as u128;
-            let prod2 = (slots[i] as u128 * coeffs2[i] as u128) % t as u128;
-            ((prod1 + prod2) % t as u128) as u64
+            let slot_sum: u128 = all_coeffs.iter()
+                .map(|coeffs| (slots[i] as u128 * coeffs[i] as u128) % t as u128)
+                .fold(0u128, |acc, x| (acc + x) % t as u128);
+            slot_sum as u64
         })
         .fold(0u64, |acc, x| ((acc as u128 + x as u128) % t as u128) as u64);
 
-    // Encrypt the original CT
-    let ct = RnsCiphertext::encrypt_slots(&keypair.pk, &slots, &mut rng);
+    // Encrypt the main CT
+    let ct_main = RnsCiphertext::encrypt_slots(&keypair.pk, &slots, &mut rng);
 
     // Pre-create mask: 1 in slot 1, 0 elsewhere
     let mut mask = vec![0u64; n];
@@ -172,21 +177,25 @@ fn bench_sum_slots_masked(c: &mut Criterion) {
     group.sample_size(10);
 
     group.bench_with_input(
-        BenchmarkId::new("cpu", format!("n={}", n)),
-        &(&ct, &galois_keys, &coeffs1, &coeffs2, &mask, &additional_cts),
-        |b, (ct, gks, coeffs1, coeffs2, mask, additional_cts)| {
+        BenchmarkId::new("cpu", format!("n={}_copies={}", n, NUM_COPIES)),
+        &(&ct_main, &galois_keys, &all_coeffs, &mask, &additional_cts),
+        |b, (ct_main, gks, all_coeffs, mask, additional_cts)| {
             b.iter(|| {
-                // Clone CT for second multiplication
-                let ct_copy = ct.clone();
-                // Slot-wise multiply each CT with its coefficients
-                let ct1_mult = ct.mul_plaintext_slots(black_box(coeffs1));
-                let ct2_mult = ct_copy.mul_plaintext_slots(black_box(coeffs2));
-                // Add the two multiplied CTs together
-                let ct_combined = ct1_mult.add(&ct2_mult);
+                // Copy and slot-wise multiply each copy with its coefficients
+                let multiplied: Vec<RnsCiphertext> = all_coeffs.iter()
+                    .map(|coeffs| (*ct_main).clone().mul_plaintext_slots(black_box(coeffs)))
+                    .collect();
+
+                // Add all multiplied copies together
+                let ct_combined = multiplied.iter().skip(1)
+                    .fold(multiplied[0].clone(), |acc, ct| acc.add(ct));
+
                 // Sum all slots
                 let summed = ct_combined.sum_slots(black_box(gks));
+
                 // Mask to keep only slot 1
                 let masked = summed.mul_plaintext_slots(black_box(mask));
+
                 // Add all 80 pre-prepared ciphertexts
                 let mut result = masked;
                 for ct_add in additional_cts.iter() {
@@ -199,11 +208,12 @@ fn bench_sum_slots_masked(c: &mut Criterion) {
 
     group.finish();
 
-    // Verify correctness (not timed): run one more iteration and check result
-    let ct_copy = ct.clone();
-    let ct1_mult = ct.mul_plaintext_slots(&coeffs1);
-    let ct2_mult = ct_copy.mul_plaintext_slots(&coeffs2);
-    let ct_combined = ct1_mult.add(&ct2_mult);
+    // Verify correctness (not timed)
+    let multiplied: Vec<RnsCiphertext> = all_coeffs.iter()
+        .map(|coeffs| ct_main.clone().mul_plaintext_slots(coeffs))
+        .collect();
+    let ct_combined = multiplied.iter().skip(1)
+        .fold(multiplied[0].clone(), |acc, ct| acc.add(&ct));
     let summed = ct_combined.sum_slots(&galois_keys);
     let masked = summed.mul_plaintext_slots(&mask);
     let mut result = masked;
@@ -229,8 +239,8 @@ fn bench_sum_slots_masked(c: &mut Criterion) {
             slot_idx, expected_slot_values[slot_idx], decrypted[slot_idx]
         );
     }
-    println!("Correctness verified: slot[0]=0, slot[1]={} (sum after 2x slot-wise mult), slots[2-81] have values",
-             decrypted[1]);
+    println!("Correctness verified: slot[0]=0, slot[1]={} (sum after {}x slot-wise mult), slots[2-81] have values",
+             decrypted[1], NUM_COPIES);
 }
 
 criterion_group! {

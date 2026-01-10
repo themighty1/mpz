@@ -12,6 +12,7 @@ mpz-garble = { workspace = true }
 mpz-zk-core = { workspace = true, features = ["rayon"] }
 mpz-zk = { workspace = true, features = ["rayon"] }
 mpz-justvengers = { workspace = true }
+mpz-justvengers-core = { workspace = true }
 mpz-fields = { workspace = true }
 pollster = { workspace = true }
 mpz-circuits = { workspace = true, features = ["aes"] }
