@@ -23,7 +23,7 @@ use super::ring::{BarrettReducer, RingPoly};
 /// RNS moduli configuration.
 ///
 /// Holds a set of coprime NTT-friendly primes for RNS representation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RnsParams {
     /// The individual prime moduli q_i.
     moduli: Vec<u64>,
@@ -43,6 +43,20 @@ pub struct RnsParams {
 /// Precomputed NTT-friendly primes for various ring dimensions.
 /// Each prime q satisfies q ≡ 1 (mod 2N) for NTT support.
 /// These are ~60-bit primes verified via Miller-Rabin primality test.
+const NTT_PRIMES_16384: [u64; 10] = [
+    // q ≡ 1 (mod 32768) primes, ~60 bits each
+    1152921504607338497,
+    1152921504608747521,
+    1152921504609239041,
+    1152921504612646913,
+    1152921504614023169,
+    1152921504614055937,
+    1152921504615628801,
+    1152921504615694337,
+    1152921504616480769,
+    1152921504616808449,
+];
+
 const NTT_PRIMES_8192: [u64; 8] = [
     // q ≡ 1 (mod 16384) primes, ~60 bits each
     1152921504606994433,
@@ -110,6 +124,7 @@ impl RnsParams {
 
         // Select precomputed primes based on ring dimension
         let available_primes: &[u64] = match ring_dim {
+            16384 => &NTT_PRIMES_16384,
             8192 => &NTT_PRIMES_8192,
             4096 => &NTT_PRIMES_4096,
             1024 => &NTT_PRIMES_1024,
@@ -355,7 +370,7 @@ impl RnsParams {
 /// Coefficients are stored as residues modulo each RNS modulus.
 /// For a polynomial with n coefficients and k moduli, we store
 /// a k × n matrix where entry [i][j] is coefficient j mod modulus i.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RnsPoly {
     /// Coefficients in RNS form: residues[i] contains all coefficients mod moduli[i].
     residues: Vec<Vec<u64>>,
@@ -548,6 +563,10 @@ mod rns_tests {
     #[test]
     fn test_precomputed_primes_valid() {
         // Verify all precomputed primes are valid
+        for &q in &NTT_PRIMES_16384 {
+            assert!(RnsParams::is_prime(q), "{} is not prime", q);
+            assert_eq!((q - 1) % 32768, 0, "{} not NTT-friendly for N=16384", q);
+        }
         for &q in &NTT_PRIMES_8192 {
             assert!(RnsParams::is_prime(q), "{} is not prime", q);
             assert_eq!((q - 1) % 16384, 0, "{} not NTT-friendly for N=8192", q);
