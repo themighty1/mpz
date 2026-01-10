@@ -158,7 +158,7 @@ fn run_prover_only<const R: usize>(
 
         // Prover protocol phases only
         let _commitment = prover.commit(&msgs.setup_msg, vole_pool).unwrap();
-        let _mk_commitment = prover.commit_mk_polynomials(&msgs.setup_msg).unwrap();
+        let _mk_commitment = prover.commit_mk_polynomials().unwrap();
         let _soldering_commit = prover.commit_soldering().unwrap();
         let _disclosure = prover.disclose(msgs.chi, &msgs.topology_vectors).unwrap();
 

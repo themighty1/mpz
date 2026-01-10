@@ -184,7 +184,7 @@ async fn run_protocol_record_verifier<const R: usize>(
     let commitment_recv = ctx_v.io_mut().expect_next().await.unwrap();
 
     // P → V: MK polynomial commitment
-    let mk_commitment = prover.commit_mk_polynomials(&setup_msg_recv).unwrap();
+    let mk_commitment = prover.commit_mk_polynomials().unwrap();
     ctx_p.io_mut().send(mk_commitment.clone()).await.unwrap();
     let _mk_commitment_recv: MKCommitmentMessage = ctx_v.io_mut().expect_next().await.unwrap();
 
@@ -308,7 +308,7 @@ async fn run_prover_with_replay<const R: usize>(
     ctx.io_mut().send(commitment).await.unwrap();
 
     // P → V: MK polynomial commitment
-    let mk_commitment = prover.commit_mk_polynomials(&setup_msg).unwrap();
+    let mk_commitment = prover.commit_mk_polynomials().unwrap();
     ctx.io_mut().send(mk_commitment).await.unwrap();
 
     // P → V: Soldering commitment

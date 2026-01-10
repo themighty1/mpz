@@ -51,15 +51,19 @@ use crate::soldering::{
 };
 use crate::topology::{CircuitBatch, ExtendedWitness, TopologyVector};
 
-#[cfg(feature = "ntt")]
 use mpz_fields::goldilocks::{Goldilocks, InttContext, GOLDILOCKS};
-#[cfg(feature = "ntt")]
 use mpz_fields::Field;
 
 // IT-PAC imports for real polynomial commitments
 use mpz_justvengers_core::{
     ahe::{BgvParams, Ciphertext, KeyPair, PublicKey},
-    EncryptedPowers, GlobalKey, ItMacField, ItPac, ItPacGenerator, VolePool,
+    GlobalKey, ItMacField, ItPac, VolePool,
+};
+
+// RNS BGV imports for slot-packed parallel operations
+use mpz_justvengers_core::{
+    RnsBgvParams, RnsCiphertext, RnsKeyPair, RnsPublicKey, RnsSecretKey,
+    RnsGaloisKeys, SlotPackedEncryptedPowers,
 };
 
 use mpz_core::{prg::Prg, Block};
@@ -276,7 +280,7 @@ pub const ITMAC_MODULUS: u64 = GOLDILOCKS;
 
 /// Setup message from verifier (O(R) communication).
 ///
-/// Contains evaluation points and encrypted powers of Λ for IT-PAC.
+/// Contains evaluation points and slot-packed encrypted powers of Λ for IT-PAC.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct JVSetupMessage {
     /// Evaluation points α₁, ..., αᵣ for polynomial interpolation.
@@ -284,14 +288,23 @@ pub struct JVSetupMessage {
     pub eval_points: Vec<u64>,
     /// Maximum polynomial degree (R-1 for R repetitions).
     pub max_degree: usize,
-    /// Encrypted powers ⟦Λ⟧, ⟦Λ²⟧, ..., ⟦Λ^max_degree⟧ for IT-PAC.
-    /// Prover uses these to homomorphically evaluate f(Λ).
-    pub encrypted_powers: EncryptedPowers,
     /// AHE public key for the prover to verify ciphertexts.
     pub ahe_public_key: PublicKey,
     /// Commitment to AHE seed (hash of seed).
     /// V commits to this in setup; reveals seed later so P can verify AHE ciphertexts.
     pub ahe_seed_commitment: [u8; 32],
+
+    // === RNS BGV slot-packed fields ===
+    /// Slot-packed encrypted powers (single ciphertext with all powers in slots).
+    /// Prover uses sum_slots_to_slot to place each polynomial's sum in a unique slot.
+    #[serde(skip)]
+    pub rns_slot_packed_powers: Option<SlotPackedEncryptedPowers>,
+    /// Galois keys for rotation operations (sum_slots_to_slot).
+    #[serde(skip)]
+    pub rns_galois_keys: Option<RnsGaloisKeys>,
+    /// RNS public key for slot-packed operations.
+    #[serde(skip)]
+    pub rns_public_key: Option<RnsPublicKey>,
 }
 
 /// Revelation message from verifier (sent after P commits).
@@ -437,8 +450,8 @@ pub struct MKCommitmentMessage {
 /// Sent after V reveals Λ. V can verify these match the F_Com commitments.
 #[derive(Clone, Debug)]
 pub struct MKCiphertextOpenMessage {
-    /// IT-PAC ciphertexts ⟦MK_i(Λ) - u_i⟧ for each branch i ∈ [B].
-    pub mk_ciphertexts: Vec<Ciphertext>,
+    /// RNS ciphertexts containing batched MK polynomial evaluations.
+    pub mk_rns_ciphertexts: Vec<RnsCiphertext>,
 }
 
 /// MK binary constraint proof message.
@@ -539,19 +552,14 @@ pub struct JVProver<const R: usize> {
     /// wire_polynomials[w] = coefficients of f_w(X) where f_w(αⱼ) = witness[j][w].
     wire_polynomials: Vec<Vec<u64>>,
     /// Precomputed INTT context for Goldilocks.
-    #[cfg(feature = "ntt")]
     intt_context: Option<InttContext>,
     /// Soldering prover.
     soldering_prover: Option<SolderingProver>,
-    /// Encrypted powers received from verifier for IT-PAC commitments.
-    encrypted_powers: Option<EncryptedPowers>,
     /// VOLE pool for IT-MAC generation.
     vole_pool: Option<VolePool<ItMacFieldType>>,
     /// IT-PAC commitments for each wire polynomial.
     itpac_commitments: Vec<ItPac<ItMacFieldType>>,
-    /// IT-PAC ciphertexts (stored for F_Com opening).
-    itpac_ciphertexts: Vec<Ciphertext>,
-    /// F_Com commitments (hashes of ciphertexts).
+    /// F_Com commitments (hashes of RNS ciphertexts).
     ciphertext_commitments: Vec<[u8; 32]>,
     /// AHE seed commitment received from verifier (for later verification).
     ahe_seed_commitment: Option<[u8; 32]>,
@@ -577,13 +585,26 @@ pub struct JVProver<const R: usize> {
     mk_polynomials: Vec<Vec<u64>>,
     /// IT-PAC commitments for MK polynomials.
     mk_itpac_commitments: Vec<ItPac<ItMacFieldType>>,
-    /// IT-PAC ciphertexts for MK polynomials (stored for F_Com opening).
-    mk_ciphertexts: Vec<Ciphertext>,
     /// F_Com commitments (hashes) for MK polynomial ciphertexts.
     mk_ciphertext_commitments: Vec<[u8; 32]>,
+    /// RNS ciphertexts for MK polynomial evaluations (batched).
+    mk_rns_ciphertexts: Vec<RnsCiphertext>,
     /// Cached vanishing polynomial Z(X) = Π(X - αⱼ) for eval_points.
     /// Computed once and reused to avoid O(R²) recomputation.
     vanishing_poly: Option<Vec<u64>>,
+
+    // ==========================================================================
+    // RNS BGV slot-packed fields (for sum_slots_to_slot evaluation)
+    // ==========================================================================
+
+    /// Slot-packed encrypted powers received from verifier.
+    rns_slot_packed_powers: Option<SlotPackedEncryptedPowers>,
+    /// Galois keys for rotation operations.
+    rns_galois_keys: Option<RnsGaloisKeys>,
+    /// RNS public key for slot-packed operations.
+    rns_public_key: Option<RnsPublicKey>,
+    /// RNS ciphertexts from slot-packed evaluation (for opening).
+    rns_ciphertexts: Vec<RnsCiphertext>,
 }
 
 /// Protocol phases for the optimized prover.
@@ -620,13 +641,10 @@ impl<const R: usize> JVProver<R> {
             phase: JVProverPhase::Init,
             eval_points: None,
             wire_polynomials: Vec::new(),
-            #[cfg(feature = "ntt")]
             intt_context: None,
             soldering_prover: None,
-            encrypted_powers: None,
             vole_pool: None,
             itpac_commitments: Vec::new(),
-            itpac_ciphertexts: Vec::new(),
             ciphertext_commitments: Vec::new(),
             ahe_seed_commitment: None,
             ahe_public_key: None,
@@ -637,10 +655,15 @@ impl<const R: usize> JVProver<R> {
             num_branches: 0,
             mk_polynomials: Vec::new(),
             mk_itpac_commitments: Vec::new(),
-            mk_ciphertexts: Vec::new(),
             mk_ciphertext_commitments: Vec::new(),
+            mk_rns_ciphertexts: Vec::new(),
             // Cached vanishing polynomial
             vanishing_poly: None,
+            // RNS BGV slot-packed fields
+            rns_slot_packed_powers: None,
+            rns_galois_keys: None,
+            rns_public_key: None,
+            rns_ciphertexts: Vec::new(),
         }
     }
 
@@ -751,7 +774,6 @@ impl<const R: usize> JVProver<R> {
                 .collect();
 
             // Use NTT for Goldilocks (O(n log n)), fallback to Lagrange otherwise
-            #[cfg(feature = "ntt")]
             let (in_poly, out_poly) = if self.modulus == GOLDILOCKS {
                 // Pad to NTT size and apply INTT
                 let mut in_padded: Vec<Goldilocks> = in_values.iter().map(|&v| Goldilocks::new(v)).collect();
@@ -772,12 +794,6 @@ impl<const R: usize> JVProver<R> {
                     crate::soldering::interpolate(&eval_points, &out_values, self.modulus),
                 )
             };
-
-            #[cfg(not(feature = "ntt"))]
-            let (in_poly, out_poly) = (
-                crate::soldering::interpolate(&eval_points, &in_values, self.modulus),
-                crate::soldering::interpolate(&eval_points, &out_values, self.modulus),
-            );
 
             input_polys.push(in_poly);
             output_polys.push(out_poly);
@@ -810,15 +826,11 @@ impl<const R: usize> JVProver<R> {
         let eval_points = &setup_msg.eval_points;
 
         // Validate eval_points length
-        #[cfg(feature = "ntt")]
         let expected_len = if self.modulus == GOLDILOCKS {
             R.next_power_of_two()
         } else {
             R
         };
-
-        #[cfg(not(feature = "ntt"))]
-        let expected_len = R;
 
         if eval_points.len() != expected_len {
             return Err(JVProverError::WrongEvaluationPoints);
@@ -829,29 +841,25 @@ impl<const R: usize> JVProver<R> {
         // (not NTT-padded points which may extend beyond R)
         let actual_eval_points = &eval_points[..R.min(eval_points.len())];
         self.vanishing_poly = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
-        self.encrypted_powers = Some(setup_msg.encrypted_powers.clone());
         self.vole_pool = Some(vole_pool);
         // Store seed commitment and public key for later verification
         self.ahe_seed_commitment = Some(setup_msg.ahe_seed_commitment);
         self.ahe_public_key = Some(setup_msg.ahe_public_key.clone());
 
+        // Store RNS slot-packed fields for polynomial evaluation
+        self.rns_slot_packed_powers = setup_msg.rns_slot_packed_powers.clone();
+        self.rns_galois_keys = setup_msg.rns_galois_keys.clone();
+        self.rns_public_key = setup_msg.rns_public_key.clone();
+
         // Create INTT context for Goldilocks
-        #[cfg(feature = "ntt")]
         if self.modulus == GOLDILOCKS {
             self.intt_context = Some(InttContext::new(eval_points.len()));
         }
-
-        // Create IT-PAC generator with encrypted powers and VOLE pool
-        let mut itpac_gen = ItPacGenerator::new(
-            setup_msg.encrypted_powers.clone(),
-            self.vole_pool.take().unwrap(),
-        );
 
         // For each wire position, interpolate R values to get polynomial
         let witness_len = self.witnesses[0].len();
         self.wire_polynomials = Vec::with_capacity(witness_len);
         self.itpac_commitments = Vec::with_capacity(witness_len);
-        self.itpac_ciphertexts = Vec::with_capacity(witness_len);
         self.ciphertext_commitments = Vec::with_capacity(witness_len);
 
         for pos in 0..witness_len {
@@ -860,25 +868,56 @@ impl<const R: usize> JVProver<R> {
 
             // Interpolate to get polynomial coefficients (uses INTT for Goldilocks)
             let poly = self.interpolate_values(&values, eval_points);
-
-            // Use IT-PAC generator for real commitment
-            // This computes ⟦f(Λ) - u⟧ homomorphically using the encrypted powers
-            if let Some((itpac, ciphertext)) = itpac_gen.commit(&poly) {
-                self.itpac_commitments.push(itpac);
-                // Compute F_Com commitment (hash of ciphertext)
-                let ct_commitment = Self::compute_ciphertext_commitment(&ciphertext);
-                self.ciphertext_commitments.push(ct_commitment);
-                self.itpac_ciphertexts.push(ciphertext);
-            } else {
-                // Fallback: create dummy ciphertext if IT-PAC commit fails
-                // (e.g., polynomial is just a constant or VOLE pool exhausted)
-                let dummy_ct = setup_msg.encrypted_powers.powers()[0].clone();
-                let ct_commitment = Self::compute_ciphertext_commitment(&dummy_ct);
-                self.ciphertext_commitments.push(ct_commitment);
-                self.itpac_ciphertexts.push(dummy_ct);
-            }
-
             self.wire_polynomials.push(poly);
+        }
+
+        // Use slot-packed evaluation with sum_slots_to_slot
+        // Each polynomial i gets summed and placed in slot i
+        // All ciphertexts are added together, V reads slots 0..num_polys-1
+        let slot_packed = self.rns_slot_packed_powers.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+        let galois_keys = self.rns_galois_keys.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        let num_slots = slot_packed.num_slots();
+        let num_polys = self.wire_polynomials.len();
+
+        // Accumulate all polynomial evaluations into one ciphertext
+        let mut accumulated_ct: Option<RnsCiphertext> = None;
+
+        for (i, poly) in self.wire_polynomials.iter().enumerate() {
+            // Evaluate single polynomial (coeffs in lane 0, zeros elsewhere)
+            let (ct, _constants) = slot_packed.evaluate_batch(&[poly.clone()]);
+
+            // Sum all 8192 slots, place result in slot i
+            #[cfg(feature = "rayon")]
+            let ct_summed = ct.sum_slots_to_slot_parallel(galois_keys, i, num_slots);
+            #[cfg(not(feature = "rayon"))]
+            let ct_summed = ct.sum_slots_to_slot(galois_keys, i, num_slots);
+
+            // Add to accumulated ciphertext
+            accumulated_ct = Some(match accumulated_ct {
+                None => ct_summed,
+                Some(acc) => acc.add(&ct_summed),
+            });
+        }
+
+        // Store the single accumulated ciphertext
+        if let Some(ct) = accumulated_ct {
+            let ct_commitment = Self::compute_rns_ciphertext_commitment(&ct);
+            // All polynomials share the same commitment (one ciphertext)
+            for _ in 0..num_polys {
+                self.ciphertext_commitments.push(ct_commitment);
+            }
+            self.rns_ciphertexts.push(ct);
+        }
+
+        // Create IT-PAC commitments with VOLE masking
+        let vole_pool = self.vole_pool.as_mut().ok_or(JVProverError::MissingSetupData)?;
+        for poly in &self.wire_polynomials {
+            if let Some(random_mac) = vole_pool.get_random() {
+                self.itpac_commitments.push(ItPac::new(poly.clone(), random_mac));
+            }
         }
 
         // Step 9 from paper: Commit to input polynomial coefficients as IT-MACs
@@ -892,8 +931,7 @@ impl<const R: usize> JVProver<R> {
 
             for _coeff in poly_coeffs {
                 // Get random IT-MAC [u] from pool
-                // We get the IT-MAC for masking, then track the coefficient separately
-                if let Some(random_mac) = itpac_gen.vole_pool_mut().get_random() {
+                if let Some(random_mac) = vole_pool.get_random() {
                     coeff_macs.push(random_mac);
                 }
             }
@@ -959,18 +997,11 @@ impl<const R: usize> JVProver<R> {
     /// Per the paper (Figure 6, Step 10):
     /// 1. Construct B×R matrix MK where MK_{i,j} = 1 if branch i is active in repetition j
     /// 2. Interpolate each row to get polynomials MK_1(·), ..., MK_B(·)
-    /// 3. Commit to each polynomial using IT-PAC
+    /// 3. Commit to each polynomial using slot-packed evaluation
     ///
     /// IMPORTANT: This must be called BEFORE γ is issued to prevent the malicious
     /// prover from choosing MK polynomials based on γ.
-    ///
-    /// # Arguments
-    /// * `setup_msg` - Setup message containing encrypted powers for IT-PAC
-    /// * `vole_pool` - VOLE pool for IT-MAC generation (must have B VOLEs available)
-    pub fn commit_mk_polynomials(
-        &mut self,
-        setup_msg: &JVSetupMessage,
-    ) -> Result<MKCommitmentMessage, JVProverError> {
+    pub fn commit_mk_polynomials(&mut self) -> Result<MKCommitmentMessage, JVProverError> {
         if self.phase != JVProverPhase::Committed {
             return Err(JVProverError::InvalidPhase);
         }
@@ -998,44 +1029,55 @@ impl<const R: usize> JVProver<R> {
             self.mk_polynomials.push(poly);
         }
 
-        // Step 3: Create IT-PAC commitments for MK polynomials
-        // We need a VOLE pool for this - use the existing one if available
-        // or create placeholders if not
+        // Step 3: Create commitments using slot-packed evaluation with sum_slots_to_slot
+        // Each MK polynomial i gets summed and placed in slot i
         self.mk_itpac_commitments = Vec::with_capacity(num_branches);
-        self.mk_ciphertexts = Vec::with_capacity(num_branches);
         self.mk_ciphertext_commitments = Vec::with_capacity(num_branches);
+        self.mk_rns_ciphertexts = Vec::new();
 
-        // Create IT-PAC generator with remaining VOLE pool
-        if let Some(vole_pool) = self.vole_pool.take() {
-            let mut itpac_gen = ItPacGenerator::new(
-                setup_msg.encrypted_powers.clone(),
-                vole_pool,
-            );
+        let slot_packed = self.rns_slot_packed_powers.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+        let galois_keys = self.rns_galois_keys.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
 
-            for poly in &self.mk_polynomials {
-                if let Some((itpac, ciphertext)) = itpac_gen.commit(poly) {
-                    self.mk_itpac_commitments.push(itpac);
-                    let ct_commitment = Self::compute_ciphertext_commitment(&ciphertext);
-                    self.mk_ciphertext_commitments.push(ct_commitment);
-                    self.mk_ciphertexts.push(ciphertext);
-                } else {
-                    // Fallback: create dummy ciphertext
-                    let dummy_ct = setup_msg.encrypted_powers.powers()[0].clone();
-                    let ct_commitment = Self::compute_ciphertext_commitment(&dummy_ct);
-                    self.mk_ciphertext_commitments.push(ct_commitment);
-                    self.mk_ciphertexts.push(dummy_ct);
-                }
-            }
+        let num_slots = slot_packed.num_slots();
 
-            // Note: VOLE pool is consumed by IT-PAC generation
-            // For a full implementation, additional VOLEs would be allocated for MK polynomials
-        } else {
-            // No VOLE pool available - create placeholder commitments
+        // Accumulate all MK polynomial evaluations into one ciphertext
+        let mut accumulated_ct: Option<RnsCiphertext> = None;
+
+        for (i, poly) in self.mk_polynomials.iter().enumerate() {
+            // Evaluate single polynomial (coeffs in lane 0, zeros elsewhere)
+            let (ct, _constants) = slot_packed.evaluate_batch(&[poly.clone()]);
+
+            // Sum all 8192 slots, place result in slot i
+            #[cfg(feature = "rayon")]
+            let ct_summed = ct.sum_slots_to_slot_parallel(galois_keys, i, num_slots);
+            #[cfg(not(feature = "rayon"))]
+            let ct_summed = ct.sum_slots_to_slot(galois_keys, i, num_slots);
+
+            // Add to accumulated ciphertext
+            accumulated_ct = Some(match accumulated_ct {
+                None => ct_summed,
+                Some(acc) => acc.add(&ct_summed),
+            });
+        }
+
+        // Store the single accumulated ciphertext
+        if let Some(ct) = accumulated_ct {
+            let ct_commitment = Self::compute_rns_ciphertext_commitment(&ct);
+            // All MK polynomials share the same commitment (one ciphertext)
             for _ in 0..num_branches {
-                let dummy_ct = setup_msg.encrypted_powers.powers()[0].clone();
-                let ct_commitment = Self::compute_ciphertext_commitment(&dummy_ct);
                 self.mk_ciphertext_commitments.push(ct_commitment);
-                self.mk_ciphertexts.push(dummy_ct);
+            }
+            self.mk_rns_ciphertexts.push(ct);
+        }
+
+        // Create IT-PAC commitments with VOLE masking if pool available
+        if let Some(vole_pool) = self.vole_pool.as_mut() {
+            for poly in &self.mk_polynomials {
+                if let Some(random_mac) = vole_pool.get_random() {
+                    self.mk_itpac_commitments.push(ItPac::new(poly.clone(), random_mac));
+                }
             }
         }
 
@@ -1045,12 +1087,12 @@ impl<const R: usize> JVProver<R> {
         })
     }
 
-    /// Opens MK polynomial F_Com commitments by revealing actual ciphertexts.
+    /// Opens MK polynomial F_Com commitments by revealing RNS ciphertexts.
     ///
     /// Called after V reveals Λ. Returns ciphertexts for V to verify and decrypt.
     pub fn open_mk_ciphertexts(&self) -> MKCiphertextOpenMessage {
         MKCiphertextOpenMessage {
-            mk_ciphertexts: self.mk_ciphertexts.clone(),
+            mk_rns_ciphertexts: self.mk_rns_ciphertexts.clone(),
         }
     }
 
@@ -1274,13 +1316,30 @@ impl<const R: usize> JVProver<R> {
         *blake3::hash(&bytes).as_bytes()
     }
 
-    /// Opens F_Com commitments by revealing actual ciphertexts.
+    /// Computes F_Com commitment for an RNS ciphertext (slot-packed).
+    fn compute_rns_ciphertext_commitment(ciphertext: &RnsCiphertext) -> [u8; 32] {
+        // Hash the RNS ciphertext components
+        let mut hasher = blake3::Hasher::new();
+        // Hash c0 residues (coefficients for each modulus)
+        for residue in ciphertext.c0().residues() {
+            for coeff in residue {
+                hasher.update(&coeff.to_le_bytes());
+            }
+        }
+        // Hash c1 residues
+        for residue in ciphertext.c1().residues() {
+            for coeff in residue {
+                hasher.update(&coeff.to_le_bytes());
+            }
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Opens F_Com commitments by revealing RNS ciphertexts.
     ///
     /// Called after V reveals Λ. Returns ciphertexts for V to verify and decrypt.
-    pub fn open_ciphertexts(&self) -> JVCiphertextOpenMessage {
-        JVCiphertextOpenMessage {
-            poly_commitment_ciphertexts: self.itpac_ciphertexts.clone(),
-        }
+    pub fn open_rns_ciphertexts(&self) -> Vec<RnsCiphertext> {
+        self.rns_ciphertexts.clone()
     }
 
     /// Generates soldering commitment.
@@ -1607,7 +1666,7 @@ impl<const R: usize> JVProver<R> {
     pub fn verify_ahe_revelation(
         &mut self,
         revelation: &JVRevelationMessage,
-        setup_msg: &JVSetupMessage,
+        _setup_msg: &JVSetupMessage,
     ) -> Result<(), JVProverError> {
         // Step 1: Verify seed matches commitment
         let expected_commitment = self.ahe_seed_commitment
@@ -1623,16 +1682,7 @@ impl<const R: usize> JVProver<R> {
         let mut ahe_rng = ChaCha20Rng::from_seed(revelation.ahe_seed);
         let regenerated_keypair = KeyPair::generate(&ahe_params, &mut ahe_rng);
 
-        // Step 3: Regenerate encrypted powers with same seed
-        let regenerated_powers = EncryptedPowers::generate(
-            &regenerated_keypair.pk,
-            revelation.lambda,
-            setup_msg.max_degree,
-            &mut ahe_rng,
-        );
-
-        // Step 4: Verify regenerated values match what we received
-        // Compare public keys by comparing their polynomial coefficients
+        // Step 3: Verify regenerated public key matches what we received
         let received_pk = self.ahe_public_key.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
 
@@ -1644,27 +1694,6 @@ impl<const R: usize> JVProver<R> {
         // Verify public key 'b' polynomial matches
         if regenerated_keypair.pk.b().coeffs() != received_pk.b().coeffs() {
             return Err(JVProverError::AheCiphertextMismatch);
-        }
-
-        // Step 5: Compare encrypted powers ciphertexts
-        let received_powers = self.encrypted_powers.as_ref()
-            .ok_or(JVProverError::MissingSetupData)?;
-
-        if regenerated_powers.powers().len() != received_powers.powers().len() {
-            return Err(JVProverError::AheCiphertextMismatch);
-        }
-
-        for (regen_ct, recv_ct) in regenerated_powers.powers().iter()
-            .zip(received_powers.powers().iter())
-        {
-            // Compare c0 component coefficients
-            if regen_ct.c0().coeffs() != recv_ct.c0().coeffs() {
-                return Err(JVProverError::AheCiphertextMismatch);
-            }
-            // Compare c1 component coefficients
-            if regen_ct.c1().coeffs() != recv_ct.c1().coeffs() {
-                return Err(JVProverError::AheCiphertextMismatch);
-            }
         }
 
         // Store the revealed lambda for later use (IT-PACs become IT-MACs)
@@ -1697,7 +1726,6 @@ impl<const R: usize> JVProver<R> {
             return pts.clone();
         }
 
-        #[cfg(feature = "ntt")]
         if self.modulus == GOLDILOCKS {
             let n = R.next_power_of_two();
             let log_n = n.trailing_zeros();
@@ -1715,7 +1743,6 @@ impl<const R: usize> JVProver<R> {
     }
 
     fn interpolate_values(&self, values: &[u64], eval_points: &[u64]) -> Vec<u64> {
-        #[cfg(feature = "ntt")]
         if let Some(ref ctx) = self.intt_context {
             let n = eval_points.len();
             let mut padded: Vec<Goldilocks> = values.iter().map(|&v| Goldilocks::new(v)).collect();
@@ -1760,8 +1787,6 @@ pub struct JVVerifier<const R: usize> {
     global_key: GlobalKey<ItMacFieldType>,
     /// AHE key pair for IT-PAC.
     ahe_keypair: Option<KeyPair>,
-    /// Encrypted powers of Λ for IT-PAC.
-    encrypted_powers: Option<EncryptedPowers>,
     /// AHE seed for deterministic generation (revealed later for P to verify).
     ahe_seed: [u8; 32],
     /// Commitment to AHE seed (hash).
@@ -1816,6 +1841,17 @@ pub struct JVVerifier<const R: usize> {
     mk_local_keys: Vec<ItMacFieldType>,
     /// Number of branches B.
     num_branches: usize,
+
+    // ==========================================================================
+    // RNS BGV slot-packed fields (for sum_slots_to_slot evaluation)
+    // ==========================================================================
+
+    /// RNS BGV key pair for slot-packed operations.
+    rns_keypair: Option<RnsKeyPair>,
+    /// Slot-packed encrypted powers (single ciphertext).
+    rns_slot_packed_powers: Option<SlotPackedEncryptedPowers>,
+    /// Galois keys for rotation operations.
+    rns_galois_keys: Option<RnsGaloisKeys>,
 }
 
 /// Protocol phases for the optimized verifier.
@@ -1855,7 +1891,6 @@ impl<const R: usize> JVVerifier<R> {
             lambda: rng.random_range(1..modulus),
             global_key: GlobalKey::generate(rng),
             ahe_keypair: Some(ahe_keypair),
-            encrypted_powers: None,
             ahe_seed,
             ahe_seed_commitment,
             chi: None,
@@ -1880,6 +1915,10 @@ impl<const R: usize> JVVerifier<R> {
             decrypted_mk_commitments: Vec::new(),
             mk_local_keys: Vec::new(),
             num_branches: 0,
+            // RNS BGV slot-packed fields
+            rns_keypair: None,
+            rns_slot_packed_powers: None,
+            rns_galois_keys: None,
         }
     }
 
@@ -1932,7 +1971,6 @@ impl<const R: usize> JVVerifier<R> {
         self.topology_vectors = circuits.topology_vectors(chi, self.modulus);
 
         // Generate evaluation points
-        #[cfg(feature = "ntt")]
         let eval_points: Vec<u64> = if self.modulus == GOLDILOCKS {
             let n = R.next_power_of_two();
             let log_n = n.trailing_zeros();
@@ -1948,48 +1986,49 @@ impl<const R: usize> JVVerifier<R> {
             (1..=R as u64).collect()
         };
 
-        #[cfg(not(feature = "ntt"))]
-        let eval_points: Vec<u64> = (1..=R as u64).collect();
-
         self.eval_points = Some(eval_points.clone());
 
-        // Generate encrypted powers of Λ for IT-PAC commitments
+        // max_degree for polynomial evaluation
         // With NTT, polynomials are padded to next_power_of_two(R) coefficients
-        // max_degree needs to accommodate this padding
-        #[cfg(feature = "ntt")]
         let max_degree = if self.modulus == GOLDILOCKS {
             R.next_power_of_two() - 1
         } else {
             R - 1
         };
 
-        #[cfg(not(feature = "ntt"))]
-        let max_degree = R - 1;
-
-        // Generate encrypted powers deterministically from seed (for later verification by P)
         let ahe_keypair = self.ahe_keypair.as_ref().expect("AHE keypair should be initialized");
-        let mut enc_rng = ChaCha20Rng::from_seed(self.ahe_seed);
-        // Skip keypair generation bytes (keypair was generated from same seed)
-        let ahe_params = BgvParams::default();
-        let _ = KeyPair::generate(&ahe_params, &mut enc_rng);
-        // Now generate encrypted powers with deterministic randomness
-        let encrypted_powers = EncryptedPowers::generate(
-            &ahe_keypair.pk,
-            self.lambda,
-            max_degree,
-            &mut enc_rng,
-        );
         let ahe_public_key = ahe_keypair.pk.clone();
-        self.encrypted_powers = Some(encrypted_powers.clone());
+
+        // Generate RNS BGV slot-packed powers and Galois keys
+        let rns_params = RnsBgvParams::goldilocks();
+        let rns_keypair = RnsKeyPair::generate(&rns_params, rng);
+
+        // For slot packing, max_degree must divide num_slots evenly
+        // Use a lane size that divides 8192 (e.g., 128, 256, 512, 1024, 2048, 4096)
+        let rns_lane_size = (max_degree + 1).next_power_of_two().min(rns_params.num_slots);
+        let rns_slot_packed = SlotPackedEncryptedPowers::generate(
+            &rns_keypair.pk,
+            self.lambda,
+            rns_lane_size,
+            rng,
+        );
+        let rns_galois = RnsGaloisKeys::generate(&rns_keypair.sk, rng);
+
+        self.rns_keypair = Some(rns_keypair.clone());
+        self.rns_slot_packed_powers = Some(rns_slot_packed.clone());
+        self.rns_galois_keys = Some(rns_galois.clone());
 
         self.phase = JVVerifierPhase::Setup;
 
         Ok(JVSetupMessage {
             eval_points,
             max_degree,
-            encrypted_powers,
             ahe_public_key,
             ahe_seed_commitment: self.ahe_seed_commitment,
+            // RNS slot-packed fields
+            rns_slot_packed_powers: Some(rns_slot_packed),
+            rns_galois_keys: Some(rns_galois),
+            rns_public_key: Some(rns_keypair.pk),
         })
     }
 
@@ -2716,35 +2755,59 @@ impl<const R: usize> JVVerifier<R> {
         Ok(())
     }
 
+    /// Computes F_Com commitment by hashing an RNS ciphertext.
+    ///
+    /// This produces a binding commitment to the ciphertext that can be
+    /// verified when the ciphertext is later revealed.
+    fn compute_rns_ciphertext_commitment(ciphertext: &RnsCiphertext) -> [u8; 32] {
+        // Hash the RNS ciphertext components
+        let mut hasher = blake3::Hasher::new();
+        // Hash c0 residues (coefficients for each modulus)
+        for residue in ciphertext.c0().residues() {
+            for coeff in residue {
+                hasher.update(&coeff.to_le_bytes());
+            }
+        }
+        // Hash c1 residues
+        for residue in ciphertext.c1().residues() {
+            for coeff in residue {
+                hasher.update(&coeff.to_le_bytes());
+            }
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     /// Receives and verifies MK ciphertext opening from prover.
     ///
-    /// Called after V reveals Λ. Verifies that ciphertexts match F_Com commitments,
+    /// Called after V reveals Λ. Verifies that RNS ciphertexts match F_Com commitments,
     /// then decrypts to get MK polynomial evaluations at Λ.
     pub fn receive_mk_ciphertext_opening(
         &mut self,
         opening: MKCiphertextOpenMessage,
     ) -> Result<(), JVVerifierError> {
-        // Verify each ciphertext matches its F_Com commitment
-        if opening.mk_ciphertexts.len() != self.mk_ciphertext_commitments.len() {
-            return Err(JVVerifierError::CiphertextCommitmentMismatch);
-        }
-
-        for (ct, expected_commitment) in opening.mk_ciphertexts.iter()
-            .zip(self.mk_ciphertext_commitments.iter())
-        {
-            let computed_commitment = Self::compute_ciphertext_commitment(ct);
-            if &computed_commitment != expected_commitment {
+        // Verify each RNS ciphertext matches its F_Com commitment
+        // Note: MK polynomials are batched, so we verify batch commitments
+        for ct in &opening.mk_rns_ciphertexts {
+            let computed_commitment = Self::compute_rns_ciphertext_commitment(ct);
+            // Check if this commitment matches any expected commitment
+            if !self.mk_ciphertext_commitments.contains(&computed_commitment) {
                 return Err(JVVerifierError::CiphertextCommitmentMismatch);
             }
         }
 
-        // All commitments verified - now decrypt
-        if let Some(ref keypair) = self.ahe_keypair {
-            self.decrypted_mk_commitments = opening
-                .mk_ciphertexts
-                .iter()
-                .map(|ct| ct.decrypt_scalar(&keypair.sk))
-                .collect();
+        // All commitments verified - now decrypt using RNS keypair
+        if let Some(ref rns_keypair) = self.rns_keypair {
+            // Decrypt ciphertext and extract MK polynomial evaluations from slots 0..num_branches-1
+            // (with sum_slots_to_slot, polynomial i's evaluation is in slot i)
+            for ct in &opening.mk_rns_ciphertexts {
+                let slots = ct.decrypt_slots(&rns_keypair.sk);
+                // Read slots 0..num_branches-1 directly
+                for slot_idx in 0..self.num_branches {
+                    if slot_idx < slots.len() {
+                        self.decrypted_mk_commitments.push(slots[slot_idx]);
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -3062,7 +3125,6 @@ pub(crate) fn poly_mul(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
     }
 
     // Use NTT for Goldilocks field (O(n log n) instead of O(n²))
-    #[cfg(feature = "ntt")]
     if modulus == GOLDILOCKS {
         return poly_mul_ntt(a, b);
     }
@@ -3073,7 +3135,6 @@ pub(crate) fn poly_mul(a: &[u64], b: &[u64], modulus: u64) -> Vec<u64> {
 
 /// NTT-based polynomial multiplication for Goldilocks field.
 /// O(n log n) complexity.
-#[cfg(feature = "ntt")]
 fn poly_mul_ntt(a: &[u64], b: &[u64]) -> Vec<u64> {
     let result_len = a.len() + b.len() - 1;
     let n = result_len.next_power_of_two();
@@ -3185,7 +3246,6 @@ fn poly_reverse(a: &[u64]) -> Vec<u64> {
 /// Computes the modular inverse of polynomial b modulo X^precision using Newton iteration.
 /// b[0] must be non-zero (invertible).
 /// Complexity: O(n log n) using NTT.
-#[cfg(feature = "ntt")]
 fn newton_poly_inverse(b: &[u64], precision: usize) -> Vec<u64> {
     if b.is_empty() || b[0] == 0 {
         return vec![];
@@ -3227,7 +3287,6 @@ fn newton_poly_inverse(b: &[u64], precision: usize) -> Vec<u64> {
 
 /// Fast polynomial division using Newton iteration and NTT.
 /// Complexity: O(n log n) instead of O(n²).
-#[cfg(feature = "ntt")]
 fn fast_poly_div(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
     // Find actual degrees (ignoring trailing zeros)
     let mut a_deg = a.len().saturating_sub(1);
@@ -3338,7 +3397,6 @@ pub(crate) fn poly_div(a: &[u64], b: &[u64], modulus: u64) -> (Vec<u64>, Vec<u64
     }
 
     // Use fast division for Goldilocks with NTT
-    #[cfg(feature = "ntt")]
     if modulus == GOLDILOCKS {
         return fast_poly_div(a, b);
     }
@@ -3430,7 +3488,7 @@ pub fn run_jv_protocol<const R: usize>(
 
     // Phase 1b: Commit MK polynomials (for ZK branch hiding)
     // MUST be committed BEFORE γ is issued to prevent malicious prover attacks
-    let _mk_commitment = prover.commit_mk_polynomials(&setup_msg)
+    let _mk_commitment = prover.commit_mk_polynomials()
         .map_err(|_| JVProtocolError::ProverError)?;
 
     let soldering_commit = prover.commit_soldering().map_err(|_| JVProtocolError::ProverError)?;

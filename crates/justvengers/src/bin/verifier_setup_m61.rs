@@ -148,7 +148,7 @@ fn generate_verifier_messages<const R: usize>(
     let vole_pool = VolePool::generate(&global_key, circuit_size * 2, &mut rng);
 
     let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
-    let _mk_commitment = prover.commit_mk_polynomials(&setup_msg).unwrap();
+    let _mk_commitment = prover.commit_mk_polynomials().unwrap();
     let soldering_commit = prover.commit_soldering().unwrap();
 
     let chi = verifier.receive_commitment(commitment).unwrap();

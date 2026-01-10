@@ -191,7 +191,7 @@ fn jv_record_verifier_messages<const R: usize>(
     let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
 
     // P → V: MK polynomial commitment
-    let _mk_commitment = prover.commit_mk_polynomials(&setup_msg).unwrap();
+    let _mk_commitment = prover.commit_mk_polynomials().unwrap();
 
     // P → V: Soldering commitment (optional)
     let soldering_commit = prover.commit_soldering().unwrap();
@@ -269,7 +269,7 @@ fn run_prover_iteration<const R: usize>(
     let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
 
     // P → V: MK polynomial commitment
-    let _mk_commitment = prover.commit_mk_polynomials(&recorded.setup_msg).unwrap();
+    let _mk_commitment = prover.commit_mk_polynomials().unwrap();
 
     // P → V: Soldering commitment (optional)
     let _soldering_commit = prover.commit_soldering().unwrap();

@@ -28,22 +28,25 @@ ark-poly = { workspace = true }
 ark-bls12-381 = { workspace = true }
 ark-serialize = { workspace = true }
 
+# Optional parallelization
+rayon = { workspace = true, optional = true }
+
 [features]
-default = ["ntt"]
-ntt = []
+default = []
 kzg = []
+rayon = ["mpz-justvengers-core/rayon", "dep:rayon"]
 mersenne = ["mpz-fields/mersenne"]
-cl-scheme = ["mpz-justvengers-core/cl-scheme"]
 
 [dev-dependencies]
 rand = { workspace = true }
 mpz-core = { path = "../core" }
 mpz-fields = { path = "../fields" }
-mpz-justvengers-core = { path = "../justvengers-core" }
+mpz-justvengers-core = { path = "../justvengers-core", features = ["rayon"] }
 mpz-common = { path = "../common", features = ["test-utils"] }
 criterion = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
+rayon = { workspace = true }
 
 [[bench]]
 name = "vm_bench"

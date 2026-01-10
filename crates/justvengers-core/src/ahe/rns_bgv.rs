@@ -1137,6 +1137,75 @@ impl RnsCiphertext {
 
         result
     }
+
+    /// Parallel version of sum_lanes using rayon for key-switching.
+    #[cfg(feature = "rayon")]
+    pub fn sum_lanes_parallel(&self, galois_keys: &RnsGaloisKeys, lane_size: usize) -> Self {
+        let mut result = self.clone();
+
+        // Number of automorphism steps = log2(lane_size)
+        let log_lane = (lane_size as f64).log2() as usize;
+
+        // Apply first log_lane automorphisms with parallel key-switching
+        for i in 0..log_lane {
+            if let Some(gk) = galois_keys.get_key(i) {
+                let permuted = result.apply_automorphism_parallel(gk);
+                result = result.add(&permuted);
+            }
+        }
+
+        result
+    }
+
+    /// Sums all slots and places the result in a single target slot.
+    ///
+    /// Given ciphertext with slots [s_0, s_1, ..., s_{n-1}]:
+    /// 1. Computes sum = Σ s_i using sum_slots
+    /// 2. Masks result so only target_slot contains the sum, others are 0
+    ///
+    /// This allows adding multiple ciphertexts where each has its sum
+    /// in a different slot, producing a single ciphertext with all sums.
+    ///
+    /// # Arguments
+    /// - `galois_keys`: Keys for sum_slots automorphisms
+    /// - `target_slot`: Slot index where the sum should be placed (0..num_slots-1)
+    /// - `num_slots`: Total number of slots
+    ///
+    /// # Returns
+    /// Ciphertext with sum in target_slot, zeros elsewhere.
+    pub fn sum_slots_to_slot(
+        &self,
+        galois_keys: &RnsGaloisKeys,
+        target_slot: usize,
+        num_slots: usize,
+    ) -> Self {
+        // Step 1: Sum all slots (result replicated to all slots)
+        let summed = self.sum_slots(galois_keys);
+
+        // Step 2: Mask to keep only target_slot
+        let mut mask = vec![0u64; num_slots];
+        mask[target_slot] = 1;
+
+        summed.mul_plaintext_slots(&mask)
+    }
+
+    /// Parallel version of sum_slots_to_slot.
+    #[cfg(feature = "rayon")]
+    pub fn sum_slots_to_slot_parallel(
+        &self,
+        galois_keys: &RnsGaloisKeys,
+        target_slot: usize,
+        num_slots: usize,
+    ) -> Self {
+        // Step 1: Sum all slots (result replicated to all slots)
+        let summed = self.sum_slots_parallel(galois_keys);
+
+        // Step 2: Mask to keep only target_slot
+        let mut mask = vec![0u64; num_slots];
+        mask[target_slot] = 1;
+
+        summed.mul_plaintext_slots(&mask)
+    }
 }
 
 /// Scales x by t/q with rounding: round(t * x / q).
