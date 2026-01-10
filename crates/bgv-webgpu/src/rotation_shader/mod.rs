@@ -114,11 +114,19 @@ mod tests {
     }
 
     #[test]
-    fn test_compose_shared_mem_ntt() {
-        let result = compose_shader(shared_mem_ntt::SHARED_MEM_NTT_SHADER, "shared_mem_ntt.wgsl");
+    fn test_compose_shared_mem_ntt_fwd() {
+        let result = compose_shader(shared_mem_ntt::SHARED_MEM_NTT_FWD_SHADER, "shared_mem_ntt_fwd.wgsl");
         assert!(result.is_ok(), "Failed: {:?}", result.err());
         let wgsl = result.unwrap();
-        assert!(wgsl.contains("fn shared_mem_ntt"), "Missing entry point");
+        assert!(wgsl.contains("fn shared_mem_ntt_fwd"), "Missing entry point");
+    }
+
+    #[test]
+    fn test_compose_shared_mem_ntt_inv() {
+        let result = compose_shader(shared_mem_ntt::SHARED_MEM_NTT_INV_SHADER, "shared_mem_ntt_inv.wgsl");
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+        let wgsl = result.unwrap();
+        assert!(wgsl.contains("fn shared_mem_ntt_inv"), "Missing entry point");
     }
 
     #[test]
