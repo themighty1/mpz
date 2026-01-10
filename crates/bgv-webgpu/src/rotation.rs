@@ -35,23 +35,27 @@ pub struct GpuRnsParams {
 impl GpuRnsParams {
     /// Creates parameters for Goldilocks field.
     ///
-    /// Uses 4 RNS moduli (~240 bit q) for sufficient noise budget.
+    /// Uses 5 RNS moduli (~300 bit q) for sufficient noise budget.
+    /// This matches the CPU `RnsBgvParams::goldilocks()` parameters.
     ///
     /// The noise budget must support:
     /// 1. Slot-wise scalar multiplication
     /// 2. sum_slots: 13 rotations with key-switching (log2(8192) = 13)
     /// 3. Masking: plaintext multiplication to zero out all slots except one
+    /// 4. CT additions (~80 for wasm zkVM)
     ///
-    /// Each rotation adds significant noise due to key-switching, so 4 moduli
+    /// Each rotation adds significant noise due to key-switching, so 5 moduli
     /// provides sufficient margin for correctness.
     pub fn goldilocks() -> Self {
         Self {
             n: 8192,
+            // Same primes as CPU RnsParams::NTT_PRIMES_8192[0..5]
             moduli: vec![
                 1152921504606994433,  // q₀ ≡ 1 (mod 16384)
                 1152921504607191041,  // q₁ ≡ 1 (mod 16384)
                 1152921504607223809,  // q₂ ≡ 1 (mod 16384)
                 1152921504607338497,  // q₃ ≡ 1 (mod 16384)
+                1152921504607518721,  // q₄ ≡ 1 (mod 16384)
             ],
             digits_per_limb: 4,
             decomp_base: 1 << 15,
@@ -402,12 +406,15 @@ pub struct GpuRotationContext {
 }
 
 impl GpuRotationContext {
-    /// Creates a new GPU rotation context.
+    /// Creates a new GPU rotation context (blocks on async).
+    /// Use `new_async` for WASM environments.
     pub fn new(params: GpuRnsParams) -> Result<Self, GpuError> {
         pollster::block_on(Self::new_async(params))
     }
 
-    async fn new_async(params: GpuRnsParams) -> Result<Self, GpuError> {
+    /// Creates a new GPU rotation context asynchronously.
+    /// Required for WASM where blocking is not allowed.
+    pub async fn new_async(params: GpuRnsParams) -> Result<Self, GpuError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()
@@ -936,6 +943,104 @@ impl GpuRnsPoly {
         rx.recv()
             .map_err(|e| GpuError::ExecutionFailed(e.to_string()))?
             .map_err(|e| GpuError::ExecutionFailed(format!("{:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let u32_data: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+
+        // Convert to residues
+        let mut residues = vec![vec![0u64; self.n]; self.num_moduli];
+        for mod_idx in 0..self.num_moduli {
+            for coeff_idx in 0..self.n {
+                let base = (mod_idx * self.n + coeff_idx) * 2;
+                residues[mod_idx][coeff_idx] =
+                    (u32_data[base] as u64) | ((u32_data[base + 1] as u64) << 32);
+            }
+        }
+
+        Ok(residues)
+    }
+
+    /// Reads the polynomial back to CPU asynchronously.
+    /// Required for WASM where blocking is not allowed.
+    pub async fn to_residues_async(&self, ctx: &GpuRotationContext) -> Result<Vec<Vec<u64>>, GpuError> {
+        let size = (self.n * self.num_moduli * 2 * std::mem::size_of::<u32>()) as u64;
+
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging_async"),
+            size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("read encoder async"),
+            });
+        encoder.copy_buffer_to_buffer(&self.buffer, 0, &staging, 0, size);
+        ctx.queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging.slice(..);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            // For WASM: use a JS Promise to await the map_async callback
+            use wasm_bindgen::prelude::*;
+            use std::cell::RefCell;
+            use std::rc::Rc;
+
+            let result: Rc<RefCell<Option<Result<(), wgpu::BufferAsyncError>>>> = Rc::new(RefCell::new(None));
+            let result_clone = result.clone();
+
+            // Create a JS Promise that resolves when the buffer is mapped
+            let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                let resolve = Rc::new(resolve);
+                let resolve_clone = resolve.clone();
+                let result_inner = result_clone.clone();
+
+                buffer_slice.map_async(wgpu::MapMode::Read, move |r| {
+                    *result_inner.borrow_mut() = Some(r);
+                    resolve_clone.call0(&JsValue::NULL).ok();
+                });
+            });
+
+            // Await the promise
+            wasm_bindgen_futures::JsFuture::from(promise)
+                .await
+                .map_err(|e| GpuError::ExecutionFailed(format!("JS await failed: {:?}", e)))?;
+
+            // Check the result
+            let map_result = result.borrow_mut().take()
+                .ok_or_else(|| GpuError::ExecutionFailed("map_async callback not called".into()))?;
+            map_result.map_err(|e| GpuError::ExecutionFailed(format!("{:?}", e)))?;
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // For native: use flume channel with polling
+            let (tx, rx) = flume::bounded(1);
+            buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+
+            loop {
+                ctx.device.poll(wgpu::Maintain::Poll);
+                match rx.try_recv() {
+                    Ok(result) => {
+                        result.map_err(|e| GpuError::ExecutionFailed(format!("{:?}", e)))?;
+                        break;
+                    }
+                    Err(flume::TryRecvError::Empty) => {
+                        std::thread::yield_now();
+                    }
+                    Err(flume::TryRecvError::Disconnected) => {
+                        return Err(GpuError::ExecutionFailed("channel disconnected".into()));
+                    }
+                }
+            }
+        }
 
         let data = buffer_slice.get_mapped_range();
         let u32_data: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
@@ -3393,14 +3498,18 @@ fn gpu_sum_slots_batched_inner(
     workspace: &SumSlotsWorkspace,
     profile: bool,
 ) -> Result<GpuRnsCiphertext, GpuError> {
+    #[cfg(not(target_arch = "wasm32"))]
     use std::time::Instant;
 
+    #[cfg(not(target_arch = "wasm32"))]
     let total_start = Instant::now();
     let n = ctx.params.n;
     let num_moduli = ctx.params.moduli.len();
     let num_keys = galois_keys.keys.len();
 
+    #[cfg(not(target_arch = "wasm32"))]
     let mut encode_time = std::time::Duration::ZERO;
+    #[cfg(not(target_arch = "wasm32"))]
     let mut submit_time = std::time::Duration::ZERO;
 
     // Initial copy: input -> workspace
@@ -3423,10 +3532,12 @@ fn gpu_sum_slots_batched_inner(
 
     // Process each rotation with ONE command buffer per rotation
     for key_idx in 0..num_keys {
+        #[cfg(not(target_arch = "wasm32"))]
         let rotation_start = Instant::now();
         let galois_key = &galois_keys.keys[key_idx];
         let k = galois_key.k;
 
+        #[cfg(not(target_arch = "wasm32"))]
         let encode_start = Instant::now();
         let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some(&format!("rotation_{}", key_idx)),
@@ -3528,13 +3639,21 @@ fn gpu_sum_slots_batched_inner(
             workspace.rns_buffer_size,
         );
 
-        encode_time += encode_start.elapsed();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            encode_time += encode_start.elapsed();
+        }
 
         // Submit this rotation's commands
+        #[cfg(not(target_arch = "wasm32"))]
         let submit_start = Instant::now();
         ctx.queue.submit(Some(encoder.finish()));
-        submit_time += submit_start.elapsed();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            submit_time += submit_start.elapsed();
+        }
 
+        #[cfg(not(target_arch = "wasm32"))]
         if profile {
             eprintln!("  Rotation {}: encode={:?}, submit={:?}, total={:?}",
                 key_idx, encode_start.elapsed(), submit_start.elapsed(), rotation_start.elapsed());
@@ -3572,11 +3691,16 @@ fn gpu_sum_slots_batched_inner(
         ctx.queue.submit(Some(encoder.finish()));
     }
 
-    // Wait for all operations to complete
+    // Wait for all operations to complete (native only - WASM handles this via browser)
+    #[cfg(not(target_arch = "wasm32"))]
     let poll_start = Instant::now();
+    #[cfg(not(target_arch = "wasm32"))]
     ctx.device.poll(wgpu::Maintain::Wait);
+    #[cfg(not(target_arch = "wasm32"))]
     let poll_time = poll_start.elapsed();
 
+    // Profiling output (native only)
+    #[cfg(not(target_arch = "wasm32"))]
     if profile {
         let total_time = total_start.elapsed();
 
@@ -3607,6 +3731,10 @@ fn gpu_sum_slots_batched_inner(
         eprintln!("  - Dispatches per rotation: ~{}", ntt_dispatches_per_rotation + other_dispatches);
         eprintln!("  - Total dispatches: ~{}", total_dispatches);
     }
+
+    // Suppress unused variable warnings in WASM
+    #[cfg(target_arch = "wasm32")]
+    let _ = profile;
 
     Ok(GpuRnsCiphertext {
         c0: GpuRnsPoly {

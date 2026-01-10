@@ -62,17 +62,17 @@ fn cpu_ct_to_gpu(ctx: &GpuRotationContext, ct: &RnsCiphertext) -> Result<GpuRnsC
         .map_err(|e| JsValue::from_str(&format!("GPU ciphertext creation failed: {:?}", e)))
 }
 
-/// Converts GPU RnsCiphertext back to CPU format.
+/// Converts GPU RnsCiphertext back to CPU format (async for WASM).
 #[cfg(target_arch = "wasm32")]
-fn gpu_ct_to_cpu(
+async fn gpu_ct_to_cpu(
     ctx: &GpuRotationContext,
     gpu_ct: &GpuRnsCiphertext,
     template: &RnsCiphertext,
 ) -> Result<RnsCiphertext, JsValue> {
-    // Read back residues from GPU
-    let c0_residues = gpu_ct.c0.to_residues(ctx)
+    // Read back residues from GPU (async)
+    let c0_residues = gpu_ct.c0.to_residues_async(ctx).await
         .map_err(|e| JsValue::from_str(&format!("GPU read failed: {:?}", e)))?;
-    let c1_residues = gpu_ct.c1.to_residues(ctx)
+    let c1_residues = gpu_ct.c1.to_residues_async(ctx).await
         .map_err(|e| JsValue::from_str(&format!("GPU read failed: {:?}", e)))?;
 
     // Create new CPU ciphertext with GPU results
@@ -189,9 +189,34 @@ fn cpu_galois_keys_to_gpu(
     Ok(GpuGaloisKeys { keys: gpu_keys })
 }
 
+/// Check if WebGPU is available in the browser.
+#[cfg(target_arch = "wasm32")]
+fn check_webgpu_available() -> Result<(), JsValue> {
+    let global = js_sys::global();
+    let navigator = js_sys::Reflect::get(&global, &"navigator".into())
+        .map_err(|_| JsValue::from_str("navigator not available"))?;
+
+    let gpu = js_sys::Reflect::get(&navigator, &"gpu".into())
+        .map_err(|_| JsValue::from_str("WebGPU not available: navigator.gpu is undefined"))?;
+
+    if gpu.is_undefined() || gpu.is_null() {
+        return Err(JsValue::from_str(
+            "WebGPU is NOT available in this browser. \
+             Please use a browser with WebGPU support (Chrome 113+, Edge 113+, or Firefox Nightly with flags). \
+             For headless Chrome, use --enable-unsafe-webgpu and --headless=new flags."
+        ));
+    }
+
+    web_sys::console::log_1(&"[bgv-webgpu] WebGPU is available!".into());
+    Ok(())
+}
+
 /// Generates all benchmark data (not timed).
 #[cfg(target_arch = "wasm32")]
-fn setup_bgv_webgpu_bench() -> Result<BgvWebGpuBenchData, JsValue> {
+async fn setup_bgv_webgpu_bench() -> Result<BgvWebGpuBenchData, JsValue> {
+    // First check if WebGPU is available
+    check_webgpu_available()?;
+
     let mut rng = Prg::from_seed(Block::ZERO);
     let params = RnsBgvParams::goldilocks();
     let keypair = RnsKeyPair::generate(&params, &mut rng);
@@ -202,10 +227,18 @@ fn setup_bgv_webgpu_bench() -> Result<BgvWebGpuBenchData, JsValue> {
 
     web_sys::console::log_1(&"[bgv-webgpu] Creating GPU context...".into());
 
-    // Create GPU context
+    // Create GPU context (async for WASM)
     let gpu_params = GpuRnsParams::goldilocks();
-    let gpu_ctx = GpuRotationContext::new(gpu_params)
-        .map_err(|e| JsValue::from_str(&format!("GPU context failed: {:?}", e)))?;
+    let gpu_ctx = GpuRotationContext::new_async(gpu_params).await
+        .map_err(|e| {
+            let msg = format!(
+                "GPU context creation failed: {:?}. \
+                 This may indicate WebGPU adapter not found or GPU not available in headless mode.",
+                e
+            );
+            web_sys::console::error_1(&msg.clone().into());
+            JsValue::from_str(&msg)
+        })?;
 
     web_sys::console::log_1(&"[bgv-webgpu] Converting Galois keys to GPU...".into());
 
@@ -255,7 +288,7 @@ fn setup_bgv_webgpu_bench() -> Result<BgvWebGpuBenchData, JsValue> {
 
 /// Runs a single iteration with WebGPU-accelerated sum_slots.
 #[cfg(target_arch = "wasm32")]
-fn run_bgv_webgpu_iteration(data: &BgvWebGpuBenchData) -> Result<(), JsValue> {
+async fn run_bgv_webgpu_iteration(data: &BgvWebGpuBenchData) -> Result<(), JsValue> {
     // CPU: Copy and slot-wise multiply each copy with its coefficients
     let multiplied: Vec<RnsCiphertext> = data.all_coeffs.iter()
         .map(|coeffs| data.ct_main.clone().mul_plaintext_slots(coeffs))
@@ -276,8 +309,8 @@ fn run_bgv_webgpu_iteration(data: &BgvWebGpuBenchData) -> Result<(), JsValue> {
         &data.gpu_workspace,
     ).map_err(|e| JsValue::from_str(&format!("GPU sum_slots failed: {:?}", e)))?;
 
-    // GPU -> CPU: Convert result back
-    let summed = gpu_ct_to_cpu(&data.gpu_ctx, &gpu_summed, &ct_combined)?;
+    // GPU -> CPU: Convert result back (async)
+    let summed = gpu_ct_to_cpu(&data.gpu_ctx, &gpu_summed, &ct_combined).await?;
 
     // CPU: Mask to keep only slot 1
     let masked = summed.mul_plaintext_slots(&data.mask);
@@ -305,7 +338,7 @@ fn run_bgv_webgpu_iteration(data: &BgvWebGpuBenchData) -> Result<(), JsValue> {
 /// BenchResult with elapsed_ms
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
-pub fn bgv_justvengers_pattern_webgpu(n: u32) -> Result<BenchResult, JsValue> {
+pub async fn bgv_justvengers_pattern_webgpu(n: u32) -> Result<BenchResult, JsValue> {
     let global = js_sys::global();
     let performance: web_sys::Performance =
         js_sys::Reflect::get(&global, &"performance".into())
@@ -320,7 +353,7 @@ pub fn bgv_justvengers_pattern_webgpu(n: u32) -> Result<BenchResult, JsValue> {
     );
 
     let setup_start = performance.now();
-    let data = setup_bgv_webgpu_bench()?;
+    let data = setup_bgv_webgpu_bench().await?;
     let setup_time = performance.now() - setup_start;
 
     web_sys::console::log_1(
@@ -331,7 +364,7 @@ pub fn bgv_justvengers_pattern_webgpu(n: u32) -> Result<BenchResult, JsValue> {
 
     for i in 0..n {
         let start = performance.now();
-        run_bgv_webgpu_iteration(&data)?;
+        run_bgv_webgpu_iteration(&data).await?;
         total_elapsed_ms += performance.now() - start;
 
         if (i + 1) % 5 == 0 || i == 0 {

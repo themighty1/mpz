@@ -518,14 +518,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start HTTP server
     let server_addr = start_server(crate_dir).await?;
 
-    // Configure browser (headless)
+    // Configure browser (headless with WebGPU support)
     let builder = BrowserConfig::builder()
         .arg("--no-sandbox")
         .arg("--disable-dev-shm-usage")
-        .arg("--disable-gpu")
         .arg("--disable-cache")
         .arg("--disable-application-cache")
-        .arg("--headless")
+        .arg("--headless=new")  // New headless mode supports GPU
+        .arg("--enable-unsafe-webgpu")  // Enable WebGPU
+        .arg("--enable-features=Vulkan,UseSkiaRenderer")  // GPU backend
         .window_size(1200, 800);
 
     let config = builder.build()?;
