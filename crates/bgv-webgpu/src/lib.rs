@@ -23,6 +23,8 @@ pub use rotation::{
     GpuRotationContext, GpuRnsParams, GpuRnsPoly, GpuRnsCiphertext, NttModulusData,
     GpuGaloisKey, GpuGaloisKeys, gpu_automorphism, gpu_add, gpu_ntt_mul, gpu_ntt_mul_single,
     gpu_key_switch, gpu_apply_automorphism, gpu_sum_slots, rotation_exponent,
+    // Batched (optimized) API
+    SumSlotsWorkspace, gpu_sum_slots_batched, gpu_sum_slots_batched_profiled,
 };
 
 /// The modulus for Goldilocks field operations.

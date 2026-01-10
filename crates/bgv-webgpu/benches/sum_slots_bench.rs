@@ -9,6 +9,7 @@ use std::time::Duration;
 use bgv_webgpu::{
     GpuRotationContext, GpuRnsParams, GpuRnsPoly, GpuRnsCiphertext,
     GpuGaloisKey, GpuGaloisKeys, gpu_sum_slots, rotation_exponent,
+    SumSlotsWorkspace, gpu_sum_slots_batched,
 };
 
 /// Creates mock Galois keys for benchmarking.
@@ -143,6 +144,20 @@ fn bench_sum_slots(c: &mut Criterion) {
         |b, (ctx, ct, keys)| {
             b.iter(|| {
                 gpu_sum_slots(black_box(ctx), black_box(ct), black_box(keys)).unwrap()
+            });
+        },
+    );
+
+    // Benchmark batched sum_slots (pre-allocated workspace, per-rotation batching)
+    let workspace = SumSlotsWorkspace::new(&ctx);
+    println!("Workspace created for batched sum_slots");
+
+    group.bench_with_input(
+        BenchmarkId::new("sum_slots_batched", format!("n={}_moduli={}", n, num_moduli)),
+        &(&ctx, &ciphertext, &galois_keys, &workspace),
+        |b, (ctx, ct, keys, ws)| {
+            b.iter(|| {
+                gpu_sum_slots_batched(black_box(ctx), black_box(ct), black_box(keys), black_box(ws)).unwrap()
             });
         },
     );

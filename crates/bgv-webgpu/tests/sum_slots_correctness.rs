@@ -8,6 +8,7 @@
 use bgv_webgpu::{
     GpuRotationContext, GpuRnsParams, GpuRnsCiphertext,
     GpuGaloisKey, GpuGaloisKeys, gpu_sum_slots,
+    SumSlotsWorkspace, gpu_sum_slots_batched,
 };
 use mpz_justvengers_core::{
     RnsKeyPair, RnsCiphertext, RnsGaloisKeys, RnsBgvParams,
@@ -725,4 +726,150 @@ fn test_debug_barrett_mu() {
     println!("Near-q multiplication: {} * {} mod {} = {}", a3, b3, q, expected3);
 
     println!("\n✓ Barrett mu debug test passed!");
+}
+
+/// Test batched sum_slots produces the same result as the non-batched version.
+#[test]
+fn test_gpu_sum_slots_batched() {
+    println!("=== GPU BATCHED sum_slots Test ===");
+    println!("This test verifies batched sum_slots produces the same result.");
+    println!();
+
+    // Use deterministic RNG
+    let mut rng = Prg::new_with_seed(TEST_SEED);
+
+    // Use Goldilocks parameters
+    let bgv_params = RnsBgvParams::goldilocks();
+    let n = bgv_params.n;
+    let num_moduli = bgv_params.num_moduli;
+
+    println!("Parameters: n={}, num_moduli={}", n, num_moduli);
+
+    // Generate CPU keys
+    println!("Generating CPU keypair...");
+    let keypair = RnsKeyPair::generate(&bgv_params, &mut rng);
+
+    println!("Generating Galois keys (this takes a while)...");
+    let cpu_galois_keys = RnsGaloisKeys::generate(&keypair.sk, &mut rng);
+    println!("Generated {} Galois keys", cpu_galois_keys.num_keys());
+
+    // Create test slots
+    let test_slots: Vec<u64> = (0..n).map(|i| (i % 1000) as u64).collect();
+    let expected_sum: u64 = test_slots.iter().sum::<u64>() % bgv_params.t;
+    println!("Expected sum: {}", expected_sum);
+
+    // Encrypt test slots
+    println!("Encrypting test slots...");
+    let cpu_ct = RnsCiphertext::encrypt_slots(&keypair.pk, &test_slots, &mut rng);
+
+    // Create GPU context
+    println!("Creating GPU context...");
+    let gpu_params = GpuRnsParams::goldilocks();
+    let ctx = match GpuRotationContext::new(gpu_params) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            println!("Skipping test - GPU context creation failed: {:?}", e);
+            return;
+        }
+    };
+
+    // Convert to GPU format
+    println!("Converting keys to GPU format...");
+    let gpu_galois_keys = cpu_to_gpu_galois_keys(&ctx, &cpu_galois_keys, num_moduli);
+    let gpu_ct = cpu_to_gpu_ciphertext(&ctx, &cpu_ct);
+
+    // Create workspace for batched version
+    println!("Creating workspace for batched sum_slots...");
+    let workspace = SumSlotsWorkspace::new(&ctx);
+
+    // Run batched GPU sum_slots
+    println!("Running BATCHED GPU sum_slots (single command buffer)...");
+    let start = std::time::Instant::now();
+    let gpu_result = gpu_sum_slots_batched(&ctx, &gpu_ct, &gpu_galois_keys, &workspace)
+        .expect("Batched GPU sum_slots failed");
+    let elapsed = start.elapsed();
+    println!("Batched sum_slots completed in {:?}", elapsed);
+
+    // Convert result back to CPU
+    println!("Converting result back to CPU format...");
+    let rns_params = RnsParams::new(n, num_moduli, 60);
+    let cpu_result = gpu_to_cpu_ciphertext(&ctx, &gpu_result, &rns_params, &bgv_params);
+
+    // Decrypt
+    println!("Decrypting result...");
+    let decrypted_slots = cpu_result.decrypt_slots(&keypair.sk);
+
+    // After sum_slots, all slots should contain the same sum
+    let result_sum = decrypted_slots[0];
+    println!("Decrypted slot[0]: {}", result_sum);
+
+    // Verify
+    if result_sum == expected_sum {
+        println!("\n✓ SUCCESS: Batched GPU sum_slots matches expected result!");
+    } else {
+        println!("\n✗ FAILURE: Batched GPU result {} != expected {}", result_sum, expected_sum);
+        println!("First 8 decrypted slots: {:?}", &decrypted_slots[..8]);
+    }
+
+    assert_eq!(result_sum, expected_sum, "Batched GPU sum_slots result mismatch");
+}
+
+/// Profile batched sum_slots to identify bottlenecks.
+#[test]
+fn test_gpu_sum_slots_batched_profiled() {
+    use bgv_webgpu::gpu_sum_slots_batched_profiled;
+
+    println!("=== GPU BATCHED sum_slots PROFILING ===");
+    println!();
+
+    // Use deterministic RNG
+    let mut rng = Prg::new_with_seed(TEST_SEED);
+
+    // Use Goldilocks parameters
+    let bgv_params = RnsBgvParams::goldilocks();
+    let n = bgv_params.n;
+    let num_moduli = bgv_params.num_moduli;
+
+    println!("Parameters: n={}, num_moduli={}", n, num_moduli);
+
+    // Generate CPU keys
+    println!("Generating CPU keypair...");
+    let keypair = RnsKeyPair::generate(&bgv_params, &mut rng);
+
+    println!("Generating Galois keys...");
+    let cpu_galois_keys = RnsGaloisKeys::generate(&keypair.sk, &mut rng);
+    println!("Generated {} Galois keys", cpu_galois_keys.num_keys());
+
+    // Create test slots
+    let test_slots: Vec<u64> = (0..n).map(|i| (i % 1000) as u64).collect();
+
+    // Encrypt test slots
+    println!("Encrypting test slots...");
+    let cpu_ct = RnsCiphertext::encrypt_slots(&keypair.pk, &test_slots, &mut rng);
+
+    // Create GPU context
+    println!("Creating GPU context...");
+    let gpu_params = GpuRnsParams::goldilocks();
+    let ctx = match GpuRotationContext::new(gpu_params) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            println!("Skipping test - GPU context creation failed: {:?}", e);
+            return;
+        }
+    };
+
+    // Convert to GPU format
+    println!("Converting keys to GPU format...");
+    let gpu_galois_keys = cpu_to_gpu_galois_keys(&ctx, &cpu_galois_keys, num_moduli);
+    let gpu_ct = cpu_to_gpu_ciphertext(&ctx, &cpu_ct);
+
+    // Create workspace
+    let workspace = SumSlotsWorkspace::new(&ctx);
+
+    // Run profiled version
+    println!("\n--- Running profiled GPU sum_slots ---\n");
+    let _gpu_result = gpu_sum_slots_batched_profiled(&ctx, &gpu_ct, &gpu_galois_keys, &workspace)
+        .expect("Profiled GPU sum_slots failed");
+
+    println!("\n✓ Profiling complete!");
 }

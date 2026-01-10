@@ -2668,3 +2668,542 @@ fn digit_decompose(@builtin(global_invocation_id) global_id: vec3<u32>) {
     output[idx * 2u + 1u] = 0u;
 }
 "#;
+
+// =============================================================================
+// FUSED SHADERS: Process all moduli in a single dispatch
+// =============================================================================
+// These reduce dispatch count by 3× by processing all 3 RNS moduli together.
+
+/// Fused twist shader - processes all moduli in one dispatch.
+/// Thread layout: thread_idx = mod_idx * n + coeff_idx
+pub const FUSED_TWIST_SHADER: &str = r#"
+struct FusedTwistParams {
+    n: u32,
+    num_moduli: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: FusedTwistParams;
+@group(0) @binding(1) var<storage, read_write> data: array<u32>;
+@group(0) @binding(2) var<storage, read> psi_powers: array<u32>;  // [mod][coeff] layout
+@group(0) @binding(3) var<storage, read> moduli: array<u32>;      // moduli[mod*4] = q_lo, q_hi, mu_lo, mu_hi
+@group(0) @binding(4) var<storage, read> barrett_params: array<u32>; // [mod*4] = mu_lo_lo, mu_lo_hi, mu_hi_lo, mu_hi_hi
+
+fn u64_mul(a: u32, b: u32) -> vec2<u32> {
+    let a_lo = a & 0xFFFFu;
+    let a_hi = a >> 16u;
+    let b_lo = b & 0xFFFFu;
+    let b_hi = b >> 16u;
+
+    let p0 = a_lo * b_lo;
+    let p1 = a_lo * b_hi;
+    let p2 = a_hi * b_lo;
+    let p3 = a_hi * b_hi;
+
+    var lo = p0;
+    var hi = p3;
+
+    let mid = p1 + p2;
+    let mid_lo = (mid & 0xFFFFu) << 16u;
+    let mid_hi = mid >> 16u;
+
+    let new_lo = lo + mid_lo;
+    if new_lo < lo { hi = hi + 1u; }
+    lo = new_lo;
+    hi = hi + mid_hi;
+
+    if p1 > 0xFFFFFFFFu - p2 {
+        hi = hi + 0x10000u;
+    }
+
+    return vec2<u32>(lo, hi);
+}
+
+fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let p00 = u64_mul(a.x, b.x);
+    let p01 = u64_mul(a.x, b.y);
+    let p10 = u64_mul(a.y, b.x);
+    let p11 = u64_mul(a.y, b.y);
+
+    var r0 = p00.x;
+    var r1 = p00.y;
+    var r2 = p11.x;
+    var r3 = p11.y;
+
+    var t = r1 + p01.x;
+    var c: u32 = 0u;
+    if t < r1 { c = 1u; }
+    r1 = t;
+    t = r1 + p10.x;
+    if t < r1 { c = c + 1u; }
+    r1 = t;
+
+    t = r2 + p01.y;
+    var c2: u32 = 0u;
+    if t < r2 { c2 = 1u; }
+    r2 = t;
+    t = r2 + p10.y;
+    if t < r2 { c2 = c2 + 1u; }
+    r2 = t;
+    t = r2 + c;
+    if t < r2 { c2 = c2 + 1u; }
+    r2 = t;
+
+    r3 = r3 + c2;
+
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+fn barrett_reduce_fused(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
+    var r0 = x.x;
+    var r1 = x.y;
+
+    if x.w == 0u && x.z == 0u {
+        if r1 < q.y || (r1 == q.y && r0 < q.x) {
+            return vec2<u32>(r0, r1);
+        }
+    }
+
+    // Simplified Barrett for 64-bit products
+    let p00 = u64_mul(r0, mu0);
+    let p01 = u64_mul(r0, mu1);
+    let p10 = u64_mul(r1, mu0);
+    let p11 = u64_mul(r1, mu1);
+    let p02 = u64_mul(r0, mu2);
+    let p03 = u64_mul(r0, mu3);
+    let p12 = u64_mul(r1, mu2);
+    let p13 = u64_mul(r1, mu3);
+
+    var acc96: u32 = p02.y + p03.x + p11.y + p12.x;
+    var acc128: u32 = p13.x + p03.y + p12.y;
+    var acc160: u32 = p13.y;
+
+    // Simplified quotient estimate
+    var q_est_lo = acc128;
+    var q_est_hi = acc160;
+
+    let qe0 = u64_mul(q_est_lo, q.x);
+    let qe1 = u64_mul(q_est_lo, q.y);
+    let qe2 = u64_mul(q_est_hi, q.x);
+
+    var sub0 = qe0.x;
+    var sub1 = qe0.y + qe1.x + qe2.x;
+
+    // r - q_est * q
+    var diff0 = r0 - sub0;
+    var borrow: u32 = 0u;
+    if r0 < sub0 { borrow = 1u; }
+    var diff1 = r1 - sub1 - borrow;
+
+    // Final reduction
+    while diff1 > q.y || (diff1 == q.y && diff0 >= q.x) {
+        if diff0 >= q.x {
+            diff0 = diff0 - q.x;
+        } else {
+            diff0 = 0xFFFFFFFFu - (q.x - diff0 - 1u);
+            diff1 = diff1 - 1u;
+        }
+        diff1 = diff1 - q.y;
+    }
+
+    return vec2<u32>(diff0, diff1);
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn fused_twist(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let thread_idx = global_id.x;
+    let n = params.n;
+    let num_moduli = params.num_moduli;
+
+    if thread_idx >= n * num_moduli {
+        return;
+    }
+
+    let coeff_idx = thread_idx % n;
+    let mod_idx = thread_idx / n;
+
+    // Load modulus and Barrett params
+    let q = vec2<u32>(moduli[mod_idx * 2u], moduli[mod_idx * 2u + 1u]);
+    let mu0 = barrett_params[mod_idx * 4u];
+    let mu1 = barrett_params[mod_idx * 4u + 1u];
+    let mu2 = barrett_params[mod_idx * 4u + 2u];
+    let mu3 = barrett_params[mod_idx * 4u + 3u];
+
+    // Load coefficient and psi power
+    let base = (mod_idx * n + coeff_idx) * 2u;
+    let psi_base = (mod_idx * n + coeff_idx) * 2u;
+
+    let val = vec2<u32>(data[base], data[base + 1u]);
+    let psi = vec2<u32>(psi_powers[psi_base], psi_powers[psi_base + 1u]);
+
+    // Multiply and reduce
+    let prod = mul64(val, psi);
+    let result = barrett_reduce_fused(prod, q, mu0, mu1, mu2, mu3);
+
+    data[base] = result.x;
+    data[base + 1u] = result.y;
+}
+"#;
+
+/// Fused bit-reverse shader - processes all moduli in one dispatch.
+pub const FUSED_BITREV_SHADER: &str = r#"
+struct FusedBitrevParams {
+    n: u32,
+    log_n: u32,
+    num_moduli: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: FusedBitrevParams;
+@group(0) @binding(1) var<storage, read> input: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<u32>;
+
+fn bit_reverse(x: u32, log_n: u32) -> u32 {
+    var v = x;
+    var r: u32 = 0u;
+    for (var i: u32 = 0u; i < log_n; i = i + 1u) {
+        r = (r << 1u) | (v & 1u);
+        v = v >> 1u;
+    }
+    return r;
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn fused_bit_reverse(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let thread_idx = global_id.x;
+    let n = params.n;
+    let num_moduli = params.num_moduli;
+
+    if thread_idx >= n * num_moduli {
+        return;
+    }
+
+    let coeff_idx = thread_idx % n;
+    let mod_idx = thread_idx / n;
+
+    let rev_idx = bit_reverse(coeff_idx, params.log_n);
+    let in_base = (mod_idx * n + coeff_idx) * 2u;
+    let out_base = (mod_idx * n + rev_idx) * 2u;
+
+    output[out_base] = input[in_base];
+    output[out_base + 1u] = input[in_base + 1u];
+}
+"#;
+
+/// Fused NTT butterfly shader - processes all moduli in one dispatch.
+pub const FUSED_BUTTERFLY_SHADER: &str = r#"
+struct FusedButterflyParams {
+    n: u32,
+    stage: u32,
+    num_moduli: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: FusedButterflyParams;
+@group(0) @binding(1) var<storage, read_write> data: array<u32>;
+@group(0) @binding(2) var<storage, read> twiddles: array<u32>;    // [mod][n] layout
+@group(0) @binding(3) var<storage, read> moduli: array<u32>;      // [mod*2] = q_lo, q_hi
+@group(0) @binding(4) var<storage, read> barrett_params: array<u32>; // [mod*4]
+
+fn u64_mul(a: u32, b: u32) -> vec2<u32> {
+    let a_lo = a & 0xFFFFu;
+    let a_hi = a >> 16u;
+    let b_lo = b & 0xFFFFu;
+    let b_hi = b >> 16u;
+    let p0 = a_lo * b_lo;
+    let p1 = a_lo * b_hi;
+    let p2 = a_hi * b_lo;
+    let p3 = a_hi * b_hi;
+    var lo = p0;
+    var hi = p3;
+    let mid = p1 + p2;
+    let mid_lo = (mid & 0xFFFFu) << 16u;
+    let mid_hi = mid >> 16u;
+    let new_lo = lo + mid_lo;
+    if new_lo < lo { hi = hi + 1u; }
+    lo = new_lo;
+    hi = hi + mid_hi;
+    if p1 > 0xFFFFFFFFu - p2 { hi = hi + 0x10000u; }
+    return vec2<u32>(lo, hi);
+}
+
+fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let p00 = u64_mul(a.x, b.x);
+    let p01 = u64_mul(a.x, b.y);
+    let p10 = u64_mul(a.y, b.x);
+    let p11 = u64_mul(a.y, b.y);
+    var r0 = p00.x; var r1 = p00.y; var r2 = p11.x; var r3 = p11.y;
+    var t = r1 + p01.x; var c: u32 = 0u; if t < r1 { c = 1u; } r1 = t;
+    t = r1 + p10.x; if t < r1 { c = c + 1u; } r1 = t;
+    t = r2 + p01.y; var c2: u32 = 0u; if t < r2 { c2 = 1u; } r2 = t;
+    t = r2 + p10.y; if t < r2 { c2 = c2 + 1u; } r2 = t;
+    t = r2 + c; if t < r2 { c2 = c2 + 1u; } r2 = t;
+    r3 = r3 + c2;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+fn barrett_reduce_bf(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
+    var r0 = x.x; var r1 = x.y;
+    if x.w == 0u && x.z == 0u && (r1 < q.y || (r1 == q.y && r0 < q.x)) { return vec2<u32>(r0, r1); }
+    let p13 = u64_mul(r1, mu3); let p03 = u64_mul(r0, mu3); let p12 = u64_mul(r1, mu2);
+    var acc128 = p13.x + p03.y + p12.y;
+    var q_est_lo = acc128;
+    let qe0 = u64_mul(q_est_lo, q.x); let qe1 = u64_mul(q_est_lo, q.y);
+    var sub0 = qe0.x; var sub1 = qe0.y + qe1.x;
+    var diff0 = r0 - sub0; var borrow: u32 = 0u; if r0 < sub0 { borrow = 1u; }
+    var diff1 = r1 - sub1 - borrow;
+    while diff1 > q.y || (diff1 == q.y && diff0 >= q.x) {
+        if diff0 >= q.x { diff0 = diff0 - q.x; } else { diff0 = 0xFFFFFFFFu - (q.x - diff0 - 1u); diff1 = diff1 - 1u; }
+        diff1 = diff1 - q.y;
+    }
+    return vec2<u32>(diff0, diff1);
+}
+
+fn addmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
+    var s0 = a.x + b.x; var c: u32 = 0u; if s0 < a.x { c = 1u; }
+    var s1 = a.y + b.y + c;
+    if s1 > q.y || (s1 == q.y && s0 >= q.x) {
+        if s0 >= q.x { s0 = s0 - q.x; } else { s0 = 0xFFFFFFFFu - (q.x - s0 - 1u); s1 = s1 - 1u; }
+        s1 = s1 - q.y;
+    }
+    return vec2<u32>(s0, s1);
+}
+
+fn submod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
+    if a.y > b.y || (a.y == b.y && a.x >= b.x) {
+        var d0 = a.x - b.x; var borrow: u32 = 0u; if a.x < b.x { borrow = 1u; }
+        return vec2<u32>(d0, a.y - b.y - borrow);
+    } else {
+        var d0 = b.x - a.x; var borrow: u32 = 0u; if b.x < a.x { borrow = 1u; }
+        var d1 = b.y - a.y - borrow;
+        var r0 = q.x - d0; borrow = 0u; if q.x < d0 { borrow = 1u; }
+        return vec2<u32>(r0, q.y - d1 - borrow);
+    }
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn fused_butterfly(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let thread_idx = global_id.x;
+    let n = params.n;
+    let num_moduli = params.num_moduli;
+    let half_n = n / 2u;
+
+    if thread_idx >= half_n * num_moduli {
+        return;
+    }
+
+    let butterfly_idx = thread_idx % half_n;
+    let mod_idx = thread_idx / half_n;
+
+    let stage = params.stage;
+    let m = 1u << (stage + 1u);
+    let half_m = 1u << stage;
+
+    let group = butterfly_idx / half_m;
+    let idx_in_group = butterfly_idx % half_m;
+    let i = group * m + idx_in_group;
+    let j = i + half_m;
+
+    // Twiddle factor index
+    let twiddle_idx = idx_in_group * (n / m);
+    let tw_base = (mod_idx * n + twiddle_idx) * 2u;
+    let twiddle = vec2<u32>(twiddles[tw_base], twiddles[tw_base + 1u]);
+
+    // Load modulus and Barrett params
+    let q = vec2<u32>(moduli[mod_idx * 2u], moduli[mod_idx * 2u + 1u]);
+    let mu0 = barrett_params[mod_idx * 4u];
+    let mu1 = barrett_params[mod_idx * 4u + 1u];
+    let mu2 = barrett_params[mod_idx * 4u + 2u];
+    let mu3 = barrett_params[mod_idx * 4u + 3u];
+
+    // Data positions
+    let base_i = (mod_idx * n + i) * 2u;
+    let base_j = (mod_idx * n + j) * 2u;
+
+    let u = vec2<u32>(data[base_i], data[base_i + 1u]);
+    let v = vec2<u32>(data[base_j], data[base_j + 1u]);
+
+    // t = v * twiddle mod q
+    let prod = mul64(v, twiddle);
+    let t = barrett_reduce_bf(prod, q, mu0, mu1, mu2, mu3);
+
+    // Butterfly: data[i] = u + t, data[j] = u - t
+    let new_i = addmod(u, t, q);
+    let new_j = submod(u, t, q);
+
+    data[base_i] = new_i.x;
+    data[base_i + 1u] = new_i.y;
+    data[base_j] = new_j.x;
+    data[base_j + 1u] = new_j.y;
+}
+"#;
+
+/// Fused pointwise multiply shader - processes all moduli in one dispatch.
+pub const FUSED_POINTWISE_SHADER: &str = r#"
+struct FusedPointwiseParams {
+    n: u32,
+    num_moduli: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: FusedPointwiseParams;
+@group(0) @binding(1) var<storage, read> a: array<u32>;
+@group(0) @binding(2) var<storage, read> b: array<u32>;
+@group(0) @binding(3) var<storage, read_write> result: array<u32>;
+@group(0) @binding(4) var<storage, read> moduli: array<u32>;
+@group(0) @binding(5) var<storage, read> barrett_params: array<u32>;
+
+fn u64_mul(a: u32, b: u32) -> vec2<u32> {
+    let a_lo = a & 0xFFFFu; let a_hi = a >> 16u;
+    let b_lo = b & 0xFFFFu; let b_hi = b >> 16u;
+    let p0 = a_lo * b_lo; let p1 = a_lo * b_hi; let p2 = a_hi * b_lo; let p3 = a_hi * b_hi;
+    var lo = p0; var hi = p3;
+    let mid = p1 + p2; let mid_lo = (mid & 0xFFFFu) << 16u; let mid_hi = mid >> 16u;
+    let new_lo = lo + mid_lo; if new_lo < lo { hi = hi + 1u; } lo = new_lo;
+    hi = hi + mid_hi; if p1 > 0xFFFFFFFFu - p2 { hi = hi + 0x10000u; }
+    return vec2<u32>(lo, hi);
+}
+
+fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let p00 = u64_mul(a.x, b.x); let p01 = u64_mul(a.x, b.y); let p10 = u64_mul(a.y, b.x); let p11 = u64_mul(a.y, b.y);
+    var r0 = p00.x; var r1 = p00.y; var r2 = p11.x; var r3 = p11.y;
+    var t = r1 + p01.x; var c: u32 = 0u; if t < r1 { c = 1u; } r1 = t;
+    t = r1 + p10.x; if t < r1 { c = c + 1u; } r1 = t;
+    t = r2 + p01.y; var c2: u32 = 0u; if t < r2 { c2 = 1u; } r2 = t;
+    t = r2 + p10.y; if t < r2 { c2 = c2 + 1u; } r2 = t;
+    t = r2 + c; if t < r2 { c2 = c2 + 1u; } r2 = t; r3 = r3 + c2;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+fn barrett_reduce_pw(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
+    var r0 = x.x; var r1 = x.y;
+    if x.w == 0u && x.z == 0u && (r1 < q.y || (r1 == q.y && r0 < q.x)) { return vec2<u32>(r0, r1); }
+    let p13 = u64_mul(r1, mu3); let p03 = u64_mul(r0, mu3); let p12 = u64_mul(r1, mu2);
+    var q_est_lo = p13.x + p03.y + p12.y;
+    let qe0 = u64_mul(q_est_lo, q.x); let qe1 = u64_mul(q_est_lo, q.y);
+    var sub0 = qe0.x; var sub1 = qe0.y + qe1.x;
+    var diff0 = r0 - sub0; var borrow: u32 = 0u; if r0 < sub0 { borrow = 1u; }
+    var diff1 = r1 - sub1 - borrow;
+    while diff1 > q.y || (diff1 == q.y && diff0 >= q.x) {
+        if diff0 >= q.x { diff0 = diff0 - q.x; } else { diff0 = 0xFFFFFFFFu - (q.x - diff0 - 1u); diff1 = diff1 - 1u; }
+        diff1 = diff1 - q.y;
+    }
+    return vec2<u32>(diff0, diff1);
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn fused_pointwise(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let thread_idx = global_id.x;
+    let n = params.n;
+    let num_moduli = params.num_moduli;
+
+    if thread_idx >= n * num_moduli {
+        return;
+    }
+
+    let coeff_idx = thread_idx % n;
+    let mod_idx = thread_idx / n;
+
+    let q = vec2<u32>(moduli[mod_idx * 2u], moduli[mod_idx * 2u + 1u]);
+    let mu0 = barrett_params[mod_idx * 4u];
+    let mu1 = barrett_params[mod_idx * 4u + 1u];
+    let mu2 = barrett_params[mod_idx * 4u + 2u];
+    let mu3 = barrett_params[mod_idx * 4u + 3u];
+
+    let base = (mod_idx * n + coeff_idx) * 2u;
+    let av = vec2<u32>(a[base], a[base + 1u]);
+    let bv = vec2<u32>(b[base], b[base + 1u]);
+
+    let prod = mul64(av, bv);
+    let res = barrett_reduce_pw(prod, q, mu0, mu1, mu2, mu3);
+
+    result[base] = res.x;
+    result[base + 1u] = res.y;
+}
+"#;
+
+/// Fused scale shader - multiplies all coefficients by n_inv, processes all moduli.
+pub const FUSED_SCALE_SHADER: &str = r#"
+struct FusedScaleParams {
+    n: u32,
+    num_moduli: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: FusedScaleParams;
+@group(0) @binding(1) var<storage, read_write> data: array<u32>;
+@group(0) @binding(2) var<storage, read> n_inv: array<u32>;        // [mod*2] = n_inv_lo, n_inv_hi
+@group(0) @binding(3) var<storage, read> moduli: array<u32>;
+@group(0) @binding(4) var<storage, read> barrett_params: array<u32>;
+
+fn u64_mul(a: u32, b: u32) -> vec2<u32> {
+    let a_lo = a & 0xFFFFu; let a_hi = a >> 16u;
+    let b_lo = b & 0xFFFFu; let b_hi = b >> 16u;
+    let p0 = a_lo * b_lo; let p1 = a_lo * b_hi; let p2 = a_hi * b_lo; let p3 = a_hi * b_hi;
+    var lo = p0; var hi = p3;
+    let mid = p1 + p2; let mid_lo = (mid & 0xFFFFu) << 16u; let mid_hi = mid >> 16u;
+    let new_lo = lo + mid_lo; if new_lo < lo { hi = hi + 1u; } lo = new_lo;
+    hi = hi + mid_hi; if p1 > 0xFFFFFFFFu - p2 { hi = hi + 0x10000u; }
+    return vec2<u32>(lo, hi);
+}
+
+fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    let p00 = u64_mul(a.x, b.x); let p01 = u64_mul(a.x, b.y); let p10 = u64_mul(a.y, b.x); let p11 = u64_mul(a.y, b.y);
+    var r0 = p00.x; var r1 = p00.y; var r2 = p11.x; var r3 = p11.y;
+    var t = r1 + p01.x; var c: u32 = 0u; if t < r1 { c = 1u; } r1 = t;
+    t = r1 + p10.x; if t < r1 { c = c + 1u; } r1 = t;
+    t = r2 + p01.y; var c2: u32 = 0u; if t < r2 { c2 = 1u; } r2 = t;
+    t = r2 + p10.y; if t < r2 { c2 = c2 + 1u; } r2 = t;
+    t = r2 + c; if t < r2 { c2 = c2 + 1u; } r2 = t; r3 = r3 + c2;
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+fn barrett_reduce_sc(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
+    var r0 = x.x; var r1 = x.y;
+    if x.w == 0u && x.z == 0u && (r1 < q.y || (r1 == q.y && r0 < q.x)) { return vec2<u32>(r0, r1); }
+    let p13 = u64_mul(r1, mu3); let p03 = u64_mul(r0, mu3); let p12 = u64_mul(r1, mu2);
+    var q_est_lo = p13.x + p03.y + p12.y;
+    let qe0 = u64_mul(q_est_lo, q.x); let qe1 = u64_mul(q_est_lo, q.y);
+    var sub0 = qe0.x; var sub1 = qe0.y + qe1.x;
+    var diff0 = r0 - sub0; var borrow: u32 = 0u; if r0 < sub0 { borrow = 1u; }
+    var diff1 = r1 - sub1 - borrow;
+    while diff1 > q.y || (diff1 == q.y && diff0 >= q.x) {
+        if diff0 >= q.x { diff0 = diff0 - q.x; } else { diff0 = 0xFFFFFFFFu - (q.x - diff0 - 1u); diff1 = diff1 - 1u; }
+        diff1 = diff1 - q.y;
+    }
+    return vec2<u32>(diff0, diff1);
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn fused_scale(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let thread_idx = global_id.x;
+    let n = params.n;
+    let num_moduli = params.num_moduli;
+
+    if thread_idx >= n * num_moduli {
+        return;
+    }
+
+    let coeff_idx = thread_idx % n;
+    let mod_idx = thread_idx / n;
+
+    let q = vec2<u32>(moduli[mod_idx * 2u], moduli[mod_idx * 2u + 1u]);
+    let mu0 = barrett_params[mod_idx * 4u];
+    let mu1 = barrett_params[mod_idx * 4u + 1u];
+    let mu2 = barrett_params[mod_idx * 4u + 2u];
+    let mu3 = barrett_params[mod_idx * 4u + 3u];
+    let scalar = vec2<u32>(n_inv[mod_idx * 2u], n_inv[mod_idx * 2u + 1u]);
+
+    let base = (mod_idx * n + coeff_idx) * 2u;
+    let val = vec2<u32>(data[base], data[base + 1u]);
+
+    let prod = mul64(val, scalar);
+    let res = barrett_reduce_sc(prod, q, mu0, mu1, mu2, mu3);
+
+    data[base] = res.x;
+    data[base + 1u] = res.y;
+}
+"#;
