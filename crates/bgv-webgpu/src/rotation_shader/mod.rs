@@ -4,6 +4,7 @@
 
 pub mod math;
 pub mod fused;
+pub mod shared_mem_ntt;
 
 use naga_oil::compose::{Composer, ComposableModuleDescriptor, NagaModuleDescriptor, ShaderLanguage, ShaderType};
 use std::collections::HashMap;
@@ -110,5 +111,21 @@ mod tests {
         // Bitrev doesn't import math, should work without composer
         let result = compose_shader(fused::FUSED_BITREV_SHADER, "fused_bitrev.wgsl");
         assert!(result.is_ok(), "Failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_compose_shared_mem_ntt() {
+        let result = compose_shader(shared_mem_ntt::SHARED_MEM_NTT_SHADER, "shared_mem_ntt.wgsl");
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+        let wgsl = result.unwrap();
+        assert!(wgsl.contains("fn shared_mem_ntt"), "Missing entry point");
+    }
+
+    #[test]
+    fn test_compose_shared_mem_ntt_partial() {
+        let result = compose_shader(shared_mem_ntt::SHARED_MEM_NTT_PARTIAL_SHADER, "shared_mem_ntt_partial.wgsl");
+        assert!(result.is_ok(), "Failed: {:?}", result.err());
+        let wgsl = result.unwrap();
+        assert!(wgsl.contains("fn shared_mem_ntt_partial"), "Missing entry point");
     }
 }
