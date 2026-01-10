@@ -9,7 +9,7 @@ use std::time::Duration;
 use bgv_webgpu::{
     GpuRotationContext, GpuRnsParams, GpuRnsPoly, GpuRnsCiphertext,
     GpuGaloisKey, GpuGaloisKeys, gpu_sum_slots, rotation_exponent,
-    SumSlotsWorkspace, gpu_sum_slots_batched,
+    SumSlotsWorkspace, gpu_sum_slots_batched, gpu_sum_slots_batched_2x,
 };
 
 /// Creates mock Galois keys for benchmarking.
@@ -158,6 +158,24 @@ fn bench_sum_slots(c: &mut Criterion) {
         |b, (ctx, ct, keys, ws)| {
             b.iter(|| {
                 gpu_sum_slots_batched(black_box(ctx), black_box(ct), black_box(keys), black_box(ws)).unwrap()
+            });
+        },
+    );
+
+    // Benchmark 2 ciphertexts to test GPU saturation
+    // If GPU was idle, 2x should take ~same time as 1x
+    // If GPU was saturated, 2x should take ~2x time
+    let ciphertext2 = create_mock_ciphertext(&ctx, n, num_moduli);
+    let workspace2 = SumSlotsWorkspace::new(&ctx);
+    println!("Created second ciphertext and workspace for 2x test");
+
+    group.bench_with_input(
+        BenchmarkId::new("sum_slots_batched_2x_parallel", format!("n={}_moduli={}", n, num_moduli)),
+        &(&ctx, &ciphertext, &ciphertext2, &galois_keys, &workspace, &workspace2),
+        |b, (ctx, ct1, ct2, keys, ws1, ws2)| {
+            b.iter(|| {
+                // Process two ciphertexts in parallel (both in same command buffer)
+                gpu_sum_slots_batched_2x(black_box(ctx), black_box(ct1), black_box(ct2), black_box(keys), black_box(ws1), black_box(ws2)).unwrap()
             });
         },
     );

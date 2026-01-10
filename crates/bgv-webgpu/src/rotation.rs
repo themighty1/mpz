@@ -35,7 +35,15 @@ pub struct GpuRnsParams {
 impl GpuRnsParams {
     /// Creates parameters for Goldilocks field.
     ///
-    /// Uses 3 RNS moduli (~180 bit q). In IT-PAC, noise never exceeds 80 bits.
+    /// Uses 4 RNS moduli (~240 bit q) for sufficient noise budget.
+    ///
+    /// The noise budget must support:
+    /// 1. Slot-wise scalar multiplication
+    /// 2. sum_slots: 13 rotations with key-switching (log2(8192) = 13)
+    /// 3. Masking: plaintext multiplication to zero out all slots except one
+    ///
+    /// Each rotation adds significant noise due to key-switching, so 4 moduli
+    /// provides sufficient margin for correctness.
     pub fn goldilocks() -> Self {
         Self {
             n: 8192,
@@ -43,6 +51,7 @@ impl GpuRnsParams {
                 1152921504606994433,  // q₀ ≡ 1 (mod 16384)
                 1152921504607191041,  // q₁ ≡ 1 (mod 16384)
                 1152921504607223809,  // q₂ ≡ 1 (mod 16384)
+                1152921504607338497,  // q₃ ≡ 1 (mod 16384)
             ],
             digits_per_limb: 4,
             decomp_base: 1 << 15,
@@ -2596,6 +2605,20 @@ pub struct SumSlotsWorkspace {
     fused_butterfly_result_inv_bg: Vec<wgpu::BindGroup>, // [stage]
     fused_pointwise_bg: wgpu::BindGroup,
     fused_scale_bg: wgpu::BindGroup,
+
+    // =========================================================================
+    // Shared memory NTT bind groups (entire NTT in single dispatch)
+    // =========================================================================
+    // Pre-allocated uniform buffers for shared memory NTT
+    shared_mem_ntt_params: Buffer,              // n, log_n (same for all)
+    shared_mem_q_buffers: Vec<Buffer>,          // [mod_idx] - q as vec2<u32>
+    shared_mem_barrett_buffers: Vec<Buffer>,    // [mod_idx] - barrett params as vec4<u32>
+    shared_mem_n_inv_buffers: Vec<Buffer>,      // [mod_idx] - n^-1 for inverse NTT
+
+    // Pre-allocated bind groups for shared memory NTT on workspace buffers
+    shared_mem_ntt_fwd_a_bg: Vec<wgpu::BindGroup>,      // [mod_idx] forward on ntt_a_twisted
+    shared_mem_ntt_fwd_b_bg: Vec<wgpu::BindGroup>,      // [mod_idx] forward on ntt_b_twisted
+    shared_mem_ntt_inv_result_bg: Vec<wgpu::BindGroup>, // [mod_idx] inverse on ntt_result
 }
 
 impl SumSlotsWorkspace {
@@ -3125,6 +3148,112 @@ impl SumSlotsWorkspace {
             ],
         });
 
+        // =========================================================================
+        // Shared memory NTT buffers and bind groups
+        // =========================================================================
+        // Params buffer (same for all NTTs)
+        let shared_mem_params = SharedMemNttParams {
+            n: n as u32,
+            log_n,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let shared_mem_ntt_params = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("shared_mem_ntt_params"),
+            contents: bytemuck::bytes_of(&shared_mem_params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        // Per-modulus uniform buffers
+        let mut shared_mem_q_buffers = Vec::with_capacity(num_moduli);
+        let mut shared_mem_barrett_buffers = Vec::with_capacity(num_moduli);
+        let mut shared_mem_n_inv_buffers = Vec::with_capacity(num_moduli);
+
+        for mod_idx in 0..num_moduli {
+            let ntt = &ctx.ntt_data[mod_idx];
+
+            // q as vec2<u32>
+            let q_data = [ntt.modulus as u32, (ntt.modulus >> 32) as u32];
+            shared_mem_q_buffers.push(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("shared_mem_q_{}", mod_idx)),
+                contents: bytemuck::cast_slice(&q_data),
+                usage: BufferUsages::UNIFORM,
+            }));
+
+            // Barrett as vec4<u32>
+            let barrett_data = [
+                ntt.mu_lo as u32,
+                (ntt.mu_lo >> 32) as u32,
+                ntt.mu_hi as u32,
+                (ntt.mu_hi >> 32) as u32,
+            ];
+            shared_mem_barrett_buffers.push(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("shared_mem_barrett_{}", mod_idx)),
+                contents: bytemuck::cast_slice(&barrett_data),
+                usage: BufferUsages::UNIFORM,
+            }));
+
+            // n_inv as storage (for inverse NTT)
+            let n_inv_data = [ntt.n_inv as u32, (ntt.n_inv >> 32) as u32];
+            shared_mem_n_inv_buffers.push(ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("shared_mem_n_inv_{}", mod_idx)),
+                contents: bytemuck::cast_slice(&n_inv_data),
+                usage: BufferUsages::STORAGE,
+            }));
+        }
+
+        // Shared memory NTT bind groups
+        // Forward NTT bindings: 0=params, 1=data, 2=twiddles, 3=psi, 4=q, 5=barrett
+        // Inverse NTT bindings: 0=params, 1=data, 2=inv_twiddles, 3=inv_psi, 4=n_inv, 5=q, 6=barrett
+        let mut shared_mem_ntt_fwd_a_bg = Vec::with_capacity(num_moduli);
+        let mut shared_mem_ntt_fwd_b_bg = Vec::with_capacity(num_moduli);
+        let mut shared_mem_ntt_inv_result_bg = Vec::with_capacity(num_moduli);
+
+        for mod_idx in 0..num_moduli {
+            // Forward NTT on ntt_a_twisted
+            shared_mem_ntt_fwd_a_bg.push(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("shared_mem_ntt_fwd_a_{}", mod_idx)),
+                layout: &ctx.shared_mem_ntt_fwd_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: shared_mem_ntt_params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: ntt_a_twisted[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: ctx.twiddle_buffers[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: ctx.psi_power_buffers[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: shared_mem_q_buffers[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: shared_mem_barrett_buffers[mod_idx].as_entire_binding() },
+                ],
+            }));
+
+            // Forward NTT on ntt_b_twisted
+            shared_mem_ntt_fwd_b_bg.push(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("shared_mem_ntt_fwd_b_{}", mod_idx)),
+                layout: &ctx.shared_mem_ntt_fwd_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: shared_mem_ntt_params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: ntt_b_twisted[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: ctx.twiddle_buffers[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: ctx.psi_power_buffers[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: shared_mem_q_buffers[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: shared_mem_barrett_buffers[mod_idx].as_entire_binding() },
+                ],
+            }));
+
+            // Inverse NTT on ntt_result
+            shared_mem_ntt_inv_result_bg.push(ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("shared_mem_ntt_inv_result_{}", mod_idx)),
+                layout: &ctx.shared_mem_ntt_inv_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: shared_mem_ntt_params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: ntt_result[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: ctx.inv_twiddle_buffers[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: ctx.psi_inv_power_buffers[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: shared_mem_n_inv_buffers[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: shared_mem_q_buffers[mod_idx].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: shared_mem_barrett_buffers[mod_idx].as_entire_binding() },
+                ],
+            }));
+        }
+
         let current_c0 = create_rns_buffer("current_c0");
         let current_c1 = create_rns_buffer("current_c1");
         let temp_c0 = create_rns_buffer("temp_c0");
@@ -3220,6 +3349,15 @@ impl SumSlotsWorkspace {
             fused_butterfly_result_inv_bg,
             fused_pointwise_bg,
             fused_scale_bg,
+
+            // Shared memory NTT
+            shared_mem_ntt_params,
+            shared_mem_q_buffers,
+            shared_mem_barrett_buffers,
+            shared_mem_n_inv_buffers,
+            shared_mem_ntt_fwd_a_bg,
+            shared_mem_ntt_fwd_b_bg,
+            shared_mem_ntt_inv_result_bg,
         }
     }
 }
@@ -3441,17 +3579,33 @@ fn gpu_sum_slots_batched_inner(
 
     if profile {
         let total_time = total_start.elapsed();
+
+        // Calculate actual dispatch count with shared memory NTT
+        // Per NTT multiply: 4 dispatches per modulus (2 fwd + pointwise + inv)
+        // Per rotation: 24 NTT muls × 3 moduli × 4 = 288 dispatches + automorphisms + adds
+        let ntt_dispatches_per_rotation = num_moduli * workspace.digits_per_limb * 2 * num_moduli * 4;
+        let other_dispatches = 2 + 2 + 4; // 2 auto + 2 clear + ~4 adds
+        let total_dispatches = num_keys * (ntt_dispatches_per_rotation + other_dispatches);
+
         eprintln!("\n=== Sum Slots Profiling Summary ===");
-        eprintln!("Total encode time: {:?} ({:.1}%)", encode_time, 100.0 * encode_time.as_secs_f64() / total_time.as_secs_f64());
-        eprintln!("Total submit time: {:?} ({:.1}%)", submit_time, 100.0 * submit_time.as_secs_f64() / total_time.as_secs_f64());
-        eprintln!("Final poll time: {:?} ({:.1}%)", poll_time, 100.0 * poll_time.as_secs_f64() / total_time.as_secs_f64());
-        eprintln!("Total time: {:?}", total_time);
-        eprintln!("\nBottleneck analysis:");
+        eprintln!();
+        eprintln!("Pipeline timing (encode overlaps with GPU):");
+        eprintln!("  Encode time (CPU command building): {:?}", encode_time);
+        eprintln!("  Submit time (queue submission):     {:?}", submit_time);
+        eprintln!("  Poll time (wait for GPU):           {:?}", poll_time);
+        eprintln!("  Total wall-clock time:              {:?}", total_time);
+        eprintln!();
+        eprintln!("Analysis:");
+        eprintln!("  If encode >> poll: CPU-bound (GPU starving)");
+        eprintln!("  If poll >> encode: GPU-bound (GPU saturated) ✓");
+        eprintln!("  Current: encode={:.0}ms, poll={:.0}ms",
+            encode_time.as_secs_f64() * 1000.0,
+            poll_time.as_secs_f64() * 1000.0);
+        eprintln!();
+        eprintln!("Dispatch count:");
         eprintln!("  - Rotations: {}", num_keys);
-        eprintln!("  - Limbs × digits per rotation: {} × {} = {}", num_moduli, workspace.digits_per_limb, num_moduli * workspace.digits_per_limb);
-        eprintln!("  - NTT multiplies per rotation: {} (each ~141 dispatches)", num_moduli * workspace.digits_per_limb * 2);
-        eprintln!("  - Estimated dispatches per rotation: ~{}", num_moduli * workspace.digits_per_limb * 2 * 141);
-        eprintln!("  - Estimated total dispatches: ~{}", num_keys * num_moduli * workspace.digits_per_limb * 2 * 141);
+        eprintln!("  - Dispatches per rotation: ~{}", ntt_dispatches_per_rotation + other_dispatches);
+        eprintln!("  - Total dispatches: ~{}", total_dispatches);
     }
 
     Ok(GpuRnsCiphertext {
@@ -3466,6 +3620,151 @@ fn gpu_sum_slots_batched_inner(
             num_moduli,
         },
     })
+}
+
+/// Processes TWO ciphertexts in parallel to test GPU saturation.
+/// Both ciphertexts' work is encoded in the same command buffer,
+/// allowing GPU to execute them concurrently if it has spare capacity.
+pub fn gpu_sum_slots_batched_2x(
+    ctx: &GpuRotationContext,
+    ct1: &GpuRnsCiphertext,
+    ct2: &GpuRnsCiphertext,
+    galois_keys: &GpuGaloisKeys,
+    workspace1: &SumSlotsWorkspace,
+    workspace2: &SumSlotsWorkspace,
+) -> Result<(GpuRnsCiphertext, GpuRnsCiphertext), GpuError> {
+    let n = ctx.params.n;
+    let num_moduli = ctx.params.moduli.len();
+    let num_keys = galois_keys.keys.len();
+
+    // Initial copy: input -> workspace for both ciphertexts
+    {
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("init_copy_2x"),
+        });
+        // Ciphertext 1
+        encoder.copy_buffer_to_buffer(&ct1.c0.buffer, 0, &workspace1.current_c0, 0, workspace1.rns_buffer_size);
+        encoder.copy_buffer_to_buffer(&ct1.c1.buffer, 0, &workspace1.current_c1, 0, workspace1.rns_buffer_size);
+        // Ciphertext 2
+        encoder.copy_buffer_to_buffer(&ct2.c0.buffer, 0, &workspace2.current_c0, 0, workspace2.rns_buffer_size);
+        encoder.copy_buffer_to_buffer(&ct2.c1.buffer, 0, &workspace2.current_c1, 0, workspace2.rns_buffer_size);
+        ctx.queue.submit(Some(encoder.finish()));
+    }
+
+    // Process each rotation - encode BOTH ciphertexts in same command buffer
+    for key_idx in 0..num_keys {
+        let galois_key = &galois_keys.keys[key_idx];
+        let k = galois_key.k;
+
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some(&format!("rotation_2x_{}", key_idx)),
+        });
+
+        // === Encode rotation for ciphertext 1 ===
+        encode_automorphism(ctx, &mut encoder, &workspace1.current_c0, &workspace1.c0_auto, k);
+        encode_automorphism(ctx, &mut encoder, &workspace1.current_c1, &workspace1.c1_auto, k);
+
+        // === Encode rotation for ciphertext 2 (in SAME command buffer) ===
+        encode_automorphism(ctx, &mut encoder, &workspace2.current_c0, &workspace2.c0_auto, k);
+        encode_automorphism(ctx, &mut encoder, &workspace2.current_c1, &workspace2.c1_auto, k);
+
+        // Zero accumulators for both
+        encoder.clear_buffer(&workspace1.ks_c0_acc, 0, Some(workspace1.rns_buffer_size));
+        encoder.clear_buffer(&workspace1.ks_c1_acc, 0, Some(workspace1.rns_buffer_size));
+        encoder.clear_buffer(&workspace2.ks_c0_acc, 0, Some(workspace2.rns_buffer_size));
+        encoder.clear_buffer(&workspace2.ks_c1_acc, 0, Some(workspace2.rns_buffer_size));
+
+        // Key-switching for both ciphertexts
+        for limb_idx in 0..num_moduli.min(galois_key.keys_b.len()) {
+            let offset = (limb_idx * n * 2 * std::mem::size_of::<u32>()) as u64;
+
+            // Copy limbs for both
+            encoder.copy_buffer_to_buffer(&workspace1.c1_auto, offset, &workspace1.limb_buffer, 0, workspace1.single_mod_size);
+            encoder.copy_buffer_to_buffer(&workspace2.c1_auto, offset, &workspace2.limb_buffer, 0, workspace2.single_mod_size);
+
+            for digit_idx in 0..workspace1.digits_per_limb {
+                // Extract digits for both
+                encode_digit_decompose(ctx, &mut encoder, &workspace1.limb_buffer, &workspace1.digit_buffer, digit_idx as u32);
+                encode_digit_decompose(ctx, &mut encoder, &workspace2.limb_buffer, &workspace2.digit_buffer, digit_idx as u32);
+
+                // Replicate digits to all moduli for both
+                for mod_idx in 0..num_moduli {
+                    let dest_offset = (mod_idx * n * 2 * std::mem::size_of::<u32>()) as u64;
+                    encoder.copy_buffer_to_buffer(&workspace1.digit_buffer, 0, &workspace1.digit_rns, dest_offset, workspace1.single_mod_size);
+                    encoder.copy_buffer_to_buffer(&workspace2.digit_buffer, 0, &workspace2.digit_rns, dest_offset, workspace2.single_mod_size);
+                }
+
+                // NTT multiplies for ciphertext 1
+                encode_ntt_mul_shared_mem(ctx, &mut encoder, workspace1, &workspace1.digit_rns, &galois_key.keys_b[limb_idx][digit_idx], &workspace1.term_b);
+                encode_ntt_mul_shared_mem(ctx, &mut encoder, workspace1, &workspace1.digit_rns, &galois_key.keys_a[limb_idx][digit_idx], &workspace1.term_a);
+
+                // NTT multiplies for ciphertext 2 (GPU can run these in parallel!)
+                encode_ntt_mul_shared_mem(ctx, &mut encoder, workspace2, &workspace2.digit_rns, &galois_key.keys_b[limb_idx][digit_idx], &workspace2.term_b);
+                encode_ntt_mul_shared_mem(ctx, &mut encoder, workspace2, &workspace2.digit_rns, &galois_key.keys_a[limb_idx][digit_idx], &workspace2.term_a);
+
+                // Accumulate for both
+                encode_add_inplace(ctx, &mut encoder, workspace1, &workspace1.ks_c0_acc, &workspace1.term_b);
+                encode_add_inplace(ctx, &mut encoder, workspace1, &workspace1.ks_c1_acc, &workspace1.term_a);
+                encode_add_inplace(ctx, &mut encoder, workspace2, &workspace2.ks_c0_acc, &workspace2.term_b);
+                encode_add_inplace(ctx, &mut encoder, workspace2, &workspace2.ks_c1_acc, &workspace2.term_a);
+            }
+        }
+
+        // Combine for both
+        encode_add(ctx, &mut encoder, &workspace1.c0_auto, &workspace1.ks_c0_acc, &workspace1.temp_c0);
+        encode_add(ctx, &mut encoder, &workspace2.c0_auto, &workspace2.ks_c0_acc, &workspace2.temp_c0);
+        encoder.copy_buffer_to_buffer(&workspace1.ks_c1_acc, 0, &workspace1.temp_c1, 0, workspace1.rns_buffer_size);
+        encoder.copy_buffer_to_buffer(&workspace2.ks_c1_acc, 0, &workspace2.temp_c1, 0, workspace2.rns_buffer_size);
+
+        // Add rotated to current for both
+        encode_add(ctx, &mut encoder, &workspace1.current_c0, &workspace1.temp_c0, &workspace1.c0_auto);
+        encode_add(ctx, &mut encoder, &workspace1.current_c1, &workspace1.temp_c1, &workspace1.c1_auto);
+        encode_add(ctx, &mut encoder, &workspace2.current_c0, &workspace2.temp_c0, &workspace2.c0_auto);
+        encode_add(ctx, &mut encoder, &workspace2.current_c1, &workspace2.temp_c1, &workspace2.c1_auto);
+
+        // Swap for both
+        encoder.copy_buffer_to_buffer(&workspace1.c0_auto, 0, &workspace1.current_c0, 0, workspace1.rns_buffer_size);
+        encoder.copy_buffer_to_buffer(&workspace1.c1_auto, 0, &workspace1.current_c1, 0, workspace1.rns_buffer_size);
+        encoder.copy_buffer_to_buffer(&workspace2.c0_auto, 0, &workspace2.current_c0, 0, workspace2.rns_buffer_size);
+        encoder.copy_buffer_to_buffer(&workspace2.c1_auto, 0, &workspace2.current_c1, 0, workspace2.rns_buffer_size);
+
+        ctx.queue.submit(Some(encoder.finish()));
+    }
+
+    // Create result buffers for both
+    let result1_c0 = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("result1_c0"), size: workspace1.rns_buffer_size,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+    let result1_c1 = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("result1_c1"), size: workspace1.rns_buffer_size,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+    let result2_c0 = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("result2_c0"), size: workspace2.rns_buffer_size,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+    let result2_c1 = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("result2_c1"), size: workspace2.rns_buffer_size,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST, mapped_at_creation: false,
+    });
+
+    // Final copy for both
+    {
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("final_copy_2x") });
+        encoder.copy_buffer_to_buffer(&workspace1.current_c0, 0, &result1_c0, 0, workspace1.rns_buffer_size);
+        encoder.copy_buffer_to_buffer(&workspace1.current_c1, 0, &result1_c1, 0, workspace1.rns_buffer_size);
+        encoder.copy_buffer_to_buffer(&workspace2.current_c0, 0, &result2_c0, 0, workspace2.rns_buffer_size);
+        encoder.copy_buffer_to_buffer(&workspace2.current_c1, 0, &result2_c1, 0, workspace2.rns_buffer_size);
+        ctx.queue.submit(Some(encoder.finish()));
+    }
+
+    ctx.device.poll(wgpu::Maintain::Wait);
+
+    Ok((
+        GpuRnsCiphertext { c0: GpuRnsPoly { buffer: result1_c0, n, num_moduli }, c1: GpuRnsPoly { buffer: result1_c1, n, num_moduli } },
+        GpuRnsCiphertext { c0: GpuRnsPoly { buffer: result2_c0, n, num_moduli }, c1: GpuRnsPoly { buffer: result2_c1, n, num_moduli } },
+    ))
 }
 
 /// Encodes automorphism σ_k into the command encoder (no submit).
@@ -4380,9 +4679,9 @@ fn encode_shared_mem_ntt(
     }
 }
 
-/// Encodes NTT multiply using shared memory NTT (3 dispatches per modulus instead of ~40).
+/// Encodes NTT multiply using shared memory NTT with pre-allocated bind groups.
+/// Uses 4 dispatches per modulus (2 forward NTT + pointwise + inverse NTT).
 /// Performs: result = INTT(NTT(a) * NTT(b))
-#[allow(dead_code)]
 fn encode_ntt_mul_shared_mem(
     ctx: &GpuRotationContext,
     encoder: &mut wgpu::CommandEncoder,
@@ -4409,13 +4708,29 @@ fn encode_ntt_mul_shared_mem(
             workspace.single_mod_size,
         );
 
-        // Forward NTT on a (1 dispatch instead of ~16)
-        encode_shared_mem_ntt(ctx, encoder, &workspace.ntt_a_twisted[mod_idx], mod_idx, false);
+        // Forward NTT on a (1 dispatch, pre-allocated bind group)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("shared_mem_ntt_fwd_a"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&ctx.shared_mem_ntt_fwd_pipeline);
+            pass.set_bind_group(0, &workspace.shared_mem_ntt_fwd_a_bg[mod_idx], &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
 
-        // Forward NTT on b (1 dispatch instead of ~16)
-        encode_shared_mem_ntt(ctx, encoder, &workspace.ntt_b_twisted[mod_idx], mod_idx, false);
+        // Forward NTT on b (1 dispatch, pre-allocated bind group)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("shared_mem_ntt_fwd_b"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&ctx.shared_mem_ntt_fwd_pipeline);
+            pass.set_bind_group(0, &workspace.shared_mem_ntt_fwd_b_bg[mod_idx], &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
 
-        // Pointwise multiply (reuse existing)
+        // Pointwise multiply (pre-allocated bind group)
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("pointwise"),
@@ -4427,8 +4742,16 @@ fn encode_ntt_mul_shared_mem(
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
-        // Inverse NTT on result (1 dispatch instead of ~16)
-        encode_shared_mem_ntt(ctx, encoder, &workspace.ntt_result[mod_idx], mod_idx, true);
+        // Inverse NTT on result (1 dispatch, pre-allocated bind group)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("shared_mem_ntt_inv_result"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&ctx.shared_mem_ntt_inv_pipeline);
+            pass.set_bind_group(0, &workspace.shared_mem_ntt_inv_result_bg[mod_idx], &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
 
         // Copy result back
         encoder.copy_buffer_to_buffer(

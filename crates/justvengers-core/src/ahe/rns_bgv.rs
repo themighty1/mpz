@@ -126,17 +126,10 @@ impl RnsKeyPair {
     }
 
     /// Generates a key pair for Goldilocks field with slot packing.
+    ///
+    /// Uses 4 RNS moduli (~240 bit q) for sufficient noise budget.
     pub fn generate_goldilocks<R: Rng>(rng: &mut R) -> Self {
         let params = RnsBgvParams::goldilocks();
-        Self::generate(&params, rng)
-    }
-
-    /// Generates a key pair for Goldilocks with extended modulus (testing only).
-    ///
-    /// Uses 4 RNS moduli for tests requiring larger noise budget.
-    /// Production code should use `generate_goldilocks()`.
-    pub fn generate_goldilocks_test<R: Rng>(rng: &mut R) -> Self {
-        let params = RnsBgvParams::goldilocks_test();
         Self::generate(&params, rng)
     }
 }
@@ -2073,9 +2066,9 @@ mod rns_bgv_tests {
     #[test]
     fn test_mul_plaintext_slots_goldilocks() {
         // Test slot-wise multiplication with Goldilocks modulus
-        // Uses 4 moduli (goldilocks_test) for higher noise budget than prod IT-PAC
+        // Uses Goldilocks params with 4 moduli for sufficient noise budget
         let mut rng = Prg::from_seed(Block::ZERO);
-        let keypair = RnsKeyPair::generate_goldilocks_test(&mut rng);
+        let keypair = RnsKeyPair::generate_goldilocks(&mut rng);
         let t = GOLDILOCKS;
 
         // Encrypt slot values
@@ -2353,9 +2346,9 @@ mod rns_bgv_tests {
 
     #[test]
     fn test_slot_packed_goldilocks() {
-        // Uses 4 moduli (goldilocks_test) for higher noise budget than prod IT-PAC
+        // Uses Goldilocks params with 4 moduli for sufficient noise budget
         let mut rng = Prg::from_seed(Block::ZERO);
-        let keypair = RnsKeyPair::generate_goldilocks_test(&mut rng);
+        let keypair = RnsKeyPair::generate_goldilocks(&mut rng);
         let t = GOLDILOCKS;
         let lambda = 12345u64;
 
@@ -2829,5 +2822,144 @@ mod rns_bgv_tests {
             "Goldilocks lane sum (R=128): result[0]={}, expected={}",
             result[0], expected_lane_sum
         );
+    }
+
+    #[test]
+    fn test_sum_slots_masked_to_single_slot() {
+        // Test sum_slots followed by masking to keep sum only in slot 0
+        // Uses Goldilocks params with 4 moduli for sufficient noise budget
+        let mut rng = Prg::from_seed(Block::ZERO);
+        let keypair = RnsKeyPair::generate_goldilocks(&mut rng);
+        let n = 8192;
+
+        // Create slot values: 1, 2, 3, ..., 100, then zeros
+        let mut slots = vec![0u64; n];
+        for i in 0..100 {
+            slots[i] = (i + 1) as u64;
+        }
+        let expected_sum: u64 = (1..=100u64).sum(); // 5050
+
+        let ct = RnsCiphertext::encrypt_slots(&keypair.pk, &slots, &mut rng);
+
+        // Generate Galois keys and sum all slots
+        let gks = RnsGaloisKeys::generate(&keypair.sk, &mut rng);
+        let ct_summed = ct.sum_slots(&gks);
+
+        // After sum_slots, all slots contain the sum
+        let summed_slots = ct_summed.decrypt_slots(&keypair.sk);
+        println!("After sum_slots: slot[0]={}, slot[1]={}, expected={}",
+                 summed_slots[0], summed_slots[1], expected_sum);
+        assert_eq!(summed_slots[0], expected_sum, "slot 0 should have sum");
+        assert_eq!(summed_slots[1], expected_sum, "slot 1 should also have sum before masking");
+
+        // Now mask: keep only slot 0, zero out all others
+        let mut mask = vec![0u64; n];
+        mask[0] = 1; // Only slot 0 gets multiplied by 1
+        let ct_masked = ct_summed.mul_plaintext_slots(&mask);
+
+        // Verify: slot 0 has the sum, all others are 0
+        let masked_slots = ct_masked.decrypt_slots(&keypair.sk);
+        println!("After masking: slot[0]={}, slot[1]={}", masked_slots[0], masked_slots[1]);
+        assert_eq!(masked_slots[0], expected_sum, "slot 0 should still have sum after masking");
+
+        // Check that other slots are zero
+        for i in 1..n {
+            assert_eq!(masked_slots[i], 0, "slot {} should be zero after masking, got {}", i, masked_slots[i]);
+        }
+
+        println!("sum_slots + mask test passed: slot 0 = {}, others = 0", masked_slots[0]);
+    }
+
+    #[test]
+    fn test_sum_slots_masked_plus_add() {
+        // Test sum_slots + masking + adding 80 ciphertexts
+        // Result: slot 0=0, slot 1=sum, slots 2-81=values from 80 CTs, others=0
+        // Uses Goldilocks params with 4 moduli for sufficient noise budget
+        let mut rng = Prg::from_seed(Block::ZERO);
+        let keypair = RnsKeyPair::generate_goldilocks(&mut rng);
+        let n = 8192;
+
+        // Create slot values: 1, 2, 3, ..., 100, then zeros
+        let mut slots = vec![0u64; n];
+        for i in 0..100 {
+            slots[i] = (i + 1) as u64;
+        }
+        let expected_sum: u64 = (1..=100u64).sum(); // 5050
+
+        let ct = RnsCiphertext::encrypt_slots(&keypair.pk, &slots, &mut rng);
+
+        // Generate Galois keys and sum all slots
+        let gks = RnsGaloisKeys::generate(&keypair.sk, &mut rng);
+        let ct_summed = ct.sum_slots(&gks);
+
+        // Mask: keep only slot 1, zero out all others
+        let mut mask = vec![0u64; n];
+        mask[1] = 1;
+        let ct_masked = ct_summed.mul_plaintext_slots(&mask);
+
+        // Create 80 ciphertexts with values in slots 2, 3, 4, ..., 81
+        let num_cts = 80;
+        let mut expected_slot_values = vec![0u64; 2 + num_cts];
+        expected_slot_values[1] = expected_sum;
+
+        let mut ct_result = ct_masked;
+        let mut total_encrypt_time = std::time::Duration::ZERO;
+        let mut total_add_time = std::time::Duration::ZERO;
+
+        for slot_idx in 2..=(1 + num_cts) {
+            let value = (slot_idx * 1000 + 123) as u64; // e.g., 2123, 3123, ...
+            expected_slot_values[slot_idx] = value;
+
+            let mut slot_vals = vec![0u64; n];
+            slot_vals[slot_idx] = value;
+
+            let t0 = std::time::Instant::now();
+            let ct_additional = RnsCiphertext::encrypt_slots(&keypair.pk, &slot_vals, &mut rng);
+            total_encrypt_time += t0.elapsed();
+
+            let t1 = std::time::Instant::now();
+            ct_result = ct_result.add(&ct_additional);
+            total_add_time += t1.elapsed();
+        }
+
+        println!("Timing for {} CTs:", num_cts);
+        println!("  Total encrypt time: {:?}", total_encrypt_time);
+        println!("  Total add time: {:?}", total_add_time);
+        println!("  Per-CT encrypt: {:?}", total_encrypt_time / num_cts as u32);
+        println!("  Per-CT add: {:?}", total_add_time / num_cts as u32);
+
+        // Verify the result
+        let result_slots = ct_result.decrypt_slots(&keypair.sk);
+        println!("After adding {} CTs:", num_cts);
+        for i in 0..(2 + num_cts) {
+            println!("  slot[{}] = {}", i, result_slots[i]);
+        }
+
+        // Check slot 0 is zero
+        assert_eq!(result_slots[0], 0,
+                   "slot 0 should be 0, got {}", result_slots[0]);
+
+        // Check slot 1 has the sum
+        assert_eq!(result_slots[1], expected_sum,
+                   "slot 1 should have sum {}, got {}", expected_sum, result_slots[1]);
+
+        // Check slots 2-(1+num_cts) have their expected values
+        for slot_idx in 2..=(1 + num_cts) {
+            assert_eq!(result_slots[slot_idx], expected_slot_values[slot_idx],
+                       "slot {} should have {}, got {}",
+                       slot_idx, expected_slot_values[slot_idx], result_slots[slot_idx]);
+        }
+
+        // Check that remaining slots are zero
+        for i in (2 + num_cts)..n {
+            assert_eq!(result_slots[i], 0,
+                       "slot {} should be zero, got {}", i, result_slots[i]);
+        }
+
+        println!("sum_slots + mask + {} CT additions test passed!", num_cts);
+        println!("  slot[0]=0, slot[1]={} (sum)", result_slots[1]);
+        for i in 2..=(1 + num_cts) {
+            println!("  slot[{}]={}", i, result_slots[i]);
+        }
     }
 }
