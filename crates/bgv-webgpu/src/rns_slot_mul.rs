@@ -1106,6 +1106,186 @@ impl RnsSlotMulGpu {
         Ok((c0_results, c1_results))
     }
 
+    /// Performs batched INTT (inverse NTT) mod Goldilocks.
+    ///
+    /// This is useful for polynomial interpolation: given evaluation values,
+    /// compute polynomial coefficients via INTT.
+    ///
+    /// # Arguments
+    /// * `values` - Batch of evaluation vectors, shape [num_batches][n]
+    ///
+    /// # Returns
+    /// Coefficient vectors [num_batches][n] representing the interpolated polynomials
+    pub fn batched_intt(&self, values: &[Vec<u64>]) -> Result<Vec<Vec<u64>>, GpuError> {
+        let num_batches = values.len();
+        if num_batches == 0 {
+            return Ok(Vec::new());
+        }
+
+        let n = self.params.n;
+
+        // Validate input sizes
+        for (i, v) in values.iter().enumerate() {
+            if v.len() != n {
+                return Err(GpuError::InvalidParams(format!(
+                    "Batch {} has {} elements, expected {}",
+                    i,
+                    v.len(),
+                    n
+                )));
+            }
+        }
+
+        // Upload input values
+        let values_flat: Vec<u32> = values
+            .iter()
+            .flat_map(|batch| batch.iter().flat_map(|&x| [x as u32, (x >> 32) as u32]))
+            .collect();
+
+        let values_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("intt_input"),
+                contents: bytemuck::cast_slice(&values_flat),
+                usage: BufferUsages::STORAGE,
+            });
+
+        // Allocate output buffer
+        let output_size = num_batches * n * 2 * std::mem::size_of::<u32>();
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("intt_output"),
+            size: output_size as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Create batch params
+        let batch_params = GpuBatchParams {
+            n: n as u32,
+            log_n: (n as u32).trailing_zeros(),
+            num_batches: num_batches as u32,
+            num_moduli: 1, // Not used for INTT
+        };
+
+        let batch_params_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("intt_batch_params"),
+                    contents: bytemuck::bytes_of(&batch_params),
+                    usage: BufferUsages::UNIFORM,
+                });
+
+        // Execute INTT (slot_encode pipeline does INTT mod t)
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("batched_intt encoder"),
+            });
+
+        {
+            let bind_group_layout = self.slot_encode_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("batched_intt bind group"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: batch_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: values_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.plaintext_twiddles_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.plaintext_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("batched_intt pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.slot_encode_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(num_batches as u32, 1, 1);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Read back results
+        self.read_batch(&output_buffer, num_batches, n)
+    }
+
+    /// Reads back a batch of polynomials from GPU buffer.
+    fn read_batch(
+        &self,
+        buffer: &Buffer,
+        num_batches: usize,
+        n: usize,
+    ) -> Result<Vec<Vec<u64>>, GpuError> {
+        let size = (num_batches * n * 2 * std::mem::size_of::<u32>()) as u64;
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("read encoder"),
+            });
+
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+        self.queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging.slice(..size);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.recv()
+            .map_err(|e| GpuError::ExecutionFailed(e.to_string()))?
+            .map_err(|e| GpuError::ExecutionFailed(format!("Buffer mapping failed: {:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let u32_data: &[u32] = bytemuck::cast_slice(&data);
+
+        // Reshape: [num_batches][n]
+        let mut results = Vec::with_capacity(num_batches);
+        for batch_idx in 0..num_batches {
+            let mut coeffs = Vec::with_capacity(n);
+            for elem_idx in 0..n {
+                let idx = (batch_idx * n + elem_idx) * 2;
+                let val = (u32_data[idx] as u64) | ((u32_data[idx + 1] as u64) << 32);
+                coeffs.push(val);
+            }
+            results.push(coeffs);
+        }
+
+        drop(data);
+        staging.unmap();
+
+        Ok(results)
+    }
+
     fn upload_rns_poly(&self, poly: &[Vec<u64>]) -> Result<Buffer, GpuError> {
         let flat: Vec<u32> = poly
             .iter()
