@@ -22,7 +22,6 @@
 
 use rand::Rng;
 
-#[cfg(feature = "ntt")]
 use mpz_fields::goldilocks::{Goldilocks, GOLDILOCKS};
 
 /// A constraint linking output of one repetition to input of the next.
@@ -161,7 +160,6 @@ pub fn generate_masking_pair<Rn: Rng>(
     }
 
     // Use NTT for Goldilocks (O(n log n)), fallback to Lagrange otherwise
-    #[cfg(feature = "ntt")]
     if modulus == GOLDILOCKS && n.is_power_of_two() {
         // Inverse NTT: evaluations at roots of unity -> coefficients
         let mut r1_padded: Vec<Goldilocks> = r1_values
@@ -259,7 +257,6 @@ pub fn verify_soldering_constraint_with_reps(
 ) -> bool {
     // For Goldilocks with NTT, use NTT to evaluate at all points at once (O(n log n))
     // instead of Horner for each point (O(n²) total)
-    #[cfg(feature = "ntt")]
     if modulus == GOLDILOCKS && eval_points.len().is_power_of_two() {
         // Check if eval_points are NTT roots (ω^0, ω^1, ..., ω^(n-1))
         // If so, NTT(coeffs) gives evaluations directly
@@ -381,7 +378,6 @@ pub fn interpolate(points: &[u64], values: &[u64], modulus: u64) -> Vec<u64> {
     }
 
     // Use Goldilocks NTT-optimized interpolation when available
-    #[cfg(feature = "ntt")]
     if modulus == GOLDILOCKS {
         return Goldilocks::interpolate_u64(points, values);
     }

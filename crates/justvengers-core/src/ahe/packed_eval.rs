@@ -34,10 +34,13 @@ use super::rns_bgv::{RnsCiphertext, RnsKeyPair, RnsPublicKey, RnsSecretKey};
 use super::params::RnsBgvParams;
 use rand::Rng;
 
+#[cfg(feature = "rayon")]
+use rayon::prelude::*;
+
 /// Encrypted powers for packed evaluation.
 ///
 /// Contains a single ciphertext with Λ^i in slot i.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PackedEncryptedPowers {
     /// Ciphertext with [Λ^0, Λ^1, ..., Λ^{n-1}] in slots.
     pub powers_ct: RnsCiphertext,
@@ -197,6 +200,39 @@ impl<'a> PackedProverEvaluator<'a> {
         }
 
         packed_cts
+    }
+
+    /// Evaluates multiple row pairs in parallel using rayon.
+    ///
+    /// For B+C rows, returns (B+C)/2 packed ciphertexts.
+    /// Each row pair is processed independently in parallel.
+    ///
+    /// # Arguments
+    /// * `rows` - All row coefficients (must have even length)
+    /// * `vole_blinders` - VOLE blinders for each row
+    #[cfg(feature = "rayon")]
+    pub fn evaluate_all_rows_parallel(
+        &self,
+        rows: &[Vec<u64>],
+        vole_blinders: &[u64],
+    ) -> Vec<RnsCiphertext> {
+        assert_eq!(rows.len(), vole_blinders.len());
+        assert!(rows.len() % 2 == 0, "number of rows must be even");
+
+        // Create pairs of (row0, row1, blinder0, blinder1) for parallel processing
+        let pairs: Vec<_> = (0..rows.len())
+            .step_by(2)
+            .map(|i| (&rows[i], &rows[i + 1], vole_blinders[i], vole_blinders[i + 1]))
+            .collect();
+
+        pairs
+            .par_iter()
+            .map(|(row0, row1, blinder0, blinder1)| {
+                // Each thread gets its own RNG
+                let mut rng = rand::rng();
+                self.evaluate_and_pack_2way(row0, row1, *blinder0, *blinder1, &mut rng)
+            })
+            .collect()
     }
 }
 

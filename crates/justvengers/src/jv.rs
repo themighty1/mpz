@@ -297,10 +297,8 @@ pub struct JVSetupMessage {
     // === Packed evaluation fields (rotation-free) ===
     /// Packed encrypted powers [Λ^0, ..., Λ^{n-1}] in slots.
     /// Prover uses slot-wise mul + blinding, verifier sums in clear.
-    #[serde(skip)]
     pub packed_powers: Option<PackedEncryptedPowers>,
     /// RNS public key for encryption.
-    #[serde(skip)]
     pub rns_public_key: Option<RnsPublicKey>,
 }
 
@@ -823,8 +821,11 @@ impl<const R: usize> JVProver<R> {
         self.eval_points = Some(eval_points.to_vec());
         // Compute and cache vanishing polynomial Z(X) = Π(X - αⱼ) over actual R points
         // (not NTT-padded points which may extend beyond R)
+        let vanish_start = std::time::Instant::now();
         let actual_eval_points = &eval_points[..R.min(eval_points.len())];
         self.vanishing_poly = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
+        eprintln!("[commit] vanishing_poly: {:?} ({} points)", vanish_start.elapsed(), actual_eval_points.len());
+
         self.vole_pool = Some(vole_pool);
         // Store seed commitment and public key for later verification
         self.ahe_seed_commitment = Some(setup_msg.ahe_seed_commitment);
@@ -835,9 +836,11 @@ impl<const R: usize> JVProver<R> {
         self.rns_public_key = setup_msg.rns_public_key.clone();
 
         // Create INTT context for Goldilocks
+        let intt_start = std::time::Instant::now();
         if self.modulus == GOLDILOCKS {
             self.intt_context = Some(InttContext::new(eval_points.len()));
         }
+        eprintln!("[commit] INTT context: {:?}", intt_start.elapsed());
 
         // For each wire position, interpolate R values to get polynomial
         let witness_len = self.witnesses[0].len();
@@ -845,6 +848,7 @@ impl<const R: usize> JVProver<R> {
         self.itpac_commitments = Vec::with_capacity(witness_len);
         self.ciphertext_commitments = Vec::with_capacity(witness_len);
 
+        let interp_start = std::time::Instant::now();
         for pos in 0..witness_len {
             // Collect values at this position across all repetitions
             let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
@@ -853,6 +857,7 @@ impl<const R: usize> JVProver<R> {
             let poly = self.interpolate_values(&values, eval_points);
             self.wire_polynomials.push(poly);
         }
+        eprintln!("[commit] interpolation: {:?} ({} polys)", interp_start.elapsed(), witness_len);
 
         // Use packed evaluation with slot-wise mul + blinding (rotation-free)
         // P evaluates each polynomial, blinds with VOLE blinder, and 2-way packs pairs
@@ -865,6 +870,7 @@ impl<const R: usize> JVProver<R> {
         let t = packed_powers.t;
 
         // Create IT-PAC commitments with VOLE masking and collect blinders
+        let itpac_start = std::time::Instant::now();
         let vole_pool = self.vole_pool.as_mut().ok_or(JVProverError::MissingSetupData)?;
         let mut vole_blinders = Vec::with_capacity(num_polys);
         for poly in &self.wire_polynomials {
@@ -876,8 +882,10 @@ impl<const R: usize> JVProver<R> {
                 vole_blinders.push(0);
             }
         }
+        eprintln!("[commit] IT-PAC creation: {:?} ({} polys)", itpac_start.elapsed(), num_polys);
 
         // Pad polynomials to slot size n
+        let pad_start = std::time::Instant::now();
         let mut padded_rows: Vec<Vec<u64>> = self.wire_polynomials.iter()
             .map(|poly| {
                 let mut row = poly.clone();
@@ -885,6 +893,7 @@ impl<const R: usize> JVProver<R> {
                 row
             })
             .collect();
+        eprintln!("[commit] padding: {:?}", pad_start.elapsed());
 
         // Ensure even number of rows for 2-way packing
         if padded_rows.len() % 2 != 0 {
@@ -894,19 +903,29 @@ impl<const R: usize> JVProver<R> {
 
         // Use PackedProverEvaluator for slot-wise mul + blinding + 2-way packing
         let evaluator = PackedProverEvaluator::new(packed_powers);
-        let mut rng = Prg::from_seed(Block::ZERO);
-        let packed_cts = evaluator.evaluate_all_rows(&padded_rows, &vole_blinders, &mut rng);
+        let bgv_start = std::time::Instant::now();
+        #[cfg(feature = "rayon")]
+        let packed_cts = evaluator.evaluate_all_rows_parallel(&padded_rows, &vole_blinders);
+        #[cfg(not(feature = "rayon"))]
+        let packed_cts = {
+            let mut rng = Prg::from_seed(Block::ZERO);
+            evaluator.evaluate_all_rows(&padded_rows, &vole_blinders, &mut rng)
+        };
+        eprintln!("[commit] BGV evaluate_all_rows: {:?} ({} rows -> {} packed)", bgv_start.elapsed(), padded_rows.len(), packed_cts.len());
 
         // Store packed ciphertexts
+        let store_start = std::time::Instant::now();
         for ct in packed_cts {
             let ct_commitment = Self::compute_rns_ciphertext_commitment(&ct);
             self.ciphertext_commitments.push(ct_commitment);
             self.rns_ciphertexts.push(ct);
         }
+        eprintln!("[commit] store CTs: {:?}", store_start.elapsed());
 
         // Step 9 from paper: Commit to input polynomial coefficients as IT-MACs
         // This is required for extractability - the witness must be extractable,
         // which is not possible from unopened polynomials alone.
+        let input_mac_start = std::time::Instant::now();
         self.input_coeff_macs = Vec::with_capacity(self.num_inputs);
 
         for input_idx in 0..self.num_inputs {
@@ -922,6 +941,7 @@ impl<const R: usize> JVProver<R> {
 
             self.input_coeff_macs.push(coeff_macs);
         }
+        eprintln!("[commit] input MACs: {:?} ({} inputs)", input_mac_start.elapsed(), self.num_inputs);
 
         self.phase = JVProverPhase::Committed;
 
@@ -1058,8 +1078,13 @@ impl<const R: usize> JVProver<R> {
 
         // Use PackedProverEvaluator for slot-wise mul + blinding + 2-way packing
         let evaluator = PackedProverEvaluator::new(packed_powers);
-        let mut rng = Prg::from_seed(Block::ZERO);
-        let packed_cts = evaluator.evaluate_all_rows(&padded_rows, &vole_blinders, &mut rng);
+        #[cfg(feature = "rayon")]
+        let packed_cts = evaluator.evaluate_all_rows_parallel(&padded_rows, &vole_blinders);
+        #[cfg(not(feature = "rayon"))]
+        let packed_cts = {
+            let mut rng = Prg::from_seed(Block::ZERO);
+            evaluator.evaluate_all_rows(&padded_rows, &vole_blinders, &mut rng)
+        };
 
         // Store packed ciphertexts
         for ct in packed_cts {
@@ -1539,6 +1564,7 @@ impl<const R: usize> JVProver<R> {
         // H(X) = Σᵢ γⁱ·(f_a_i(X)·f_b_i(X) - f_c_i(X))
         // Q(X) = H(X) / Z(X)
 
+        let lpzk_poly_start = std::time::Instant::now();
         let mut h_poly = vec![0u64]; // Start with zero polynomial
         gamma_power = 1u64;
 
@@ -1580,13 +1606,16 @@ impl<const R: usize> JVProver<R> {
 
             gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
         }
+        eprintln!("[lpzk] poly accumulation: {:?} ({} mults, h_poly deg={})", lpzk_poly_start.elapsed(), num_mults, h_poly.len());
 
         // Use cached vanishing polynomial Z(X) = Π(X - αⱼ)
         let z_poly = self.vanishing_poly.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
 
         // Compute quotient Q(X) = H(X) / Z(X)
+        let div_start = std::time::Instant::now();
         let (quotient_coeffs, _remainder) = poly_div(&h_poly, z_poly, self.modulus);
+        eprintln!("[lpzk] poly_div: {:?} (h_deg={}, z_deg={})", div_start.elapsed(), h_poly.len(), z_poly.len());
 
         self.phase = JVProverPhase::Done;
 
@@ -1931,6 +1960,14 @@ impl<const R: usize> JVVerifier<R> {
         &self.topology_vectors
     }
 
+    /// Preloads an RNS keypair to skip key generation in setup.
+    ///
+    /// This is useful for benchmarks where we want to reuse a pre-generated
+    /// keypair from a fixture file.
+    pub fn set_preloaded_rns_keypair(&mut self, keypair: RnsKeyPair) {
+        self.rns_keypair = Some(keypair);
+    }
+
     /// Sets up the verifier.
     pub fn setup<Rn: Rng>(
         &mut self,
@@ -1974,9 +2011,15 @@ impl<const R: usize> JVVerifier<R> {
         let ahe_keypair = self.ahe_keypair.as_ref().expect("AHE keypair should be initialized");
         let ahe_public_key = ahe_keypair.pk.clone();
 
-        // Generate RNS BGV keypair and packed encrypted powers (rotation-free)
-        let rns_params = RnsBgvParams::goldilocks();
-        let rns_keypair = RnsKeyPair::generate(&rns_params, rng);
+        // Use preloaded keypair if available, otherwise generate
+        let rns_keypair = if let Some(ref kp) = self.rns_keypair {
+            kp.clone()
+        } else {
+            let rns_params = RnsBgvParams::goldilocks();
+            let kp = RnsKeyPair::generate(&rns_params, rng);
+            self.rns_keypair = Some(kp.clone());
+            kp
+        };
 
         // Generate packed encrypted powers [Λ^0, ..., Λ^{n-1}] in slots
         let packed_powers = PackedEncryptedPowers::generate(
@@ -1985,7 +2028,6 @@ impl<const R: usize> JVVerifier<R> {
             rng,
         );
 
-        self.rns_keypair = Some(rns_keypair.clone());
         self.packed_powers = Some(packed_powers.clone());
 
         self.phase = JVVerifierPhase::Setup;
@@ -3148,7 +3190,22 @@ pub(crate) fn poly_scale(a: &[u64], scalar: u64, modulus: u64) -> Vec<u64> {
 
 /// Computes the vanishing polynomial Z(X) = Π(X - αᵢ) for evaluation points.
 pub(crate) fn compute_vanishing_poly(eval_points: &[u64], modulus: u64) -> Vec<u64> {
-    // Z(X) = (X - α₁)(X - α₂)...(X - αᵣ)
+    let r = eval_points.len();
+
+    // Fast path for Goldilocks NTT roots: Z(X) = X^R - 1
+    // This works when eval_points are ω^0, ω^1, ..., ω^{R-1} (roots of unity)
+    if modulus == GOLDILOCKS && r.is_power_of_two() {
+        // Check if these are NTT roots (first point should be 1 = ω^0)
+        if eval_points.first() == Some(&1) {
+            // Z(X) = X^R - 1 = -1 + 0*X + 0*X² + ... + 1*X^R
+            let mut z = vec![0u64; r + 1];
+            z[0] = modulus - 1; // -1 mod p
+            z[r] = 1;           // X^R coefficient
+            return z;
+        }
+    }
+
+    // Fallback: naive O(R²) approach for non-NTT points
     let mut z = vec![1u64]; // Start with constant 1
 
     for &alpha in eval_points {

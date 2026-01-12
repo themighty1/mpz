@@ -1,10 +1,14 @@
-//! JV VM benchmark with fresh witness each iteration.
+//! JV VM benchmark.
 //!
 //! Run with: cargo bench -p mpz-justvengers --bench vm_bench
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use futures::executor::block_on;
 use serio::{SinkExt, stream::IoStreamExt};
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+use std::sync::LazyLock;
 
 use mpz_justvengers::{
     Circuit, CircuitBatch, SolderingConstraint,
@@ -14,12 +18,39 @@ use mpz_justvengers::{
     MKCommitmentMessage,
     extract_verifier_shares_from_pool,
 };
-use mpz_justvengers_core::{VolePool, GlobalKey};
+use mpz_justvengers_core::{VolePool, GlobalKey, RnsKeyPair, RnsPublicKey, RnsSecretKey};
 use mpz_common::context::{Context, recording_st_context_with_limit, replay_st_context};
 
 use mpz_core::{prg::Prg, Block};
 use mpz_fields::goldilocks::GOLDILOCKS;
 use rand::{Rng, SeedableRng};
+
+/// Path to BGV fixture directory.
+const FIXTURE_DIR: &str = "bgv_fixtures";
+
+/// Lazily-loaded RNS keypair from fixture files.
+static PRELOADED_RNS_KEYPAIR: LazyLock<Option<RnsKeyPair>> = LazyLock::new(|| {
+    load_rns_keypair_from_fixture().ok()
+});
+
+/// Loads RNS keypair from fixture files.
+fn load_rns_keypair_from_fixture() -> Result<RnsKeyPair, Box<dyn std::error::Error>> {
+    let fixture_path = Path::new(FIXTURE_DIR);
+
+    // Load secret key
+    let mut sk_file = File::open(fixture_path.join("secret_key.bin"))?;
+    let mut sk_bytes = Vec::new();
+    sk_file.read_to_end(&mut sk_bytes)?;
+    let sk: RnsSecretKey = bincode::deserialize(&sk_bytes)?;
+
+    // Load public key
+    let mut pk_file = File::open(fixture_path.join("public_key.bin"))?;
+    let mut pk_bytes = Vec::new();
+    pk_file.read_to_end(&mut pk_bytes)?;
+    let pk: RnsPublicKey = bincode::deserialize(&pk_bytes)?;
+
+    Ok(RnsKeyPair { sk, pk })
+}
 
 const MODULUS: u64 = GOLDILOCKS;
 const NUM_BRANCHES: usize = 60;
@@ -162,8 +193,11 @@ async fn run_protocol_record_verifier<const R: usize>(
     prover.setup(circuits, inputs_per_rep).unwrap();
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
-    // Setup verifier
+    // Setup verifier with preloaded keypair if available
     let mut verifier = JVVerifier::<R>::new(MODULUS, &mut rng);
+    if let Some(ref keypair) = *PRELOADED_RNS_KEYPAIR {
+        verifier.set_preloaded_rns_keypair(keypair.clone());
+    }
     let setup_msg = verifier.setup(circuits, &mut rng).unwrap();
     verifier.setup_soldering(soldering_constraints.to_vec()).unwrap();
 
@@ -290,29 +324,46 @@ async fn run_prover_with_replay<const R: usize>(
     soldering_constraints: &[SolderingConstraint],
     recorded_messages: &JVRecordedMessages,
 ) {
+    let total_start = std::time::Instant::now();
     let mut rng = Prg::from_seed(Block::ZERO);
 
     // Fresh prover with fresh witness setup each iteration
+    let new_start = std::time::Instant::now();
     let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    eprintln!("[bench] new: {:?}", new_start.elapsed());
+
+    let setup_start = std::time::Instant::now();
     prover.setup(circuits, inputs_per_rep).unwrap();
+    eprintln!("[bench] setup: {:?}", setup_start.elapsed());
+
+    let solder_setup_start = std::time::Instant::now();
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
+    eprintln!("[bench] setup_soldering: {:?}", solder_setup_start.elapsed());
 
     // Create VOLE pool for IT-PAC commitments
+    let vole_start = std::time::Instant::now();
     let vole_pool = VolePool::generate(&recorded_messages.global_key, recorded_messages.circuit_size * 2, &mut rng);
+    eprintln!("[bench] vole_pool: {:?}", vole_start.elapsed());
 
     // V → P: Setup message
     let setup_msg: JVSetupMessage = ctx.io_mut().expect_next().await.unwrap();
 
     // P → V: Commitment
+    let commit_start = std::time::Instant::now();
     let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
+    eprintln!("[bench] commit: {:?}", commit_start.elapsed());
     ctx.io_mut().send(commitment).await.unwrap();
 
     // P → V: MK polynomial commitment
+    let mk_start = std::time::Instant::now();
     let mk_commitment = prover.commit_mk_polynomials().unwrap();
+    eprintln!("[bench] commit_mk: {:?}", mk_start.elapsed());
     ctx.io_mut().send(mk_commitment).await.unwrap();
 
     // P → V: Soldering commitment
+    let solder_start = std::time::Instant::now();
     let soldering_commit = prover.commit_soldering().unwrap();
+    eprintln!("[bench] commit_soldering: {:?}", solder_start.elapsed());
     ctx.io_mut().send(soldering_commit).await.unwrap();
 
     // V → P: Chi challenge
@@ -325,12 +376,16 @@ async fn run_prover_with_replay<const R: usize>(
     let soldering_challenge: Option<SolderingChallengeMessage> = ctx.io_mut().expect_next().await.unwrap();
 
     // P → V: Disclosure
+    let disclose_start = std::time::Instant::now();
     let disclosure = prover.disclose(chi, &topology_vectors).unwrap();
+    eprintln!("[bench] disclose: {:?}", disclose_start.elapsed());
     ctx.io_mut().send(disclosure).await.unwrap();
 
     // P → V: Soldering reveal
     if let Some(ref challenge) = soldering_challenge {
+        let reveal_start = std::time::Instant::now();
         let reveal = prover.reveal_soldering_aggregated(challenge).unwrap();
+        eprintln!("[bench] reveal_soldering: {:?}", reveal_start.elapsed());
         ctx.io_mut().send(reveal).await.unwrap();
     }
 
@@ -341,32 +396,114 @@ async fn run_prover_with_replay<const R: usize>(
     let gamma: u64 = ctx.io_mut().expect_next().await.unwrap();
 
     // P → V: Open message
+    let open_start = std::time::Instant::now();
     let open_msg = prover.open(rho, gamma, &topology_vectors).unwrap();
+    eprintln!("[bench] open: {:?}", open_start.elapsed());
     ctx.io_mut().send(open_msg).await.unwrap();
 
     // P → V: IT-PAC opening
+    let itpac_start = std::time::Instant::now();
     let itpac_open_msg = prover.open_itpac().unwrap();
+    eprintln!("[bench] open_itpac: {:?}", itpac_start.elapsed());
     ctx.io_mut().send(itpac_open_msg).await.unwrap();
 
     // P → V: LPZK proof
+    let lpzk_start = std::time::Instant::now();
     let lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
+    eprintln!("[bench] lpzk: {:?}", lpzk_start.elapsed());
     ctx.io_mut().send(lpzk_proof).await.unwrap();
+
+    eprintln!("[bench] TOTAL: {:?}", total_start.elapsed());
 }
 
 // ============================================================================
 // Benchmarks
 // ============================================================================
 
-/// Benchmark JV VM prover with fresh witness each iteration.
+/// Benchmark JV VM prover.
 fn bench_jv_vm(c: &mut Criterion) {
     let mut group = c.benchmark_group("jv_vm");
     group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(5));
+    group.warm_up_time(std::time::Duration::from_secs(2));
 
     let circuits = create_vm_circuit_batch();
     let sample_circuit = circuits.get(0).unwrap();
     let state_offset = state_output_offset(sample_circuit);
     let soldering = create_soldering_constraints(state_offset);
     let num_mults = sample_circuit.num_mults();
+
+    // 128 reps
+    {
+        const R: usize = 128;
+        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
+
+        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+        group.throughput(Throughput::Elements(total_mults));
+
+        group.bench_function("128_reps", |b| {
+            b.iter(|| {
+                block_on(async {
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
+                });
+                black_box(())
+            });
+        });
+    }
+
+    // 256 reps
+    {
+        const R: usize = 256;
+        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
+
+        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+        group.throughput(Throughput::Elements(total_mults));
+
+        group.bench_function("256_reps", |b| {
+            b.iter(|| {
+                block_on(async {
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
+                });
+                black_box(())
+            });
+        });
+    }
+
+    // 512 reps
+    {
+        const R: usize = 512;
+        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
+
+        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+        group.throughput(Throughput::Elements(total_mults));
+
+        group.bench_function("512_reps", |b| {
+            b.iter(|| {
+                block_on(async {
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
+                });
+                black_box(())
+            });
+        });
+    }
 
     // 1K reps
     {
@@ -379,7 +516,7 @@ fn bench_jv_vm(c: &mut Criterion) {
         let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
         group.throughput(Throughput::Elements(total_mults));
 
-        group.bench_function(BenchmarkId::new("fresh_witness", "1K"), |b| {
+        group.bench_function("1K_reps", |b| {
             b.iter(|| {
                 block_on(async {
                     let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
@@ -403,7 +540,55 @@ fn bench_jv_vm(c: &mut Criterion) {
         let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
         group.throughput(Throughput::Elements(total_mults));
 
-        group.bench_function(BenchmarkId::new("fresh_witness", "2K"), |b| {
+        group.bench_function("2K_reps", |b| {
+            b.iter(|| {
+                block_on(async {
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
+                });
+                black_box(())
+            });
+        });
+    }
+
+    // 4K reps
+    {
+        const R: usize = 4096;
+        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
+
+        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+        group.throughput(Throughput::Elements(total_mults));
+
+        group.bench_function("4K_reps", |b| {
+            b.iter(|| {
+                block_on(async {
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
+                });
+                black_box(())
+            });
+        });
+    }
+
+    // 8K reps (max for 8192 slots)
+    {
+        const R: usize = 8192;
+        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
+
+        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+        group.throughput(Throughput::Elements(total_mults));
+
+        group.bench_function("8K_reps", |b| {
             b.iter(|| {
                 block_on(async {
                     let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
@@ -419,5 +604,43 @@ fn bench_jv_vm(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark 8K reps only (for quick testing).
+fn bench_jv_vm_8k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jv_vm");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(5));
+    group.warm_up_time(std::time::Duration::from_secs(2));
+
+    let circuits = create_vm_circuit_batch();
+    let sample_circuit = circuits.get(0).unwrap();
+    let state_offset = state_output_offset(sample_circuit);
+    let soldering = create_soldering_constraints(state_offset);
+    let num_mults = sample_circuit.num_mults();
+
+    const R: usize = 8192;
+    let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+    let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+    println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
+
+    let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+    group.throughput(Throughput::Elements(total_mults));
+
+    group.bench_function("8K_reps", |b| {
+        b.iter(|| {
+            block_on(async {
+                let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                run_prover_with_replay::<R>(
+                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                ).await;
+            });
+            black_box(())
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(benches, bench_jv_vm);
-criterion_main!(benches);
+criterion_group!(benches_8k, bench_jv_vm_8k);
+criterion_main!(benches, benches_8k);
