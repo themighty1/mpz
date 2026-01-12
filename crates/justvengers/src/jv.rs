@@ -72,6 +72,10 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::ops::{Add, Mul, Sub};
 
+// Optional GPU acceleration for slot multiplication
+#[cfg(feature = "gpu")]
+use bgv_webgpu::{RnsSlotMulGpu, RnsBatchParams};
+
 // ============================================================================
 // Goldilocks IT-MAC Field
 // ============================================================================
@@ -899,8 +903,31 @@ impl<const R: usize> JVProver<R> {
         // Result: (B+C)/2 ciphertexts regardless of number of chunks.
         let bgv_start = std::time::Instant::now();
 
-        // Step 1: Evaluate each polynomial across all chunks and collapse (parallel)
-        #[cfg(feature = "rayon")]
+        // GPU-accelerated path: batch all slot multiplications per chunk
+        #[cfg(feature = "gpu")]
+        let mut collapsed_cts: Vec<RnsCiphertext> = {
+            let gpu_result = Self::commit_gpu_batched(
+                &self.wire_polynomials,
+                packed_powers_chunks,
+                &vole_blinders,
+                slot_count,
+                t,
+            );
+
+            match gpu_result {
+                Ok(cts) => {
+                    eprintln!("[commit] GPU path succeeded");
+                    cts
+                }
+                Err(e) => {
+                    eprintln!("[commit] GPU path failed ({}), falling back to CPU", e);
+                    Self::commit_cpu_parallel(&self.wire_polynomials, packed_powers_chunks, &vole_blinders, slot_count)
+                }
+            }
+        };
+
+        // CPU path with rayon parallelization
+        #[cfg(all(feature = "rayon", not(feature = "gpu")))]
         let mut collapsed_cts: Vec<RnsCiphertext> = {
             use rayon::prelude::*;
             self.wire_polynomials
@@ -942,7 +969,8 @@ impl<const R: usize> JVProver<R> {
                 .collect()
         };
 
-        #[cfg(not(feature = "rayon"))]
+        // Sequential CPU path (no rayon, no GPU)
+        #[cfg(not(any(feature = "rayon", feature = "gpu")))]
         let mut collapsed_cts: Vec<RnsCiphertext> = {
             let mut result = Vec::with_capacity(num_polys);
             for (poly_idx, poly) in self.wire_polynomials.iter().enumerate() {
@@ -1023,6 +1051,209 @@ impl<const R: usize> JVProver<R> {
             num_polynomials: witness_len,
             ciphertext_commitments: self.ciphertext_commitments.clone(),
         })
+    }
+
+    /// GPU-accelerated batched slot multiplication.
+    ///
+    /// Uses multi-CT batching to process chunks in GPU dispatches,
+    /// splitting into groups if buffer size exceeds GPU limits.
+    #[cfg(feature = "gpu")]
+    fn commit_gpu_batched(
+        wire_polynomials: &[Vec<u64>],
+        packed_powers_chunks: &[PackedEncryptedPowers],
+        vole_blinders: &[u64],
+        slot_count: usize,
+        t: u64,
+    ) -> Result<Vec<RnsCiphertext>, String> {
+        let num_polys = wire_polynomials.len();
+        let num_chunks = packed_powers_chunks.len();
+
+        // Get reference CT for params
+        let ref_ct = &packed_powers_chunks[0].powers_ct;
+        let rns_params = ref_ct.rns_params().clone();
+        let bgv_params = ref_ct.bgv_params().clone();
+
+        // Initialize GPU context with actual RNS moduli from ciphertext
+        let moduli = rns_params.moduli();
+        let roots = rns_params.roots();
+        let k = moduli.len();
+        let moduli_with_psi: Vec<(u64, u64)> = moduli
+            .iter()
+            .zip(roots.iter())
+            .map(|(&q, &psi)| (q, psi))
+            .collect();
+
+        let gpu_params = RnsBatchParams::from_moduli(slot_count, t, &moduli_with_psi)
+            .ok_or("Failed to create GPU params")?;
+        let gpu_ctx =
+            RnsSlotMulGpu::new(gpu_params).map_err(|e| format!("GPU init failed: {}", e))?;
+
+        let gpu_start = std::time::Instant::now();
+
+        // Calculate max chunks per GPU call to stay under buffer limits
+        // Buffer size = total_batches * k * n * 2 * 4 bytes
+        // Max buffer = 256MB = 268,435,456 bytes (WebGPU limit)
+        const MAX_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+        let bytes_per_batch = k * slot_count * 2 * 4; // k moduli * n elements * 2 u32s * 4 bytes
+        let max_batches = MAX_BUFFER_SIZE / bytes_per_batch;
+        let max_chunks_per_call = (max_batches / num_polys).max(1);
+
+        // Precompute NTT for all CTs
+        let all_cts_ntt: Vec<(Vec<Vec<u64>>, Vec<Vec<u64>>)> = packed_powers_chunks
+            .iter()
+            .map(|chunk| chunk.powers_ct.precompute_ntt())
+            .collect();
+
+        // Process in groups of chunks that fit in GPU buffer
+        let mut chunk_results: Vec<Vec<RnsCiphertext>> = vec![Vec::new(); num_chunks];
+        let mut gpu_calls = 0;
+
+        for group_start in (0..num_chunks).step_by(max_chunks_per_call) {
+            let group_end = (group_start + max_chunks_per_call).min(num_chunks);
+
+            // Collect CTs for this group
+            let group_c0_ntt: Vec<Vec<Vec<u64>>> = (group_start..group_end)
+                .map(|i| all_cts_ntt[i].0.clone())
+                .collect();
+            let group_c1_ntt: Vec<Vec<Vec<u64>>> = (group_start..group_end)
+                .map(|i| all_cts_ntt[i].1.clone())
+                .collect();
+
+            // Prepare plaintext slots for this group
+            let group_plaintext_slots: Vec<Vec<u64>> = (group_start..group_end)
+                .flat_map(|chunk_idx| {
+                    let chunk_start = chunk_idx * slot_count;
+                    wire_polynomials.iter().map(move |poly| {
+                        let mut coeffs = vec![0u64; slot_count];
+                        for (i, &coeff) in
+                            poly.iter().skip(chunk_start).take(slot_count).enumerate()
+                        {
+                            coeffs[i] = coeff % t;
+                        }
+                        coeffs
+                    })
+                })
+                .collect();
+
+            // GPU dispatch for this group
+            let (group_c0_results, group_c1_results) = gpu_ctx
+                .mul_batched_multi_ct(
+                    &group_c0_ntt,
+                    &group_c1_ntt,
+                    &group_plaintext_slots,
+                    num_polys,
+                )
+                .map_err(|e| format!("GPU mul failed: {}", e))?;
+
+            gpu_calls += 1;
+
+            // Reshape and store results for this group
+            for (local_chunk_idx, global_chunk_idx) in (group_start..group_end).enumerate() {
+                let mut cts: Vec<RnsCiphertext> = Vec::with_capacity(num_polys);
+                for poly_idx in 0..num_polys {
+                    let batch_idx = local_chunk_idx * num_polys + poly_idx;
+                    let ct = RnsCiphertext::from_residues(
+                        group_c0_results[batch_idx].clone(),
+                        group_c1_results[batch_idx].clone(),
+                        rns_params.clone(),
+                        bgv_params.clone(),
+                    );
+
+                    // Apply blinding for chunk 0
+                    let ct = if global_chunk_idx == 0 {
+                        let vole_blinder = vole_blinders[poly_idx];
+                        let mut rng = Prg::from_seed(Block::from([poly_idx as u8; 16]));
+
+                        // Generate blinders: r_0..r_{n-2} random, r_{n-1} = vole_u - sum
+                        let mut blinders = Vec::with_capacity(slot_count);
+                        let mut sum: u128 = 0;
+                        for _ in 0..slot_count - 1 {
+                            let r: u64 = rng.random::<u64>() % t;
+                            blinders.push(r);
+                            sum = (sum + r as u128) % t as u128;
+                        }
+                        let r_last = ((vole_blinder as u128 + t as u128 - sum) % t as u128) as u64;
+                        blinders.push(r_last);
+
+                        ct.sub_plaintext_slots(&blinders)
+                    } else {
+                        ct
+                    };
+
+                    cts.push(ct);
+                }
+                chunk_results[global_chunk_idx] = cts;
+            }
+        }
+
+        eprintln!(
+            "[commit] GPU multi-CT slot mul: {:?} ({} polys x {} chunks, {} GPU calls, max {} chunks/call)",
+            gpu_start.elapsed(),
+            num_polys,
+            num_chunks,
+            gpu_calls,
+            max_chunks_per_call
+        );
+
+        // Collapse across chunks (add CTs per polynomial)
+        let collapse_start = std::time::Instant::now();
+        let collapsed_cts: Vec<RnsCiphertext> = (0..num_polys)
+            .map(|poly_idx| {
+                let mut acc = chunk_results[0][poly_idx].clone();
+                for chunk_idx in 1..num_chunks {
+                    acc = acc.add(&chunk_results[chunk_idx][poly_idx]);
+                }
+                acc
+            })
+            .collect();
+        eprintln!("[commit] GPU collapse: {:?}", collapse_start.elapsed());
+
+        Ok(collapsed_cts)
+    }
+
+    /// CPU parallel slot multiplication (rayon fallback).
+    #[cfg(feature = "rayon")]
+    fn commit_cpu_parallel(
+        wire_polynomials: &[Vec<u64>],
+        packed_powers_chunks: &[PackedEncryptedPowers],
+        vole_blinders: &[u64],
+        slot_count: usize,
+    ) -> Vec<RnsCiphertext> {
+        use rayon::prelude::*;
+
+        wire_polynomials
+            .par_iter()
+            .enumerate()
+            .map(|(poly_idx, poly)| {
+                let vole_blinder = vole_blinders[poly_idx];
+                let mut collapsed_ct: Option<RnsCiphertext> = None;
+
+                for (chunk_idx, powers_chunk) in packed_powers_chunks.iter().enumerate() {
+                    let chunk_start = chunk_idx * slot_count;
+
+                    let mut coeffs = vec![0u64; slot_count];
+                    for (i, &coeff) in poly.iter().skip(chunk_start).take(slot_count).enumerate() {
+                        coeffs[i] = coeff;
+                    }
+
+                    let evaluator = PackedProverEvaluator::new(powers_chunk);
+
+                    let chunk_ct = if chunk_idx == 0 {
+                        let mut rng = Prg::from_seed(Block::from([poly_idx as u8; 16]));
+                        evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
+                    } else {
+                        evaluator.evaluate_row_unblinded(&coeffs)
+                    };
+
+                    collapsed_ct = Some(match collapsed_ct {
+                        None => chunk_ct,
+                        Some(acc) => acc.add(&chunk_ct),
+                    });
+                }
+
+                collapsed_ct.unwrap()
+            })
+            .collect()
     }
 
     /// Generates the input coefficient IT-MAC commitment message.

@@ -17,9 +17,14 @@ mod shader;
 mod rotation_shader_legacy;
 mod rotation_shader;
 pub mod rotation;
+pub mod slot_mul_shader;
+pub mod slot_mul_gpu;
+pub mod rns_slot_mul;
 
 pub use error::GpuError;
 pub use gpu::{GpuContext, GpuCiphertext, SlotWiseMul};
+pub use slot_mul_gpu::{SlotMulGpuContext, TwiddleFactors};
+pub use rns_slot_mul::{RnsSlotMulGpu, RnsBatchParams, RnsModulusNttData, PlaintextNttData};
 pub use rotation::{
     GpuRotationContext, GpuRnsParams, GpuRnsPoly, GpuRnsCiphertext, NttModulusData,
     GpuGaloisKey, GpuGaloisKeys, gpu_automorphism, gpu_add, gpu_ntt_mul, gpu_ntt_mul_single,

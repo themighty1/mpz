@@ -21,21 +21,17 @@ rand_chacha = { workspace = true }
 futures = { workspace = true }
 blake3 = { workspace = true }
 
-# KZG polynomial commitments
-ark-ff = { workspace = true }
-ark-ec = { workspace = true }
-ark-poly = { workspace = true }
-ark-bls12-381 = { workspace = true }
-ark-serialize = { workspace = true }
-
 # Optional parallelization
 rayon = { workspace = true, optional = true }
 
+# Optional GPU acceleration
+bgv-webgpu = { path = "../bgv-webgpu", optional = true }
+
 [features]
 default = []
-kzg = []
 rayon = ["mpz-justvengers-core/rayon", "dep:rayon"]
 mersenne = ["mpz-fields/mersenne"]
+gpu = ["dep:bgv-webgpu", "rayon"]  # GPU path requires rayon for fallback
 
 [dev-dependencies]
 rand = { workspace = true }
@@ -50,6 +46,10 @@ rayon = { workspace = true }
 
 [[bench]]
 name = "vm_bench"
+harness = false
+
+[[bench]]
+name = "prover_breakdown_bench"
 harness = false
 
 [[bin]]
