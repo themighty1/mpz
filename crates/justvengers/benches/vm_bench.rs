@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo bench -p mpz-justvengers --bench vm_bench
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use futures::executor::block_on;
 use serio::{SinkExt, stream::IoStreamExt};
 use std::fs::File;
@@ -433,151 +433,7 @@ fn bench_jv_vm(c: &mut Criterion) {
     let soldering = create_soldering_constraints(state_offset);
     let num_mults = sample_circuit.num_mults();
 
-    // 128 reps
-    {
-        const R: usize = 128;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
-
-        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function("128_reps", |b| {
-            b.iter(|| {
-                block_on(async {
-                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
-                    run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
-                    ).await;
-                });
-                black_box(())
-            });
-        });
-    }
-
-    // 256 reps
-    {
-        const R: usize = 256;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
-
-        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function("256_reps", |b| {
-            b.iter(|| {
-                block_on(async {
-                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
-                    run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
-                    ).await;
-                });
-                black_box(())
-            });
-        });
-    }
-
-    // 512 reps
-    {
-        const R: usize = 512;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
-
-        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function("512_reps", |b| {
-            b.iter(|| {
-                block_on(async {
-                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
-                    run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
-                    ).await;
-                });
-                black_box(())
-            });
-        });
-    }
-
-    // 1K reps
-    {
-        const R: usize = 1000;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
-
-        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function("1K_reps", |b| {
-            b.iter(|| {
-                block_on(async {
-                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
-                    run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
-                    ).await;
-                });
-                black_box(())
-            });
-        });
-    }
-
-    // 2K reps
-    {
-        const R: usize = 2000;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
-
-        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function("2K_reps", |b| {
-            b.iter(|| {
-                block_on(async {
-                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
-                    run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
-                    ).await;
-                });
-                black_box(())
-            });
-        });
-    }
-
-    // 4K reps
-    {
-        const R: usize = 4096;
-        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
-        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
-
-        println!("[JV {} reps] Communication: total {:.1} KB", R, recorded_bytes.len() as f64 / 1024.0);
-
-        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
-        group.throughput(Throughput::Elements(total_mults));
-
-        group.bench_function("4K_reps", |b| {
-            b.iter(|| {
-                block_on(async {
-                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
-                    run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
-                    ).await;
-                });
-                black_box(())
-            });
-        });
-    }
-
-    // 8K reps (max for 8192 slots)
+    // 8K reps (1 chunk)
     {
         const R: usize = 8192;
         let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
@@ -589,6 +445,102 @@ fn bench_jv_vm(c: &mut Criterion) {
         group.throughput(Throughput::Elements(total_mults));
 
         group.bench_function("8K_reps", |b| {
+            b.iter(|| {
+                block_on(async {
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
+                });
+                black_box(())
+            });
+        });
+    }
+
+    // 16K reps (2 chunks)
+    {
+        const R: usize = 16384;
+        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+        println!("[JV {} reps] Communication: total {:.1} KB (2 chunks)", R, recorded_bytes.len() as f64 / 1024.0);
+
+        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+        group.throughput(Throughput::Elements(total_mults));
+
+        group.bench_function("16K_reps", |b| {
+            b.iter(|| {
+                block_on(async {
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
+                });
+                black_box(())
+            });
+        });
+    }
+
+    // 32K reps (4 chunks)
+    {
+        const R: usize = 32768;
+        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+        println!("[JV {} reps] Communication: total {:.1} KB (4 chunks)", R, recorded_bytes.len() as f64 / 1024.0);
+
+        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+        group.throughput(Throughput::Elements(total_mults));
+
+        group.bench_function("32K_reps", |b| {
+            b.iter(|| {
+                block_on(async {
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
+                });
+                black_box(())
+            });
+        });
+    }
+
+    // 64K reps (8 chunks)
+    {
+        const R: usize = 65536;
+        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+        println!("[JV {} reps] Communication: total {:.1} KB (8 chunks)", R, recorded_bytes.len() as f64 / 1024.0);
+
+        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+        group.throughput(Throughput::Elements(total_mults));
+
+        group.bench_function("64K_reps", |b| {
+            b.iter(|| {
+                block_on(async {
+                    let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                    run_prover_with_replay::<R>(
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    ).await;
+                });
+                black_box(())
+            });
+        });
+    }
+
+    // 128K reps (16 chunks)
+    {
+        const R: usize = 131072;
+        let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+        let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+        println!("[JV {} reps] Communication: total {:.1} KB (16 chunks)", R, recorded_bytes.len() as f64 / 1024.0);
+
+        let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+        group.throughput(Throughput::Elements(total_mults));
+
+        group.bench_function("128K_reps", |b| {
             b.iter(|| {
                 block_on(async {
                     let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
@@ -641,6 +593,158 @@ fn bench_jv_vm_8k(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark 16K reps only (for quick testing with 2 chunks).
+fn bench_jv_vm_16k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jv_vm");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(5));
+    group.warm_up_time(std::time::Duration::from_secs(2));
+
+    let circuits = create_vm_circuit_batch();
+    let sample_circuit = circuits.get(0).unwrap();
+    let state_offset = state_output_offset(sample_circuit);
+    let soldering = create_soldering_constraints(state_offset);
+    let num_mults = sample_circuit.num_mults();
+
+    const R: usize = 16384;
+    let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+    let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+    println!("[JV {} reps] Communication: total {:.1} KB (2 chunks)", R, recorded_bytes.len() as f64 / 1024.0);
+
+    let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+    group.throughput(Throughput::Elements(total_mults));
+
+    group.bench_function("16K_reps", |b| {
+        b.iter(|| {
+            block_on(async {
+                let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                run_prover_with_replay::<R>(
+                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                ).await;
+            });
+            black_box(())
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark 32K reps only (for quick testing with 4 chunks).
+fn bench_jv_vm_32k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jv_vm");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(5));
+    group.warm_up_time(std::time::Duration::from_secs(2));
+
+    let circuits = create_vm_circuit_batch();
+    let sample_circuit = circuits.get(0).unwrap();
+    let state_offset = state_output_offset(sample_circuit);
+    let soldering = create_soldering_constraints(state_offset);
+    let num_mults = sample_circuit.num_mults();
+
+    const R: usize = 32768;
+    let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+    let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+    println!("[JV {} reps] Communication: total {:.1} KB (4 chunks)", R, recorded_bytes.len() as f64 / 1024.0);
+
+    let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+    group.throughput(Throughput::Elements(total_mults));
+
+    group.bench_function("32K_reps", |b| {
+        b.iter(|| {
+            block_on(async {
+                let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                run_prover_with_replay::<R>(
+                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                ).await;
+            });
+            black_box(())
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark 64K reps only (for quick testing with 8 chunks).
+fn bench_jv_vm_64k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jv_vm");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(10));
+    group.warm_up_time(std::time::Duration::from_secs(3));
+
+    let circuits = create_vm_circuit_batch();
+    let sample_circuit = circuits.get(0).unwrap();
+    let state_offset = state_output_offset(sample_circuit);
+    let soldering = create_soldering_constraints(state_offset);
+    let num_mults = sample_circuit.num_mults();
+
+    const R: usize = 65536;
+    let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+    let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+    println!("[JV {} reps] Communication: total {:.1} KB (8 chunks)", R, recorded_bytes.len() as f64 / 1024.0);
+
+    let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+    group.throughput(Throughput::Elements(total_mults));
+
+    group.bench_function("64K_reps", |b| {
+        b.iter(|| {
+            block_on(async {
+                let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                run_prover_with_replay::<R>(
+                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                ).await;
+            });
+            black_box(())
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark 128K reps only (for quick testing with 16 chunks).
+fn bench_jv_vm_128k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jv_vm");
+    group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(15));
+    group.warm_up_time(std::time::Duration::from_secs(5));
+
+    let circuits = create_vm_circuit_batch();
+    let sample_circuit = circuits.get(0).unwrap();
+    let state_offset = state_output_offset(sample_circuit);
+    let soldering = create_soldering_constraints(state_offset);
+    let num_mults = sample_circuit.num_mults();
+
+    const R: usize = 131072;
+    let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
+    let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
+
+    println!("[JV {} reps] Communication: total {:.1} KB (16 chunks)", R, recorded_bytes.len() as f64 / 1024.0);
+
+    let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
+    group.throughput(Throughput::Elements(total_mults));
+
+    group.bench_function("128K_reps", |b| {
+        b.iter(|| {
+            block_on(async {
+                let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
+                run_prover_with_replay::<R>(
+                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                ).await;
+            });
+            black_box(())
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(benches, bench_jv_vm);
 criterion_group!(benches_8k, bench_jv_vm_8k);
-criterion_main!(benches, benches_8k);
+criterion_group!(benches_16k, bench_jv_vm_16k);
+criterion_group!(benches_32k, bench_jv_vm_32k);
+criterion_group!(benches_64k, bench_jv_vm_64k);
+criterion_group!(benches_128k, bench_jv_vm_128k);
+criterion_main!(benches, benches_8k, benches_16k, benches_32k, benches_64k, benches_128k);

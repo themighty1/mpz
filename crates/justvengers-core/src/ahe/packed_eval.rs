@@ -58,12 +58,39 @@ impl PackedEncryptedPowers {
     /// * `lambda` - Secret evaluation point Λ
     /// * `rng` - Random number generator
     pub fn generate<R: Rng>(pk: &RnsPublicKey, lambda: u64, rng: &mut R) -> Self {
+        Self::generate_with_offset(pk, lambda, 0, rng)
+    }
+
+    /// Generates encrypted powers [Λ^offset, Λ^{offset+1}, ..., Λ^{offset+n-1}] in slots.
+    ///
+    /// This is used to support R > slot_count by generating multiple chunks:
+    /// - Chunk 0: [Λ^0, ..., Λ^{n-1}]
+    /// - Chunk 1: [Λ^n, ..., Λ^{2n-1}]
+    /// - etc.
+    ///
+    /// # Arguments
+    /// * `pk` - Public key for encryption
+    /// * `lambda` - Secret evaluation point Λ
+    /// * `offset` - Starting power index (must be multiple of n)
+    /// * `rng` - Random number generator
+    pub fn generate_with_offset<R: Rng>(
+        pk: &RnsPublicKey,
+        lambda: u64,
+        offset: usize,
+        rng: &mut R,
+    ) -> Self {
         let n = pk.params().n;
         let t = pk.params().t;
 
-        // Compute powers: [Λ^0, Λ^1, ..., Λ^{n-1}]
+        // Compute Λ^offset first
+        let mut base_power = 1u64;
+        for _ in 0..offset {
+            base_power = ((base_power as u128 * lambda as u128) % t as u128) as u64;
+        }
+
+        // Compute powers: [Λ^offset, Λ^{offset+1}, ..., Λ^{offset+n-1}]
         let mut powers = Vec::with_capacity(n);
-        let mut power = 1u64;
+        let mut power = base_power;
         for _ in 0..n {
             powers.push(power);
             power = ((power as u128 * lambda as u128) % t as u128) as u64;
@@ -77,6 +104,36 @@ impl PackedEncryptedPowers {
             num_powers: n,
             t,
         }
+    }
+
+    /// Generates multiple chunks of encrypted powers for R > slot_count.
+    ///
+    /// Returns ceil(total_powers / slot_count) ciphertexts.
+    ///
+    /// # Arguments
+    /// * `pk` - Public key for encryption
+    /// * `lambda` - Secret evaluation point Λ
+    /// * `total_powers` - Total number of powers needed (typically R.next_power_of_two())
+    /// * `rng` - Random number generator
+    pub fn generate_chunks<R: Rng>(
+        pk: &RnsPublicKey,
+        lambda: u64,
+        total_powers: usize,
+        rng: &mut R,
+    ) -> Vec<Self> {
+        let slot_count = pk.params().n;
+        let num_chunks = (total_powers + slot_count - 1) / slot_count;
+
+        (0..num_chunks)
+            .map(|chunk_idx| {
+                Self::generate_with_offset(pk, lambda, chunk_idx * slot_count, rng)
+            })
+            .collect()
+    }
+
+    /// Returns the power offset for this chunk (0 for first chunk).
+    pub fn slot_count(&self) -> usize {
+        self.num_powers
     }
 }
 
@@ -143,6 +200,23 @@ impl<'a> PackedProverEvaluator<'a> {
 
         // Step 3: Subtract blinders from ciphertext
         ct_products.sub_plaintext_slots(&blinders)
+    }
+
+    /// Evaluates a single row without blinding (just slot-wise multiplication).
+    ///
+    /// Used for chunk 1+ when collapsing multiple chunks - only chunk 0 needs blinding.
+    ///
+    /// # Arguments
+    /// * `coeffs` - Polynomial coefficients [c_0, c_1, ..., c_{n-1}]
+    ///
+    /// # Returns
+    /// Ciphertext with products: Enc([c_i * Λ^i])
+    pub fn evaluate_row_unblinded(&self, coeffs: &[u64]) -> RnsCiphertext {
+        let n = self.encrypted_powers.num_powers;
+        assert_eq!(coeffs.len(), n, "coeffs must match number of slots");
+
+        // Just slot-wise multiplication: Enc(c_i * Λ^i)
+        self.encrypted_powers.powers_ct.mul_plaintext_slots(coeffs)
     }
 
     /// Evaluates two rows and packs them into a single ciphertext.

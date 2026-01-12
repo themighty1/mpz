@@ -64,6 +64,7 @@ use mpz_justvengers_core::{
 use mpz_justvengers_core::{
     RnsBgvParams, RnsCiphertext, RnsKeyPair, RnsPublicKey, RnsSecretKey,
     PackedEncryptedPowers, PackedProverEvaluator,
+    CiphertextPacking, // trait needed for pack_2way method
 };
 
 use mpz_core::{prg::Prg, Block};
@@ -295,9 +296,16 @@ pub struct JVSetupMessage {
     pub ahe_seed_commitment: [u8; 32],
 
     // === Packed evaluation fields (rotation-free) ===
-    /// Packed encrypted powers [Λ^0, ..., Λ^{n-1}] in slots.
+    /// Packed encrypted powers chunks for slot-wise evaluation.
+    ///
+    /// For R ≤ 8K: single chunk with [Λ^0, ..., Λ^{n-1}]
+    /// For R > 8K: multiple chunks:
+    ///   - Chunk 0: [Λ^0, ..., Λ^{n-1}]
+    ///   - Chunk 1: [Λ^n, ..., Λ^{2n-1}]
+    ///   - etc.
+    ///
     /// Prover uses slot-wise mul + blinding, verifier sums in clear.
-    pub packed_powers: Option<PackedEncryptedPowers>,
+    pub packed_powers_chunks: Option<Vec<PackedEncryptedPowers>>,
     /// RNS public key for encryption.
     pub rns_public_key: Option<RnsPublicKey>,
 }
@@ -582,8 +590,9 @@ pub struct JVProver<const R: usize> {
     // Packed evaluation fields (rotation-free)
     // ==========================================================================
 
-    /// Packed encrypted powers [Λ^0, ..., Λ^{n-1}] in slots.
-    packed_powers: Option<PackedEncryptedPowers>,
+    /// Packed encrypted powers chunks for R > slot_count support.
+    /// For R ≤ 8K: single chunk. For R > 8K: multiple chunks.
+    packed_powers_chunks: Option<Vec<PackedEncryptedPowers>>,
     /// RNS public key for encryption.
     rns_public_key: Option<RnsPublicKey>,
     /// RNS ciphertexts from packed evaluation (for opening).
@@ -643,7 +652,7 @@ impl<const R: usize> JVProver<R> {
             // Cached vanishing polynomial
             vanishing_poly: None,
             // Packed evaluation fields
-            packed_powers: None,
+            packed_powers_chunks: None,
             rns_public_key: None,
             rns_ciphertexts: Vec::new(),
         }
@@ -832,7 +841,7 @@ impl<const R: usize> JVProver<R> {
         self.ahe_public_key = Some(setup_msg.ahe_public_key.clone());
 
         // Store packed evaluation fields
-        self.packed_powers = setup_msg.packed_powers.clone();
+        self.packed_powers_chunks = setup_msg.packed_powers_chunks.clone();
         self.rns_public_key = setup_msg.rns_public_key.clone();
 
         // Create INTT context for Goldilocks
@@ -862,12 +871,13 @@ impl<const R: usize> JVProver<R> {
         // Use packed evaluation with slot-wise mul + blinding (rotation-free)
         // P evaluates each polynomial, blinds with VOLE blinder, and 2-way packs pairs
         // V decrypts and sums in the clear to get f(Λ) - u
-        let packed_powers = self.packed_powers.as_ref()
+        let packed_powers_chunks = self.packed_powers_chunks.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
 
         let num_polys = self.wire_polynomials.len();
-        let n = packed_powers.num_powers;
-        let t = packed_powers.t;
+        let num_chunks = packed_powers_chunks.len();
+        let slot_count = packed_powers_chunks[0].num_powers;
+        let t = packed_powers_chunks[0].t;
 
         // Create IT-PAC commitments with VOLE masking and collect blinders
         let itpac_start = std::time::Instant::now();
@@ -884,43 +894,107 @@ impl<const R: usize> JVProver<R> {
         }
         eprintln!("[commit] IT-PAC creation: {:?} ({} polys)", itpac_start.elapsed(), num_polys);
 
-        // Pad polynomials to slot size n
-        let pad_start = std::time::Instant::now();
-        let mut padded_rows: Vec<Vec<u64>> = self.wire_polynomials.iter()
-            .map(|poly| {
-                let mut row = poly.clone();
-                row.resize(n, 0);
-                row
-            })
-            .collect();
-        eprintln!("[commit] padding: {:?}", pad_start.elapsed());
-
-        // Ensure even number of rows for 2-way packing
-        if padded_rows.len() % 2 != 0 {
-            padded_rows.push(vec![0u64; n]);
-            vole_blinders.push(0);
-        }
-
-        // Use PackedProverEvaluator for slot-wise mul + blinding + 2-way packing
-        let evaluator = PackedProverEvaluator::new(packed_powers);
+        // For R > slot_count, we evaluate each polynomial across multiple chunks
+        // and collapse them by homomorphic addition before 2-way packing.
+        // Result: (B+C)/2 ciphertexts regardless of number of chunks.
         let bgv_start = std::time::Instant::now();
-        #[cfg(feature = "rayon")]
-        let packed_cts = evaluator.evaluate_all_rows_parallel(&padded_rows, &vole_blinders);
-        #[cfg(not(feature = "rayon"))]
-        let packed_cts = {
-            let mut rng = Prg::from_seed(Block::ZERO);
-            evaluator.evaluate_all_rows(&padded_rows, &vole_blinders, &mut rng)
-        };
-        eprintln!("[commit] BGV evaluate_all_rows: {:?} ({} rows -> {} packed)", bgv_start.elapsed(), padded_rows.len(), packed_cts.len());
 
-        // Store packed ciphertexts
-        let store_start = std::time::Instant::now();
-        for ct in packed_cts {
-            let ct_commitment = Self::compute_rns_ciphertext_commitment(&ct);
-            self.ciphertext_commitments.push(ct_commitment);
-            self.rns_ciphertexts.push(ct);
+        // Step 1: Evaluate each polynomial across all chunks and collapse (parallel)
+        #[cfg(feature = "rayon")]
+        let mut collapsed_cts: Vec<RnsCiphertext> = {
+            use rayon::prelude::*;
+            self.wire_polynomials
+                .par_iter()
+                .enumerate()
+                .map(|(poly_idx, poly)| {
+                    let vole_blinder = vole_blinders[poly_idx];
+                    let mut collapsed_ct: Option<RnsCiphertext> = None;
+
+                    for (chunk_idx, powers_chunk) in packed_powers_chunks.iter().enumerate() {
+                        let chunk_start = chunk_idx * slot_count;
+
+                        // Extract coefficients for this chunk, padding with 0 if needed
+                        let mut coeffs = vec![0u64; slot_count];
+                        for (i, &coeff) in poly.iter().skip(chunk_start).take(slot_count).enumerate() {
+                            coeffs[i] = coeff;
+                        }
+
+                        let evaluator = PackedProverEvaluator::new(powers_chunk);
+
+                        // Chunk 0: evaluate with blinding
+                        // Chunks 1+: evaluate without blinding (just slot-wise mul)
+                        let chunk_ct = if chunk_idx == 0 {
+                            let mut rng = Prg::from_seed(Block::from([poly_idx as u8; 16]));
+                            evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
+                        } else {
+                            evaluator.evaluate_row_unblinded(&coeffs)
+                        };
+
+                        // Collapse by adding to accumulated CT
+                        collapsed_ct = Some(match collapsed_ct {
+                            None => chunk_ct,
+                            Some(acc) => acc.add(&chunk_ct),
+                        });
+                    }
+
+                    collapsed_ct.unwrap()
+                })
+                .collect()
+        };
+
+        #[cfg(not(feature = "rayon"))]
+        let mut collapsed_cts: Vec<RnsCiphertext> = {
+            let mut result = Vec::with_capacity(num_polys);
+            for (poly_idx, poly) in self.wire_polynomials.iter().enumerate() {
+                let vole_blinder = vole_blinders[poly_idx];
+                let mut collapsed_ct: Option<RnsCiphertext> = None;
+
+                for (chunk_idx, powers_chunk) in packed_powers_chunks.iter().enumerate() {
+                    let chunk_start = chunk_idx * slot_count;
+
+                    let mut coeffs = vec![0u64; slot_count];
+                    for (i, &coeff) in poly.iter().skip(chunk_start).take(slot_count).enumerate() {
+                        coeffs[i] = coeff;
+                    }
+
+                    let evaluator = PackedProverEvaluator::new(powers_chunk);
+
+                    let chunk_ct = if chunk_idx == 0 {
+                        let mut rng = Prg::from_seed(Block::from([poly_idx as u8; 16]));
+                        evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
+                    } else {
+                        evaluator.evaluate_row_unblinded(&coeffs)
+                    };
+
+                    collapsed_ct = Some(match collapsed_ct {
+                        None => chunk_ct,
+                        Some(acc) => acc.add(&chunk_ct),
+                    });
+                }
+
+                result.push(collapsed_ct.unwrap());
+            }
+            result
+        };
+
+        // Step 2: Ensure even number for 2-way packing
+        if collapsed_cts.len() % 2 != 0 {
+            // Add a zero ciphertext for padding
+            let zero_coeffs = vec![0u64; slot_count];
+            let evaluator = PackedProverEvaluator::new(&packed_powers_chunks[0]);
+            collapsed_cts.push(evaluator.evaluate_row_unblinded(&zero_coeffs));
         }
-        eprintln!("[commit] store CTs: {:?}", store_start.elapsed());
+
+        // Step 3: 2-way pack pairs of collapsed ciphertexts
+        for pair in collapsed_cts.chunks(2) {
+            let packed_ct = RnsCiphertext::pack_2way(&pair[0], &pair[1]);
+            let ct_commitment = Self::compute_rns_ciphertext_commitment(&packed_ct);
+            self.ciphertext_commitments.push(ct_commitment);
+            self.rns_ciphertexts.push(packed_ct);
+        }
+
+        eprintln!("[commit] BGV evaluate+collapse+pack: {:?} ({} polys x {} chunks -> {} packed CTs)",
+            bgv_start.elapsed(), num_polys, num_chunks, self.rns_ciphertexts.len());
 
         // Step 9 from paper: Commit to input polynomial coefficients as IT-MACs
         // This is required for extractability - the witness must be extractable,
@@ -1039,10 +1113,11 @@ impl<const R: usize> JVProver<R> {
         self.mk_ciphertext_commitments = Vec::with_capacity(num_branches);
         self.mk_rns_ciphertexts = Vec::new();
 
-        let packed_powers = self.packed_powers.as_ref()
+        let packed_powers_chunks = self.packed_powers_chunks.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
 
-        let n = packed_powers.num_powers;
+        let num_chunks = packed_powers_chunks.len();
+        let slot_count = packed_powers_chunks[0].num_powers;
 
         // Create IT-PAC commitments with VOLE masking and collect blinders
         let mut vole_blinders = Vec::with_capacity(num_branches);
@@ -1061,37 +1136,95 @@ impl<const R: usize> JVProver<R> {
             vole_blinders.resize(num_branches, 0);
         }
 
-        // Pad polynomials to slot size n
-        let mut padded_rows: Vec<Vec<u64>> = self.mk_polynomials.iter()
-            .map(|poly| {
-                let mut row = poly.clone();
-                row.resize(n, 0);
-                row
-            })
-            .collect();
-
-        // Ensure even number of rows for 2-way packing
-        if padded_rows.len() % 2 != 0 {
-            padded_rows.push(vec![0u64; n]);
-            vole_blinders.push(0);
-        }
-
-        // Use PackedProverEvaluator for slot-wise mul + blinding + 2-way packing
-        let evaluator = PackedProverEvaluator::new(packed_powers);
+        // Evaluate each MK polynomial across all chunks and collapse (parallel)
         #[cfg(feature = "rayon")]
-        let packed_cts = evaluator.evaluate_all_rows_parallel(&padded_rows, &vole_blinders);
-        #[cfg(not(feature = "rayon"))]
-        let packed_cts = {
-            let mut rng = Prg::from_seed(Block::ZERO);
-            evaluator.evaluate_all_rows(&padded_rows, &vole_blinders, &mut rng)
+        let mut collapsed_cts: Vec<RnsCiphertext> = {
+            use rayon::prelude::*;
+            self.mk_polynomials
+                .par_iter()
+                .enumerate()
+                .map(|(poly_idx, poly)| {
+                    let vole_blinder = vole_blinders[poly_idx];
+                    let mut collapsed_ct: Option<RnsCiphertext> = None;
+
+                    for (chunk_idx, powers_chunk) in packed_powers_chunks.iter().enumerate() {
+                        let chunk_start = chunk_idx * slot_count;
+
+                        let mut coeffs = vec![0u64; slot_count];
+                        for (i, &coeff) in poly.iter().skip(chunk_start).take(slot_count).enumerate() {
+                            coeffs[i] = coeff;
+                        }
+
+                        let evaluator = PackedProverEvaluator::new(powers_chunk);
+
+                        let chunk_ct = if chunk_idx == 0 {
+                            let mut rng = Prg::from_seed(Block::from([(poly_idx + 0x1000) as u8; 16]));
+                            evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
+                        } else {
+                            evaluator.evaluate_row_unblinded(&coeffs)
+                        };
+
+                        collapsed_ct = Some(match collapsed_ct {
+                            None => chunk_ct,
+                            Some(acc) => acc.add(&chunk_ct),
+                        });
+                    }
+
+                    collapsed_ct.unwrap()
+                })
+                .collect()
         };
 
-        // Store packed ciphertexts
-        for ct in packed_cts {
-            let ct_commitment = Self::compute_rns_ciphertext_commitment(&ct);
-            self.mk_ciphertext_commitments.push(ct_commitment);
-            self.mk_rns_ciphertexts.push(ct);
+        #[cfg(not(feature = "rayon"))]
+        let mut collapsed_cts: Vec<RnsCiphertext> = {
+            let mut result = Vec::with_capacity(num_branches);
+            for (poly_idx, poly) in self.mk_polynomials.iter().enumerate() {
+                let vole_blinder = vole_blinders[poly_idx];
+                let mut collapsed_ct: Option<RnsCiphertext> = None;
+
+                for (chunk_idx, powers_chunk) in packed_powers_chunks.iter().enumerate() {
+                    let chunk_start = chunk_idx * slot_count;
+
+                    let mut coeffs = vec![0u64; slot_count];
+                    for (i, &coeff) in poly.iter().skip(chunk_start).take(slot_count).enumerate() {
+                        coeffs[i] = coeff;
+                    }
+
+                    let evaluator = PackedProverEvaluator::new(powers_chunk);
+
+                    let chunk_ct = if chunk_idx == 0 {
+                        let mut rng = Prg::from_seed(Block::from([(poly_idx + 0x1000) as u8; 16]));
+                        evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
+                    } else {
+                        evaluator.evaluate_row_unblinded(&coeffs)
+                    };
+
+                    collapsed_ct = Some(match collapsed_ct {
+                        None => chunk_ct,
+                        Some(acc) => acc.add(&chunk_ct),
+                    });
+                }
+
+                result.push(collapsed_ct.unwrap());
+            }
+            result
+        };
+
+        // Ensure even number for 2-way packing
+        if collapsed_cts.len() % 2 != 0 {
+            let zero_coeffs = vec![0u64; slot_count];
+            let evaluator = PackedProverEvaluator::new(&packed_powers_chunks[0]);
+            collapsed_cts.push(evaluator.evaluate_row_unblinded(&zero_coeffs));
         }
+
+        // 2-way pack pairs
+        for pair in collapsed_cts.chunks(2) {
+            let packed_ct = RnsCiphertext::pack_2way(&pair[0], &pair[1]);
+            let ct_commitment = Self::compute_rns_ciphertext_commitment(&packed_ct);
+            self.mk_ciphertext_commitments.push(ct_commitment);
+            self.mk_rns_ciphertexts.push(packed_ct);
+        }
+        let _ = num_chunks; // silence unused warning
 
         Ok(MKCommitmentMessage {
             num_branches,
@@ -1855,8 +1988,8 @@ pub struct JVVerifier<const R: usize> {
 
     /// RNS BGV key pair for decryption.
     rns_keypair: Option<RnsKeyPair>,
-    /// Packed encrypted powers [Λ^0, ..., Λ^{n-1}] in slots.
-    packed_powers: Option<PackedEncryptedPowers>,
+    /// Packed encrypted powers chunks for R > slot_count support.
+    packed_powers_chunks: Option<Vec<PackedEncryptedPowers>>,
 }
 
 /// Protocol phases for the optimized verifier.
@@ -1922,7 +2055,7 @@ impl<const R: usize> JVVerifier<R> {
             num_branches: 0,
             // Packed evaluation fields
             rns_keypair: None,
-            packed_powers: None,
+            packed_powers_chunks: None,
         }
     }
 
@@ -2021,14 +2154,22 @@ impl<const R: usize> JVVerifier<R> {
             kp
         };
 
-        // Generate packed encrypted powers [Λ^0, ..., Λ^{n-1}] in slots
-        let packed_powers = PackedEncryptedPowers::generate(
+        // Generate packed encrypted powers chunks
+        // For R ≤ slot_count: single chunk with [Λ^0, ..., Λ^{n-1}]
+        // For R > slot_count: multiple chunks covering all needed powers
+        let total_powers = if self.modulus == GOLDILOCKS {
+            R.next_power_of_two()
+        } else {
+            R
+        };
+        let packed_powers_chunks = PackedEncryptedPowers::generate_chunks(
             &rns_keypair.pk,
             self.lambda,
+            total_powers,
             rng,
         );
 
-        self.packed_powers = Some(packed_powers.clone());
+        self.packed_powers_chunks = Some(packed_powers_chunks.clone());
 
         self.phase = JVVerifierPhase::Setup;
 
@@ -2038,7 +2179,7 @@ impl<const R: usize> JVVerifier<R> {
             ahe_public_key,
             ahe_seed_commitment: self.ahe_seed_commitment,
             // Packed evaluation fields
-            packed_powers: Some(packed_powers),
+            packed_powers_chunks: Some(packed_powers_chunks),
             rns_public_key: Some(rns_keypair.pk),
         })
     }
