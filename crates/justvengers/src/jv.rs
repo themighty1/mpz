@@ -72,6 +72,29 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::ops::{Add, Mul, Sub};
 
+// WASM-compatible timing helper (std::time::Instant panics on WASM)
+#[cfg(not(target_arch = "wasm32"))]
+macro_rules! profile_start {
+    () => { Some(std::time::Instant::now()) };
+}
+#[cfg(target_arch = "wasm32")]
+macro_rules! profile_start {
+    () => { None::<()> };
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+macro_rules! profile_end {
+    ($start:expr, $($arg:tt)*) => {
+        if let Some(s) = $start {
+            eprintln!($($arg)*, s.elapsed());
+        }
+    };
+}
+#[cfg(target_arch = "wasm32")]
+macro_rules! profile_end {
+    ($start:expr, $($arg:tt)*) => { let _ = $start; };
+}
+
 // Optional GPU acceleration for slot multiplication
 #[cfg(feature = "gpu")]
 use bgv_webgpu::{RnsSlotMulGpu, RnsBatchParams};
@@ -601,6 +624,10 @@ pub struct JVProver<const R: usize> {
     rns_public_key: Option<RnsPublicKey>,
     /// RNS ciphertexts from packed evaluation (for opening).
     rns_ciphertexts: Vec<RnsCiphertext>,
+    /// GPU context for slot multiplication (pre-initialized for WASM).
+    /// Wrapped in Arc for Clone support (GPU handles can't be cloned).
+    #[cfg(feature = "gpu")]
+    gpu_context: Option<std::sync::Arc<RnsSlotMulGpu>>,
 }
 
 /// Protocol phases for the optimized prover.
@@ -659,6 +686,9 @@ impl<const R: usize> JVProver<R> {
             packed_powers_chunks: None,
             rns_public_key: None,
             rns_ciphertexts: Vec::new(),
+            // GPU context
+            #[cfg(feature = "gpu")]
+            gpu_context: None,
         }
     }
 
@@ -680,6 +710,81 @@ impl<const R: usize> JVProver<R> {
     /// Returns active branches.
     pub fn active_branches(&self) -> &[usize] {
         &self.active_branches
+    }
+
+    /// Prepares GPU context asynchronously from setup message.
+    /// Call this before commit() on WASM to enable GPU acceleration.
+    #[cfg(feature = "gpu")]
+    pub async fn prepare_gpu_async(&mut self, setup_msg: &JVSetupMessage) -> Result<(), JVProverError> {
+        let packed_powers_chunks = setup_msg.packed_powers_chunks.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        let ref_ct = &packed_powers_chunks[0].powers_ct;
+        let rns_params = ref_ct.rns_params();
+        let slot_count = packed_powers_chunks[0].num_powers;
+        let t = packed_powers_chunks[0].t;
+
+        let moduli = rns_params.moduli();
+        let roots = rns_params.roots();
+        let moduli_with_psi: Vec<(u64, u64)> = moduli
+            .iter()
+            .zip(roots.iter())
+            .map(|(&q, &psi)| (q, psi))
+            .collect();
+
+        let gpu_params = RnsBatchParams::from_moduli(slot_count, t, &moduli_with_psi)
+            .ok_or(JVProverError::GpuInitFailed)?;
+
+        match RnsSlotMulGpu::new_async(gpu_params).await {
+            Ok(ctx) => {
+                self.gpu_context = Some(std::sync::Arc::new(ctx));
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[prepare_gpu_async] GPU init failed: {}", e);
+                Err(JVProverError::GpuInitFailed)
+            }
+        }
+    }
+
+    /// Prepares GPU context synchronously from setup message (native only).
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    pub fn prepare_gpu(&mut self, setup_msg: &JVSetupMessage) -> Result<(), JVProverError> {
+        let packed_powers_chunks = setup_msg.packed_powers_chunks.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        let ref_ct = &packed_powers_chunks[0].powers_ct;
+        let rns_params = ref_ct.rns_params();
+        let slot_count = packed_powers_chunks[0].num_powers;
+        let t = packed_powers_chunks[0].t;
+
+        let moduli = rns_params.moduli();
+        let roots = rns_params.roots();
+        let moduli_with_psi: Vec<(u64, u64)> = moduli
+            .iter()
+            .zip(roots.iter())
+            .map(|(&q, &psi)| (q, psi))
+            .collect();
+
+        let gpu_params = RnsBatchParams::from_moduli(slot_count, t, &moduli_with_psi)
+            .ok_or(JVProverError::GpuInitFailed)?;
+
+        match RnsSlotMulGpu::new(gpu_params) {
+            Ok(ctx) => {
+                self.gpu_context = Some(std::sync::Arc::new(ctx));
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[prepare_gpu] GPU init failed: {}", e);
+                Err(JVProverError::GpuInitFailed)
+            }
+        }
+    }
+
+    /// Returns whether GPU context is initialized.
+    #[cfg(feature = "gpu")]
+    pub fn has_gpu(&self) -> bool {
+        self.gpu_context.is_some()
     }
 
     /// Initializes the prover with per-repetition circuits.
@@ -834,10 +939,10 @@ impl<const R: usize> JVProver<R> {
         self.eval_points = Some(eval_points.to_vec());
         // Compute and cache vanishing polynomial Z(X) = Π(X - αⱼ) over actual R points
         // (not NTT-padded points which may extend beyond R)
-        let vanish_start = std::time::Instant::now();
+        let vanish_start = profile_start!();
         let actual_eval_points = &eval_points[..R.min(eval_points.len())];
         self.vanishing_poly = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
-        eprintln!("[commit] vanishing_poly: {:?} ({} points)", vanish_start.elapsed(), actual_eval_points.len());
+        profile_end!(vanish_start, "[commit] vanishing_poly ({} points): {:?}", actual_eval_points.len());
 
         self.vole_pool = Some(vole_pool);
         // Store seed commitment and public key for later verification
@@ -849,11 +954,11 @@ impl<const R: usize> JVProver<R> {
         self.rns_public_key = setup_msg.rns_public_key.clone();
 
         // Create INTT context for Goldilocks
-        let intt_start = std::time::Instant::now();
+        let intt_start = profile_start!();
         if self.modulus == GOLDILOCKS {
             self.intt_context = Some(InttContext::new(eval_points.len()));
         }
-        eprintln!("[commit] INTT context: {:?}", intt_start.elapsed());
+        profile_end!(intt_start, "[commit] INTT context: {:?}");
 
         // For each wire position, interpolate R values to get polynomial
         let witness_len = self.witnesses[0].len();
@@ -861,7 +966,7 @@ impl<const R: usize> JVProver<R> {
         self.itpac_commitments = Vec::with_capacity(witness_len);
         self.ciphertext_commitments = Vec::with_capacity(witness_len);
 
-        let interp_start = std::time::Instant::now();
+        let interp_start = profile_start!();
         for pos in 0..witness_len {
             // Collect values at this position across all repetitions
             let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
@@ -870,7 +975,7 @@ impl<const R: usize> JVProver<R> {
             let poly = self.interpolate_values(&values, eval_points);
             self.wire_polynomials.push(poly);
         }
-        eprintln!("[commit] interpolation: {:?} ({} polys)", interp_start.elapsed(), witness_len);
+        profile_end!(interp_start, "[commit] interpolation ({} polys): {:?}", witness_len);
 
         // Use packed evaluation with slot-wise mul + blinding (rotation-free)
         // P evaluates each polynomial, blinds with VOLE blinder, and 2-way packs pairs
@@ -884,7 +989,7 @@ impl<const R: usize> JVProver<R> {
         let t = packed_powers_chunks[0].t;
 
         // Create IT-PAC commitments with VOLE masking and collect blinders
-        let itpac_start = std::time::Instant::now();
+        let itpac_start = profile_start!();
         let vole_pool = self.vole_pool.as_mut().ok_or(JVProverError::MissingSetupData)?;
         let mut vole_blinders = Vec::with_capacity(num_polys);
         for poly in &self.wire_polynomials {
@@ -896,37 +1001,43 @@ impl<const R: usize> JVProver<R> {
                 vole_blinders.push(0);
             }
         }
-        eprintln!("[commit] IT-PAC creation: {:?} ({} polys)", itpac_start.elapsed(), num_polys);
+        profile_end!(itpac_start, "[commit] IT-PAC creation ({} polys): {:?}", num_polys);
 
         // For R > slot_count, we evaluate each polynomial across multiple chunks
         // and collapse them by homomorphic addition before 2-way packing.
         // Result: (B+C)/2 ciphertexts regardless of number of chunks.
-        let bgv_start = std::time::Instant::now();
+        let bgv_start = profile_start!();
 
-        // GPU-accelerated path: batch all slot multiplications per chunk
+        // GPU-accelerated path: uses pre-initialized gpu_context
         #[cfg(feature = "gpu")]
         let mut collapsed_cts: Vec<RnsCiphertext> = {
-            let gpu_result = Self::commit_gpu_batched(
-                &self.wire_polynomials,
-                packed_powers_chunks,
-                &vole_blinders,
-                slot_count,
-                t,
-            );
+            if let Some(ref gpu_ctx) = self.gpu_context {
+                let gpu_result = Self::commit_gpu_batched_with_ctx(
+                    gpu_ctx,
+                    &self.wire_polynomials,
+                    packed_powers_chunks,
+                    &vole_blinders,
+                    slot_count,
+                    t,
+                );
 
-            match gpu_result {
-                Ok(cts) => {
-                    eprintln!("[commit] GPU path succeeded");
-                    cts
+                match gpu_result {
+                    Ok(cts) => {
+                        eprintln!("[commit] GPU path succeeded");
+                        cts
+                    }
+                    Err(e) => {
+                        eprintln!("[commit] GPU path failed ({}), falling back to CPU", e);
+                        Self::commit_cpu_parallel(&self.wire_polynomials, packed_powers_chunks, &vole_blinders, slot_count)
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[commit] GPU path failed ({}), falling back to CPU", e);
-                    Self::commit_cpu_parallel(&self.wire_polynomials, packed_powers_chunks, &vole_blinders, slot_count)
-                }
+            } else {
+                eprintln!("[commit] No GPU context, using CPU path");
+                Self::commit_cpu_parallel(&self.wire_polynomials, packed_powers_chunks, &vole_blinders, slot_count)
             }
         };
 
-        // CPU path with rayon parallelization
+        // CPU path with rayon parallelization (when GPU feature not enabled)
         #[cfg(all(feature = "rayon", not(feature = "gpu")))]
         let mut collapsed_cts: Vec<RnsCiphertext> = {
             use rayon::prelude::*;
@@ -1021,13 +1132,13 @@ impl<const R: usize> JVProver<R> {
             self.rns_ciphertexts.push(packed_ct);
         }
 
-        eprintln!("[commit] BGV evaluate+collapse+pack: {:?} ({} polys x {} chunks -> {} packed CTs)",
-            bgv_start.elapsed(), num_polys, num_chunks, self.rns_ciphertexts.len());
+        profile_end!(bgv_start, "[commit] BGV evaluate+collapse+pack ({} polys x {} chunks -> {} packed CTs): {:?}",
+            num_polys, num_chunks, self.rns_ciphertexts.len());
 
         // Step 9 from paper: Commit to input polynomial coefficients as IT-MACs
         // This is required for extractability - the witness must be extractable,
         // which is not possible from unopened polynomials alone.
-        let input_mac_start = std::time::Instant::now();
+        let input_mac_start = profile_start!();
         self.input_coeff_macs = Vec::with_capacity(self.num_inputs);
 
         for input_idx in 0..self.num_inputs {
@@ -1043,7 +1154,7 @@ impl<const R: usize> JVProver<R> {
 
             self.input_coeff_macs.push(coeff_macs);
         }
-        eprintln!("[commit] input MACs: {:?} ({} inputs)", input_mac_start.elapsed(), self.num_inputs);
+        profile_end!(input_mac_start, "[commit] input MACs ({} inputs): {:?}", self.num_inputs);
 
         self.phase = JVProverPhase::Committed;
 
@@ -1053,12 +1164,13 @@ impl<const R: usize> JVProver<R> {
         })
     }
 
-    /// GPU-accelerated batched slot multiplication.
+    /// GPU-accelerated batched slot multiplication with pre-initialized context.
     ///
     /// Uses multi-CT batching to process chunks in GPU dispatches,
     /// splitting into groups if buffer size exceeds GPU limits.
     #[cfg(feature = "gpu")]
-    fn commit_gpu_batched(
+    fn commit_gpu_batched_with_ctx(
+        gpu_ctx: &RnsSlotMulGpu,
         wire_polynomials: &[Vec<u64>],
         packed_powers_chunks: &[PackedEncryptedPowers],
         vole_blinders: &[u64],
@@ -1073,22 +1185,9 @@ impl<const R: usize> JVProver<R> {
         let rns_params = ref_ct.rns_params().clone();
         let bgv_params = ref_ct.bgv_params().clone();
 
-        // Initialize GPU context with actual RNS moduli from ciphertext
-        let moduli = rns_params.moduli();
-        let roots = rns_params.roots();
-        let k = moduli.len();
-        let moduli_with_psi: Vec<(u64, u64)> = moduli
-            .iter()
-            .zip(roots.iter())
-            .map(|(&q, &psi)| (q, psi))
-            .collect();
+        let k = rns_params.moduli().len();
 
-        let gpu_params = RnsBatchParams::from_moduli(slot_count, t, &moduli_with_psi)
-            .ok_or("Failed to create GPU params")?;
-        let gpu_ctx =
-            RnsSlotMulGpu::new(gpu_params).map_err(|e| format!("GPU init failed: {}", e))?;
-
-        let gpu_start = std::time::Instant::now();
+        let gpu_start = profile_start!();
 
         // Calculate max chunks per GPU call to stay under buffer limits
         // Buffer size = total_batches * k * n * 2 * 4 bytes
@@ -1186,9 +1285,9 @@ impl<const R: usize> JVProver<R> {
             }
         }
 
-        eprintln!(
-            "[commit] GPU multi-CT slot mul: {:?} ({} polys x {} chunks, {} GPU calls, max {} chunks/call)",
-            gpu_start.elapsed(),
+        profile_end!(
+            gpu_start,
+            "[commit] GPU multi-CT slot mul ({} polys x {} chunks, {} GPU calls, max {} chunks/call): {:?}",
             num_polys,
             num_chunks,
             gpu_calls,
@@ -1196,7 +1295,7 @@ impl<const R: usize> JVProver<R> {
         );
 
         // Collapse across chunks (add CTs per polynomial)
-        let collapse_start = std::time::Instant::now();
+        let collapse_start = profile_start!();
         let collapsed_cts: Vec<RnsCiphertext> = (0..num_polys)
             .map(|poly_idx| {
                 let mut acc = chunk_results[0][poly_idx].clone();
@@ -1206,7 +1305,7 @@ impl<const R: usize> JVProver<R> {
                 acc
             })
             .collect();
-        eprintln!("[commit] GPU collapse: {:?}", collapse_start.elapsed());
+        profile_end!(collapse_start, "[commit] GPU collapse: {:?}");
 
         Ok(collapsed_cts)
     }
@@ -1928,7 +2027,7 @@ impl<const R: usize> JVProver<R> {
         // H(X) = Σᵢ γⁱ·(f_a_i(X)·f_b_i(X) - f_c_i(X))
         // Q(X) = H(X) / Z(X)
 
-        let lpzk_poly_start = std::time::Instant::now();
+        let lpzk_poly_start = profile_start!();
         let mut h_poly = vec![0u64]; // Start with zero polynomial
         gamma_power = 1u64;
 
@@ -1970,16 +2069,16 @@ impl<const R: usize> JVProver<R> {
 
             gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
         }
-        eprintln!("[lpzk] poly accumulation: {:?} ({} mults, h_poly deg={})", lpzk_poly_start.elapsed(), num_mults, h_poly.len());
+        profile_end!(lpzk_poly_start, "[lpzk] poly accumulation ({} mults, h_poly deg={}): {:?}", num_mults, h_poly.len());
 
         // Use cached vanishing polynomial Z(X) = Π(X - αⱼ)
         let z_poly = self.vanishing_poly.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
 
         // Compute quotient Q(X) = H(X) / Z(X)
-        let div_start = std::time::Instant::now();
+        let div_start = profile_start!();
         let (quotient_coeffs, _remainder) = poly_div(&h_poly, z_poly, self.modulus);
-        eprintln!("[lpzk] poly_div: {:?} (h_deg={}, z_deg={})", div_start.elapsed(), h_poly.len(), z_poly.len());
+        profile_end!(div_start, "[lpzk] poly_div (h_deg={}, z_deg={}): {:?}", h_poly.len(), z_poly.len());
 
         self.phase = JVProverPhase::Done;
 
@@ -3347,6 +3446,8 @@ pub enum JVProverError {
     AheSeedMismatch,
     /// AHE ciphertexts don't match regenerated values.
     AheCiphertextMismatch,
+    /// GPU initialization failed.
+    GpuInitFailed,
 }
 
 /// Errors for the optimized verifier.

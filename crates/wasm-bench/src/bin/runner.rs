@@ -81,6 +81,7 @@ const ALL_BENCHMARKS: &[&str] = &[
     "bgv/justvengers_pattern",
     "bgv/justvengers_pattern_parallel",
     "bgv/justvengers_pattern_webgpu",
+    "bgv/webgpu_worker_test",
 ];
 
 /// Get all benchmarks in a group

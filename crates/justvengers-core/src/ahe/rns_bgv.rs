@@ -610,6 +610,15 @@ impl RnsCiphertext {
         &self.bgv_params
     }
 
+    /// Returns the c0 and c1 residues for GPU processing.
+    ///
+    /// Returns (c0_residues, c1_residues) where each is Vec<Vec<u64>> with shape [num_moduli][n].
+    pub fn precompute_ntt(&self) -> (Vec<Vec<u64>>, Vec<Vec<u64>>) {
+        let c0_residues: Vec<Vec<u64>> = self.c0.residues().to_vec();
+        let c1_residues: Vec<Vec<u64>> = self.c1.residues().to_vec();
+        (c0_residues, c1_residues)
+    }
+
     /// Creates a ciphertext from residue arrays.
     pub fn from_residues(
         c0_residues: Vec<Vec<u64>>,

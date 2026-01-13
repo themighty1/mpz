@@ -390,3 +390,60 @@ pub async fn bgv_justvengers_pattern_webgpu(n: u32) -> Result<BenchResult, JsVal
         and_gates: 0,
     })
 }
+
+/// Test version: runs bgv_webgpu benchmark directly (no worker).
+/// This tests if async GPU code works at all before trying workers.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn bgv_webgpu_worker_test(n: u32) -> Result<BenchResult, JsValue> {
+    web_sys::console::log_1(&"[bgv-webgpu-worker-test] Running directly (no worker)...".into());
+
+    // Just call the same benchmark code directly
+    run_bgv_worker_bench(n).await
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+/// Inner async benchmark for worker test.
+#[cfg(target_arch = "wasm32")]
+async fn run_bgv_worker_bench(n: u32) -> Result<BenchResult, String> {
+    let global = js_sys::global();
+    let performance: web_sys::Performance =
+        js_sys::Reflect::get(&global, &"performance".into())
+            .map_err(|_| "performance not available".to_string())?
+            .unchecked_into();
+
+    web_sys::console::log_1(&"[bgv-worker-bench] Setting up GPU context...".into());
+
+    let setup_start = performance.now();
+    let data = setup_bgv_webgpu_bench().await
+        .map_err(|e| format!("Setup failed: {:?}", e))?;
+    let setup_time = performance.now() - setup_start;
+
+    web_sys::console::log_1(
+        &format!("[bgv-worker-bench] Setup done in {:.2}ms, running {} iterations", setup_time, n).into(),
+    );
+
+    let mut total_elapsed_ms = 0.0;
+
+    for i in 0..n {
+        let start = performance.now();
+        run_bgv_webgpu_iteration(&data).await
+            .map_err(|e| format!("Iteration failed: {:?}", e))?;
+        total_elapsed_ms += performance.now() - start;
+
+        if (i + 1) % 5 == 0 || i == 0 {
+            web_sys::console::log_1(
+                &format!("[bgv-worker-bench] Iteration {}/{} done", i + 1, n).into(),
+            );
+        }
+    }
+
+    web_sys::console::log_1(
+        &format!("[bgv-worker-bench] Done: {:.2}ms total", total_elapsed_ms).into(),
+    );
+
+    Ok(BenchResult {
+        elapsed_ms: total_elapsed_ms,
+        and_gates: 0,
+    })
+}

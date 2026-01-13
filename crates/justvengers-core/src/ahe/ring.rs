@@ -23,7 +23,7 @@ pub struct RingPoly {
 
 /// Barrett reduction for modulus q.
 /// For a product a*b where a,b < q, computes (a*b) mod q without division.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BarrettReducer {
     q: u64,
     q_128: u128,

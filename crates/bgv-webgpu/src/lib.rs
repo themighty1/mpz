@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! WebGPU-accelerated BGV ciphertext scalar multiplication.
 //!
 //! This crate provides GPU-accelerated slot-wise scalar multiplication for BGV ciphertexts.

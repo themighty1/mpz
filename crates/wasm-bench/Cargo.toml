@@ -11,7 +11,7 @@ mpz-garble-core = { workspace = true }
 mpz-garble = { workspace = true }
 mpz-zk-core = { workspace = true, features = ["rayon"] }
 mpz-zk = { workspace = true, features = ["rayon"] }
-mpz-justvengers = { workspace = true }
+mpz-justvengers = { workspace = true, features = ["gpu"] }
 mpz-justvengers-core = { workspace = true, features = ["rayon"] }
 bgv-webgpu = { path = "../bgv-webgpu" }
 mpz-fields = { workspace = true }

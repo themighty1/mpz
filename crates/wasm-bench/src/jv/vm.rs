@@ -160,7 +160,7 @@ fn generate_vm_inputs_per_rep(num_repetitions: usize) -> (Vec<Vec<u64>>, Vec<usi
 
 /// Records JV verifier messages for replay benchmarking with IT-PAC.
 #[cfg(target_arch = "wasm32")]
-fn jv_record_verifier_messages<const R: usize>(
+async fn jv_record_verifier_messages<const R: usize>(
     circuits: &CircuitBatch,
     active_branches: &[usize],
     inputs_per_rep: &[Vec<u64>],
@@ -186,6 +186,12 @@ fn jv_record_verifier_messages<const R: usize>(
     // Extract verifier shares before passing pool to prover
     let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
     verifier.set_verifier_local_keys(verifier_shares);
+
+    // Note: GPU init disabled for now in vm.rs - using rayon CPU path
+    // WebGPU async init in web workers needs more work
+    // prover.prepare_gpu_async(&setup_msg).await.unwrap_or_else(|e| {
+    //     web_sys::console::log_1(&format!("[jv_vm] GPU init failed: {:?}, using CPU fallback", e).into());
+    // });
 
     // P → V: CommitmentMessage (IT-PAC ciphertexts)
     let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
@@ -265,6 +271,11 @@ fn run_prover_iteration<const R: usize>(
     // Create VOLE pool for IT-PAC commitments
     let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
 
+    // Note: GPU init disabled for now - using rayon CPU path
+    // prover.prepare_gpu_async(&recorded.setup_msg).await.unwrap_or_else(|e| {
+    //     let _ = e;
+    // });
+
     // P → V: CommitmentMessage (IT-PAC ciphertexts)
     let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
 
@@ -302,12 +313,41 @@ fn run_prover_iteration<const R: usize>(
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn jv_vm_prover(n: u32, reps: u32) -> Result<BenchResult, JsValue> {
-    // Run synchronously (blocking but simpler than web_spawn for benchmarks)
-    run_vm_bench(n, reps as usize).map_err(|e| JsValue::from_str(&e))
+    use std::sync::{Arc, Mutex};
+    use wasm_bindgen_futures::JsFuture;
+
+    let result: Arc<Mutex<Option<Result<BenchResult, String>>>> = Arc::new(Mutex::new(None));
+    let result_clone = result.clone();
+
+    // Run benchmark on web worker thread (where Atomics.wait is allowed)
+    let _handle = web_spawn::spawn(move || {
+        // Use spawn_local inside worker to run async GPU init
+        wasm_bindgen_futures::spawn_local(async move {
+            let bench_result = run_vm_bench_async(n, reps as usize).await;
+            *result_clone.lock().unwrap() = Some(bench_result);
+        });
+    });
+
+    // Poll for result on main thread
+    loop {
+        JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL))
+            .await
+            .unwrap();
+        if let Some(r) = result.lock().unwrap().take() {
+            return r.map_err(|e| JsValue::from_str(&e));
+        }
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            web_sys::window()
+                .unwrap()
+                .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 10)
+                .unwrap();
+        });
+        JsFuture::from(promise).await.unwrap();
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
-fn run_vm_bench(n: u32, reps: usize) -> Result<BenchResult, String> {
+async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> {
     let global = js_sys::global();
     let performance: web_sys::Performance =
         js_sys::Reflect::get(&global, &"performance".into())
@@ -325,13 +365,13 @@ fn run_vm_bench(n: u32, reps: usize) -> Result<BenchResult, String> {
             const R: usize = $r;
             let (inputs, branches, _final_acc) = generate_vm_inputs_per_rep(R);
 
-            // Record verifier messages (not timed)
+            // Record verifier messages (not timed) - async for GPU init
             let recorded = jv_record_verifier_messages::<R>(
                 &circuits,
                 &branches,
                 &inputs,
                 &soldering,
-            );
+            ).await;
 
             web_sys::console::log_1(
                 &format!(

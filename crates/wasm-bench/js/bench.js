@@ -211,6 +211,7 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "bgv", name: "bgv/justvengers_pattern", fn: (n) => wasm.bgv_justvengers_pattern(n), async: false, returnsBenchResult: true, warmup: 0 },
         { category: "bgv", name: "bgv/justvengers_pattern_parallel", fn: (n) => wasm.bgv_justvengers_pattern_parallel(n, concurrency), async: true, returnsBenchResult: true, warmup: 0, mt: true },
         { category: "bgv", name: "bgv/justvengers_pattern_webgpu", fn: (n) => wasm.bgv_justvengers_pattern_webgpu(n), async: true, returnsBenchResult: true, warmup: 0 },
+        { category: "bgv", name: "bgv/webgpu_worker_test", fn: (n) => wasm.bgv_webgpu_worker_test(n), async: true, returnsBenchResult: true, warmup: 0, mt: true },
     ];
 }
 

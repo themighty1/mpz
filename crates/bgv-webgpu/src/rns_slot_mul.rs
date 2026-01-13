@@ -245,13 +245,23 @@ pub struct RnsSlotMulGpu {
     rns_params_buffers: Vec<Buffer>,
 }
 
+impl std::fmt::Debug for RnsSlotMulGpu {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RnsSlotMulGpu")
+            .field("n", &self.params.n)
+            .field("k", &self.params.k)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RnsSlotMulGpu {
     /// Creates a new GPU context for RNS batched slot multiplication.
     pub fn new(params: RnsBatchParams) -> Result<Self, GpuError> {
         pollster::block_on(Self::new_async(params))
     }
 
-    async fn new_async(params: RnsBatchParams) -> Result<Self, GpuError> {
+    /// Creates a new GPU context asynchronously (required for WASM).
+    pub async fn new_async(params: RnsBatchParams) -> Result<Self, GpuError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
             ..Default::default()

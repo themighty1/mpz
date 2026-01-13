@@ -187,7 +187,7 @@ impl Default for BgvParams {
 /// When the plaintext modulus t is large (e.g., Goldilocks ≈ 2^64), the ciphertext
 /// modulus q must be much larger to maintain noise budget. This requires RNS
 /// representation where q = q_1 × q_2 × ... × q_k with each q_i fitting in 64 bits.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RnsBgvParams {
     /// Ring dimension (must be power of 2).
     pub n: usize,
