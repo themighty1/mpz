@@ -14,6 +14,7 @@
 
 mod error;
 mod gpu;
+mod math;
 mod shader;
 mod rotation_shader_legacy;
 mod rotation_shader;
