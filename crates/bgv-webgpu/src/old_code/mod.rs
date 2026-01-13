@@ -6,5 +6,7 @@
 //! Kept for reference and potential future use.
 
 mod rotation;
+mod rotation_shader_legacy;
+pub mod rotation_shader;
 
 pub use rotation::*;

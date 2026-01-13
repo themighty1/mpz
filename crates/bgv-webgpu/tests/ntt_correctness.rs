@@ -636,3 +636,290 @@ fn test_gpu_mulmod() {
 
     println!("\n✓ GPU mulmod test passed for all moduli!");
 }
+
+/// Test GPU addmod and submod against CPU reference.
+#[test]
+fn test_gpu_addmod_submod() {
+    let n = 8192;
+    let params = RnsBatchParams::goldilocks(n).unwrap();
+    let gpu_ctx = match RnsSlotMulGpu::new(params.clone()) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            println!("Skipping test: GPU not available ({})", e);
+            return;
+        }
+    };
+
+    println!("=== GPU Addmod/Submod Test ===");
+
+    for (mod_idx, data) in params.rns_data.iter().enumerate() {
+        let q = data.modulus;
+
+        println!("\n--- Modulus {} (q = {}) ---", mod_idx, q);
+
+        // Test cases: various edge cases for add and sub
+        let test_cases: Vec<(Vec<u64>, Vec<u64>)> = vec![
+            // Small values
+            (vec![1, 2, 3, 4], vec![5, 6, 7, 8]),
+            // Values near q (test wrap-around for add)
+            (vec![q - 1, q - 2, q - 10, q / 2], vec![1, 5, 20, q / 2 + 1]),
+            // Test subtraction wrap-around (a < b)
+            (vec![0, 1, 5, 10], vec![1, 5, 10, 100]),
+            // Large values
+            (vec![q - 1, q - 1, q / 2, q / 2], vec![q - 1, 1, q / 2, q / 2 + 1]),
+            // Mix of edge cases
+            (vec![0, q - 1, 1, q / 2], vec![0, 1, q - 1, q / 2]),
+        ];
+
+        for (a_vals, b_vals) in &test_cases {
+            let (gpu_add, gpu_sub) = gpu_ctx.test_addmod_submod(a_vals, b_vals, mod_idx)
+                .expect("GPU addmod/submod failed");
+
+            let cpu_add: Vec<u64> = a_vals.iter().zip(b_vals.iter())
+                .map(|(&a, &b)| mod_add(a, b, q))
+                .collect();
+            let cpu_sub: Vec<u64> = a_vals.iter().zip(b_vals.iter())
+                .map(|(&a, &b)| mod_sub(a, b, q))
+                .collect();
+
+            let add_matches = gpu_add.iter().zip(&cpu_add).filter(|(&a, &b)| a == b).count();
+            let sub_matches = gpu_sub.iter().zip(&cpu_sub).filter(|(&a, &b)| a == b).count();
+
+            if add_matches != a_vals.len() {
+                println!("ADDMOD FAIL: a={:?}, b={:?}", a_vals, b_vals);
+                println!("  CPU add: {:?}", cpu_add);
+                println!("  GPU add: {:?}", gpu_add);
+                for i in 0..a_vals.len() {
+                    if cpu_add[i] != gpu_add[i] {
+                        println!("  Add mismatch at {}: {} + {} mod {} = CPU:{}, GPU:{}",
+                            i, a_vals[i], b_vals[i], q, cpu_add[i], gpu_add[i]);
+                    }
+                }
+            }
+
+            if sub_matches != a_vals.len() {
+                println!("SUBMOD FAIL: a={:?}, b={:?}", a_vals, b_vals);
+                println!("  CPU sub: {:?}", cpu_sub);
+                println!("  GPU sub: {:?}", gpu_sub);
+                for i in 0..a_vals.len() {
+                    if cpu_sub[i] != gpu_sub[i] {
+                        println!("  Sub mismatch at {}: {} - {} mod {} = CPU:{}, GPU:{}",
+                            i, a_vals[i], b_vals[i], q, cpu_sub[i], gpu_sub[i]);
+                    }
+                }
+            }
+
+            assert_eq!(add_matches, a_vals.len(), "GPU addmod failed for modulus {}", mod_idx);
+            assert_eq!(sub_matches, a_vals.len(), "GPU submod failed for modulus {}", mod_idx);
+        }
+
+        println!("✓ All addmod/submod test cases passed for modulus {}", mod_idx);
+    }
+
+    println!("\n✓ GPU addmod/submod test passed for all moduli!");
+}
+
+/// Test GPU bit_reverse function against CPU reference.
+#[test]
+fn test_gpu_bit_reverse() {
+    let n = 8192;
+    let log_n = 13u32;  // 2^13 = 8192
+
+    let params = RnsBatchParams::goldilocks(n).unwrap();
+    let gpu_ctx = match RnsSlotMulGpu::new(params) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            println!("Skipping test: GPU not available ({})", e);
+            return;
+        }
+    };
+
+    println!("=== GPU Bit Reverse Test ===");
+    println!("n = {}, log_n = {}", n, log_n);
+
+    // Test all indices 0..n
+    let indices: Vec<u32> = (0..n as u32).collect();
+    let gpu_result = gpu_ctx.test_bit_reverse(&indices, log_n)
+        .expect("GPU bit_reverse failed");
+
+    let cpu_result: Vec<u32> = indices.iter()
+        .map(|&i| bit_reverse(i as usize, log_n as usize) as u32)
+        .collect();
+
+    let matches = gpu_result.iter().zip(&cpu_result).filter(|(&a, &b)| a == b).count();
+    println!("Matches: {} / {}", matches, n);
+
+    if matches != n {
+        for i in 0..n {
+            if gpu_result[i] != cpu_result[i] {
+                println!("First mismatch at {}: CPU={}, GPU={}", i, cpu_result[i], gpu_result[i]);
+                break;
+            }
+        }
+    }
+
+    assert_eq!(matches, n, "GPU bit_reverse failed");
+    println!("✓ GPU bit_reverse test passed!");
+}
+
+/// Test GPU twiddle factor computation (omega_inv^i) against CPU reference.
+#[test]
+fn test_gpu_twiddle_factors() {
+    let n = 8192;
+    let params = RnsBatchParams::goldilocks(n).unwrap();
+    let gpu_ctx = match RnsSlotMulGpu::new(params.clone()) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            println!("Skipping test: GPU not available ({})", e);
+            return;
+        }
+    };
+
+    println!("=== GPU Twiddle Factors Test ===");
+
+    for (mod_idx, data) in params.rns_data.iter().enumerate() {
+        let q = data.modulus;
+        let omega_inv = data.omega_inv;
+
+        println!("\n--- Modulus {} (q = {}) ---", mod_idx, q);
+        println!("omega_inv = {}", omega_inv);
+
+        // Compute CPU reference: omega_inv^i for i = 0..n
+        let cpu_twiddles: Vec<u64> = (0..n)
+            .map(|i| mod_pow(omega_inv, i as u64, q))
+            .collect();
+
+        // Get GPU result
+        let gpu_twiddles = gpu_ctx.test_twiddle_factors(mod_idx)
+            .expect("GPU twiddle_factors failed");
+
+        let matches = gpu_twiddles.iter().zip(&cpu_twiddles).filter(|(&a, &b)| a == b).count();
+        println!("CPU twiddles[0..8]: {:?}", &cpu_twiddles[..8]);
+        println!("GPU twiddles[0..8]: {:?}", &gpu_twiddles[..8]);
+        println!("Matches: {} / {}", matches, n);
+
+        if matches != n {
+            for i in 0..n {
+                if gpu_twiddles[i] != cpu_twiddles[i] {
+                    println!("First mismatch at {}: CPU={}, GPU={}", i, cpu_twiddles[i], gpu_twiddles[i]);
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(matches, n, "GPU twiddle_factors failed for modulus {}", mod_idx);
+    }
+
+    println!("\n✓ GPU twiddle factors test passed for all moduli!");
+}
+
+/// Test GPU untwist operation (multiply by psi_inv^i) against CPU reference.
+#[test]
+fn test_gpu_untwist() {
+    let n = 8192;
+    let params = RnsBatchParams::goldilocks(n).unwrap();
+    let gpu_ctx = match RnsSlotMulGpu::new(params.clone()) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            println!("Skipping test: GPU not available ({})", e);
+            return;
+        }
+    };
+
+    println!("=== GPU Untwist Test ===");
+
+    for (mod_idx, data) in params.rns_data.iter().enumerate() {
+        let q = data.modulus;
+        let psi_inv = data.psi_inv;
+
+        println!("\n--- Modulus {} (q = {}) ---", mod_idx, q);
+        println!("psi_inv = {}", psi_inv);
+
+        // Create test input
+        let input: Vec<u64> = (0..n).map(|i| (i as u64 * 12345) % q).collect();
+
+        // CPU reference: val[i] * psi_inv^i mod q
+        let cpu_result: Vec<u64> = input.iter().enumerate()
+            .map(|(i, &v)| {
+                let psi_inv_power = mod_pow(psi_inv, i as u64, q);
+                mod_mul(v, psi_inv_power, q)
+            })
+            .collect();
+
+        // GPU result
+        let gpu_result = gpu_ctx.test_untwist(&input, mod_idx)
+            .expect("GPU untwist failed");
+
+        let matches = gpu_result.iter().zip(&cpu_result).filter(|(&a, &b)| a == b).count();
+        println!("CPU untwist[0..8]: {:?}", &cpu_result[..8]);
+        println!("GPU untwist[0..8]: {:?}", &gpu_result[..8]);
+        println!("Matches: {} / {}", matches, n);
+
+        if matches != n {
+            for i in 0..n {
+                if gpu_result[i] != cpu_result[i] {
+                    println!("First mismatch at {}: CPU={}, GPU={}", i, cpu_result[i], gpu_result[i]);
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(matches, n, "GPU untwist failed for modulus {}", mod_idx);
+    }
+
+    println!("\n✓ GPU untwist test passed for all moduli!");
+}
+
+/// Test GPU n_inv scaling (multiply by 1/n mod q) against CPU reference.
+#[test]
+fn test_gpu_n_inv_scaling() {
+    let n = 8192;
+    let params = RnsBatchParams::goldilocks(n).unwrap();
+    let gpu_ctx = match RnsSlotMulGpu::new(params.clone()) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            println!("Skipping test: GPU not available ({})", e);
+            return;
+        }
+    };
+
+    println!("=== GPU n_inv Scaling Test ===");
+
+    for (mod_idx, data) in params.rns_data.iter().enumerate() {
+        let q = data.modulus;
+        let n_inv = data.n_inv;
+
+        println!("\n--- Modulus {} (q = {}) ---", mod_idx, q);
+        println!("n_inv = {}", n_inv);
+
+        // Create test input
+        let input: Vec<u64> = (0..n).map(|i| (i as u64 * 54321) % q).collect();
+
+        // CPU reference: val * n_inv mod q
+        let cpu_result: Vec<u64> = input.iter()
+            .map(|&v| mod_mul(v, n_inv, q))
+            .collect();
+
+        // GPU result
+        let gpu_result = gpu_ctx.test_n_inv_scaling(&input, mod_idx)
+            .expect("GPU n_inv_scaling failed");
+
+        let matches = gpu_result.iter().zip(&cpu_result).filter(|(&a, &b)| a == b).count();
+        println!("CPU n_inv[0..8]: {:?}", &cpu_result[..8]);
+        println!("GPU n_inv[0..8]: {:?}", &gpu_result[..8]);
+        println!("Matches: {} / {}", matches, n);
+
+        if matches != n {
+            for i in 0..n {
+                if gpu_result[i] != cpu_result[i] {
+                    println!("First mismatch at {}: CPU={}, GPU={}", i, cpu_result[i], gpu_result[i]);
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(matches, n, "GPU n_inv_scaling failed for modulus {}", mod_idx);
+    }
+
+    println!("\n✓ GPU n_inv scaling test passed for all moduli!");
+}

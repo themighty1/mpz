@@ -11,8 +11,6 @@
 //!
 //! GPU target: < 200ms for the full batch
 
-use std::borrow::Cow;
-
 use bytemuck::{Pod, Zeroable};
 use wgpu::{util::DeviceExt, Buffer, BufferUsages, ComputePipeline, Device, Queue};
 
@@ -295,26 +293,34 @@ impl RnsSlotMulGpu {
             )
             .await?;
 
-        // Compile shaders
-        let slot_encode_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("slot_encode"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SLOT_ENCODE_SHADER)),
-        });
+        // Compile shaders using naga_oil composition for shared math module
+        let slot_encode_shader = crate::shader_math::create_shader_module(
+            &device,
+            SLOT_ENCODE_SHADER,
+            "slot_encode.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
 
-        let forward_ntt_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("forward_ntt"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(FORWARD_NTT_SHADER)),
-        });
+        let forward_ntt_shader = crate::shader_math::create_shader_module(
+            &device,
+            FORWARD_NTT_SHADER,
+            "forward_ntt.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
 
-        let pointwise_mul_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("pointwise_mul"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(POINTWISE_MUL_SHADER)),
-        });
+        let pointwise_mul_shader = crate::shader_math::create_shader_module(
+            &device,
+            POINTWISE_MUL_SHADER,
+            "pointwise_mul.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
 
-        let inverse_ntt_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("inverse_ntt"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(INVERSE_NTT_SHADER)),
-        });
+        let inverse_ntt_shader = crate::shader_math::create_shader_module(
+            &device,
+            INVERSE_NTT_SHADER,
+            "inverse_ntt.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
 
         // Create pipelines
         let slot_encode_pipeline =
@@ -347,11 +353,12 @@ impl RnsSlotMulGpu {
                 cache: None,
             });
 
-        let pointwise_mul_multi_ct_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("pointwise_mul_multi_ct"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(POINTWISE_MUL_MULTI_CT_SHADER)),
-            });
+        let pointwise_mul_multi_ct_shader = crate::shader_math::create_shader_module(
+            &device,
+            POINTWISE_MUL_MULTI_CT_SHADER,
+            "pointwise_mul_multi_ct.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
 
         let pointwise_mul_multi_ct_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1560,11 +1567,11 @@ impl RnsSlotMulGpu {
             )));
         }
 
-        // Create input buffer
+        // Create input buffer (single batch at offset 0)
         let num_batches = 1;
-        let mut input_data = vec![0u32; num_batches * k * n * 2];
+        let mut input_data = vec![0u32; num_batches * n * 2];
         for elem_idx in 0..n {
-            let idx = (mod_idx * n + elem_idx) * 2;
+            let idx = elem_idx * 2;
             input_data[idx] = input[elem_idx] as u32;
             input_data[idx + 1] = (input[elem_idx] >> 32) as u32;
         }
@@ -1578,7 +1585,7 @@ impl RnsSlotMulGpu {
         // Output buffer
         let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test_inverse_ntt output"),
-            size: (num_batches * k * n * 2 * std::mem::size_of::<u32>()) as u64,
+            size: (num_batches * n * 2 * std::mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -1639,19 +1646,20 @@ impl RnsSlotMulGpu {
             pass.dispatch_workgroups(num_batches as u32, 1, 1);
         }
 
-        // Copy to staging buffer
+        // Copy from input_buffer (inverse NTT is in-place on c0_data = binding 1)
+        let output_size = (num_batches * n * 2 * std::mem::size_of::<u32>()) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test staging"),
-            size: (num_batches * k * n * 2 * std::mem::size_of::<u32>()) as u64,
+            size: output_size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         encoder.copy_buffer_to_buffer(
-            &output_buffer,
+            &input_buffer,  // Read from input (in-place result)
             0,
             &staging,
             0,
-            (num_batches * k * n * 2 * std::mem::size_of::<u32>()) as u64,
+            output_size,
         );
 
         self.queue.submit(Some(encoder.finish()));
@@ -1672,10 +1680,10 @@ impl RnsSlotMulGpu {
         let data = buffer_slice.get_mapped_range();
         let u32_data: &[u32] = bytemuck::cast_slice(&data);
 
-        // Extract output for the specified modulus
+        // Extract output (single batch at offset 0)
         let mut result = Vec::with_capacity(n);
         for elem_idx in 0..n {
-            let idx = (mod_idx * n + elem_idx) * 2;
+            let idx = elem_idx * 2;
             let val = (u32_data[idx] as u64) | ((u32_data[idx + 1] as u64) << 32);
             result.push(val);
         }
@@ -1952,6 +1960,1068 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         Ok(result)
     }
+
+    /// Tests GPU addmod and submod against CPU reference.
+    ///
+    /// **Test API** - verifies addmod/submod implementation correctness.
+    pub fn test_addmod_submod(
+        &self,
+        a_values: &[u64],
+        b_values: &[u64],
+        mod_idx: usize,
+    ) -> Result<(Vec<u64>, Vec<u64>), GpuError> {
+        let n = a_values.len();
+        if b_values.len() != n {
+            return Err(GpuError::InvalidParams("a and b must have same length".to_string()));
+        }
+        if mod_idx >= self.params.k {
+            return Err(GpuError::InvalidParams(format!("mod_idx {} >= k {}", mod_idx, self.params.k)));
+        }
+
+        // Create shader for addmod/submod test
+        let shader_src = r#"
+struct ModulusParams {
+    modulus_lo: u32,
+    modulus_hi: u32,
+    mu_lo: u32,
+    mu_hi: u32,
+    n_inv_lo: u32,
+    n_inv_hi: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> a_vals: array<u32>;
+@group(0) @binding(1) var<storage, read> b_vals: array<u32>;
+@group(0) @binding(2) var<storage, read_write> add_out: array<u32>;
+@group(0) @binding(3) var<storage, read_write> sub_out: array<u32>;
+@group(0) @binding(4) var<uniform> mod_params: ModulusParams;
+
+fn addmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
+    var sum_lo = a.x + b.x;
+    var carry = 0u;
+    if sum_lo < a.x { carry = 1u; }
+    var sum_hi = a.y + b.y + carry;
+
+    if sum_hi > q.y || (sum_hi == q.y && sum_lo >= q.x) {
+        if sum_lo >= q.x { sum_lo = sum_lo - q.x; }
+        else { sum_lo = 0xFFFFFFFFu - (q.x - sum_lo - 1u); sum_hi = sum_hi - 1u; }
+        sum_hi = sum_hi - q.y;
+    }
+    return vec2<u32>(sum_lo, sum_hi);
+}
+
+fn submod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
+    if a.y > b.y || (a.y == b.y && a.x >= b.x) {
+        var diff_lo = a.x - b.x;
+        var borrow = 0u;
+        if a.x < b.x { borrow = 1u; }
+        var diff_hi = a.y - b.y - borrow;
+        return vec2<u32>(diff_lo, diff_hi);
+    } else {
+        var diff_lo = b.x - a.x;
+        var borrow = 0u;
+        if b.x < a.x { borrow = 1u; }
+        var diff_hi = b.y - a.y - borrow;
+        var res_lo = q.x - diff_lo;
+        borrow = 0u;
+        if q.x < diff_lo { borrow = 1u; }
+        var res_hi = q.y - diff_hi - borrow;
+        return vec2<u32>(res_lo, res_hi);
+    }
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    let a = vec2<u32>(a_vals[idx * 2u], a_vals[idx * 2u + 1u]);
+    let b = vec2<u32>(b_vals[idx * 2u], b_vals[idx * 2u + 1u]);
+    let q = vec2<u32>(mod_params.modulus_lo, mod_params.modulus_hi);
+
+    let add_result = addmod(a, b, q);
+    add_out[idx * 2u] = add_result.x;
+    add_out[idx * 2u + 1u] = add_result.y;
+
+    let sub_result = submod(a, b, q);
+    sub_out[idx * 2u] = sub_result.x;
+    sub_out[idx * 2u + 1u] = sub_result.y;
+}
+"#;
+
+        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("addmod_submod_test shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(shader_src)),
+        });
+
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("addmod_submod_test pipeline"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let a_data: Vec<u32> = a_values.iter().flat_map(|&x| [x as u32, (x >> 32) as u32]).collect();
+        let b_data: Vec<u32> = b_values.iter().flat_map(|&x| [x as u32, (x >> 32) as u32]).collect();
+
+        let a_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("a_buffer"),
+            contents: bytemuck::cast_slice(&a_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let b_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("b_buffer"),
+            contents: bytemuck::cast_slice(&b_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let add_out_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("add_out_buffer"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let sub_out_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sub_out_buffer"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group_layout = pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("addmod_submod_test bind group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: a_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: add_out_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: sub_out_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: self.rns_params_buffers[mod_idx].as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("addmod_submod_test encoder"),
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("addmod_submod_test pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(((n + 255) / 256) as u32, 1, 1);
+        }
+
+        let add_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("add_staging"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sub_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sub_staging"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(&add_out_buffer, 0, &add_staging, 0, (n * 2 * std::mem::size_of::<u32>()) as u64);
+        encoder.copy_buffer_to_buffer(&sub_out_buffer, 0, &sub_staging, 0, (n * 2 * std::mem::size_of::<u32>()) as u64);
+
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Read add results
+        let buffer_slice = add_staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GpuError::ExecutionFailed(format!("Channel recv failed: {:?}", e)))?
+            .map_err(|e| GpuError::ExecutionFailed(format!("Buffer mapping failed: {:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let u32_data: &[u32] = bytemuck::cast_slice(&data);
+        let mut add_result = Vec::with_capacity(n);
+        for i in 0..n {
+            let val = (u32_data[i * 2] as u64) | ((u32_data[i * 2 + 1] as u64) << 32);
+            add_result.push(val);
+        }
+        drop(data);
+        add_staging.unmap();
+
+        // Read sub results
+        let buffer_slice = sub_staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GpuError::ExecutionFailed(format!("Channel recv failed: {:?}", e)))?
+            .map_err(|e| GpuError::ExecutionFailed(format!("Buffer mapping failed: {:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let u32_data: &[u32] = bytemuck::cast_slice(&data);
+        let mut sub_result = Vec::with_capacity(n);
+        for i in 0..n {
+            let val = (u32_data[i * 2] as u64) | ((u32_data[i * 2 + 1] as u64) << 32);
+            sub_result.push(val);
+        }
+        drop(data);
+        sub_staging.unmap();
+
+        Ok((add_result, sub_result))
+    }
+
+    /// Test bit_reverse function in isolation.
+    pub fn test_bit_reverse(
+        &self,
+        indices: &[u32],
+        log_n: u32,
+    ) -> Result<Vec<u32>, GpuError> {
+        let n = indices.len();
+
+        let shader_source = format!(r#"
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+
+fn bit_reverse(x: u32, bits: u32) -> u32 {{
+    var v = x;
+    var r: u32 = 0u;
+    for (var i: u32 = 0u; i < bits; i++) {{
+        r = (r << 1u) | (v & 1u);
+        v = v >> 1u;
+    }}
+    return r;
+}}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let idx = gid.x;
+    if idx >= {n}u {{ return; }}
+    output[idx] = bit_reverse(input[idx], {log_n}u);
+}}
+"#, n = n, log_n = log_n);
+
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("bit_reverse_test shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
+
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("bit_reverse_test pipeline"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let input_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("input"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("output"),
+            size: (n * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bit_reverse_test bind_group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: input_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: output_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("bit_reverse_test encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("bit_reverse_test pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(((n + 255) / 256) as u32, 1, 1);
+        }
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: (n * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging, 0, (n * std::mem::size_of::<u32>()) as u64);
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let buffer_slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GpuError::ExecutionFailed(format!("Channel recv failed: {:?}", e)))?
+            .map_err(|e| GpuError::ExecutionFailed(format!("Buffer mapping failed: {:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let result: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+
+        Ok(result)
+    }
+
+    /// Test twiddle factor (omega_inv^i) computation in isolation.
+    pub fn test_twiddle_factors(
+        &self,
+        mod_idx: usize,
+    ) -> Result<Vec<u64>, GpuError> {
+        let n = self.params.n;
+        let data = &self.params.rns_data[mod_idx];
+        let q = data.modulus;
+        let omega_inv = data.omega_inv;
+
+        // Create buffer with omega_inv powers (what should be in twiddles)
+        // We'll compute them on GPU and compare
+        let shader_source = format!(r#"
+@group(0) @binding(0) var<storage, read_write> output: array<u32>;
+
+fn u64_mul(a: u32, b: u32) -> vec2<u32> {{
+    let a_lo = a & 0xFFFFu;
+    let a_hi = a >> 16u;
+    let b_lo = b & 0xFFFFu;
+    let b_hi = b >> 16u;
+    let p0 = a_lo * b_lo;
+    let p1 = a_lo * b_hi;
+    let p2 = a_hi * b_lo;
+    let p3 = a_hi * b_hi;
+    var lo = p0;
+    var hi = p3;
+    let mid = p1 + p2;
+    let mid_lo = (mid & 0xFFFFu) << 16u;
+    let mid_hi = mid >> 16u;
+    let new_lo = lo + mid_lo;
+    if new_lo < lo {{ hi = hi + 1u; }}
+    lo = new_lo;
+    hi = hi + mid_hi;
+    if p1 > 0xFFFFFFFFu - p2 {{ hi = hi + 0x10000u; }}
+    return vec2<u32>(lo, hi);
+}}
+
+fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {{
+    let p00 = u64_mul(a.x, b.x);
+    let p01 = u64_mul(a.x, b.y);
+    let p10 = u64_mul(a.y, b.x);
+    let p11 = u64_mul(a.y, b.y);
+    var r0 = p00.x;
+    var r1 = p00.y;
+    var r2 = p11.x;
+    var r3 = p11.y;
+    var carry: u32 = 0u;
+    var sum = r1 + p01.x;
+    if sum < r1 {{ carry = 1u; }}
+    r1 = sum;
+    sum = r2 + carry;
+    carry = 0u;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    carry = 0u;
+    sum = r1 + p10.x;
+    if sum < r1 {{ carry = 1u; }}
+    r1 = sum;
+    sum = r2 + carry;
+    carry = 0u;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    carry = 0u;
+    sum = r2 + p01.y;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    carry = 0u;
+    sum = r2 + p10.y;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    return vec4<u32>(r0, r1, r2, r3);
+}}
+
+fn sub128(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {{
+    var r: vec4<u32>;
+    var borrow: u32 = 0u;
+    if a.x >= b.x {{ r.x = a.x - b.x; borrow = 0u; }}
+    else {{ r.x = 0xFFFFFFFFu - (b.x - a.x - 1u); borrow = 1u; }}
+    let t1 = a.y - borrow;
+    borrow = select(0u, 1u, a.y < borrow);
+    if t1 >= b.y {{ r.y = t1 - b.y; }}
+    else {{ r.y = 0xFFFFFFFFu - (b.y - t1 - 1u); borrow = borrow + 1u; }}
+    let t2 = a.z - borrow;
+    borrow = select(0u, 1u, a.z < borrow);
+    if t2 >= b.z {{ r.z = t2 - b.z; }}
+    else {{ r.z = 0xFFFFFFFFu - (b.z - t2 - 1u); borrow = borrow + 1u; }}
+    r.w = a.w - b.w - borrow;
+    return r;
+}}
+
+fn ge128(a: vec4<u32>, b: vec4<u32>) -> bool {{
+    if a.w != b.w {{ return a.w > b.w; }}
+    if a.z != b.z {{ return a.z > b.z; }}
+    if a.y != b.y {{ return a.y > b.y; }}
+    return a.x >= b.x;
+}}
+
+fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {{
+    var prod = mul64(a, b);
+    let q128 = vec4<u32>(q.x, q.y, 0u, 0u);
+    for (var shift = 63; shift >= 0; shift--) {{
+        if !ge128(prod, q128) {{ break; }}
+        var shifted_q: vec4<u32>;
+        let s = u32(shift);
+        if s >= 64u {{
+            let ss = s - 64u;
+            shifted_q.x = 0u;
+            shifted_q.y = 0u;
+            shifted_q.z = q.x << ss;
+            shifted_q.w = select(0u, q.x >> (32u - ss), ss > 0u) | (q.y << ss);
+            if ss > 0u {{ shifted_q.z = shifted_q.z | select(0u, q.y >> (32u - ss), ss < 32u); }}
+        }} else if s >= 32u {{
+            let ss = s - 32u;
+            shifted_q.x = 0u;
+            shifted_q.y = q.x << ss;
+            shifted_q.z = select(0u, q.x >> (32u - ss), ss > 0u) | (q.y << ss);
+            shifted_q.w = select(0u, q.y >> (32u - ss), ss > 0u);
+        }} else if s > 0u {{
+            shifted_q.x = q.x << s;
+            shifted_q.y = (q.x >> (32u - s)) | (q.y << s);
+            shifted_q.z = q.y >> (32u - s);
+            shifted_q.w = 0u;
+        }} else {{
+            shifted_q = q128;
+        }}
+        if ge128(prod, shifted_q) {{
+            prod = sub128(prod, shifted_q);
+        }}
+    }}
+    return vec2<u32>(prod.x, prod.y);
+}}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let idx = gid.x;
+    if idx >= {n}u {{ return; }}
+
+    // Compute omega_inv^idx iteratively
+    let q = vec2<u32>({q_lo}u, {q_hi}u);
+    let omega_inv = vec2<u32>({omega_inv_lo}u, {omega_inv_hi}u);
+
+    var result = vec2<u32>(1u, 0u);  // Start with 1
+    var base = omega_inv;
+    var exp = idx;
+
+    while exp > 0u {{
+        if (exp & 1u) == 1u {{
+            result = mulmod(result, base, q);
+        }}
+        exp = exp >> 1u;
+        base = mulmod(base, base, q);
+    }}
+
+    output[idx * 2u] = result.x;
+    output[idx * 2u + 1u] = result.y;
+}}
+"#, n = n,
+   q_lo = q as u32, q_hi = (q >> 32) as u32,
+   omega_inv_lo = omega_inv as u32, omega_inv_hi = (omega_inv >> 32) as u32);
+
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("twiddle_test shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
+
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("twiddle_test pipeline"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("output"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("twiddle_test bind_group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: output_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("twiddle_test encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("twiddle_test pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(((n + 255) / 256) as u32, 1, 1);
+        }
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging, 0, (n * 2 * std::mem::size_of::<u32>()) as u64);
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let buffer_slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GpuError::ExecutionFailed(format!("Channel recv failed: {:?}", e)))?
+            .map_err(|e| GpuError::ExecutionFailed(format!("Buffer mapping failed: {:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let u32_data: &[u32] = bytemuck::cast_slice(&data);
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            let val = (u32_data[i * 2] as u64) | ((u32_data[i * 2 + 1] as u64) << 32);
+            result.push(val);
+        }
+        drop(data);
+        staging.unmap();
+
+        Ok(result)
+    }
+
+    /// Test untwist operation (multiply by psi_inv^i) in isolation.
+    pub fn test_untwist(
+        &self,
+        values: &[u64],
+        mod_idx: usize,
+    ) -> Result<Vec<u64>, GpuError> {
+        let n = values.len();
+        let data = &self.params.rns_data[mod_idx];
+        let q = data.modulus;
+        let psi_inv = data.psi_inv;
+
+        // Pack input values
+        let mut input_data: Vec<u32> = Vec::with_capacity(n * 2);
+        for &v in values {
+            input_data.push(v as u32);
+            input_data.push((v >> 32) as u32);
+        }
+
+        let shader_source = format!(r#"
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+
+fn u64_mul(a: u32, b: u32) -> vec2<u32> {{
+    let a_lo = a & 0xFFFFu;
+    let a_hi = a >> 16u;
+    let b_lo = b & 0xFFFFu;
+    let b_hi = b >> 16u;
+    let p0 = a_lo * b_lo;
+    let p1 = a_lo * b_hi;
+    let p2 = a_hi * b_lo;
+    let p3 = a_hi * b_hi;
+    var lo = p0;
+    var hi = p3;
+    let mid = p1 + p2;
+    let mid_lo = (mid & 0xFFFFu) << 16u;
+    let mid_hi = mid >> 16u;
+    let new_lo = lo + mid_lo;
+    if new_lo < lo {{ hi = hi + 1u; }}
+    lo = new_lo;
+    hi = hi + mid_hi;
+    if p1 > 0xFFFFFFFFu - p2 {{ hi = hi + 0x10000u; }}
+    return vec2<u32>(lo, hi);
+}}
+
+fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {{
+    let p00 = u64_mul(a.x, b.x);
+    let p01 = u64_mul(a.x, b.y);
+    let p10 = u64_mul(a.y, b.x);
+    let p11 = u64_mul(a.y, b.y);
+    var r0 = p00.x;
+    var r1 = p00.y;
+    var r2 = p11.x;
+    var r3 = p11.y;
+    var carry: u32 = 0u;
+    var sum = r1 + p01.x;
+    if sum < r1 {{ carry = 1u; }}
+    r1 = sum;
+    sum = r2 + carry;
+    carry = 0u;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    carry = 0u;
+    sum = r1 + p10.x;
+    if sum < r1 {{ carry = 1u; }}
+    r1 = sum;
+    sum = r2 + carry;
+    carry = 0u;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    carry = 0u;
+    sum = r2 + p01.y;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    carry = 0u;
+    sum = r2 + p10.y;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    return vec4<u32>(r0, r1, r2, r3);
+}}
+
+fn sub128(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {{
+    var r: vec4<u32>;
+    var borrow: u32 = 0u;
+    if a.x >= b.x {{ r.x = a.x - b.x; borrow = 0u; }}
+    else {{ r.x = 0xFFFFFFFFu - (b.x - a.x - 1u); borrow = 1u; }}
+    let t1 = a.y - borrow;
+    borrow = select(0u, 1u, a.y < borrow);
+    if t1 >= b.y {{ r.y = t1 - b.y; }}
+    else {{ r.y = 0xFFFFFFFFu - (b.y - t1 - 1u); borrow = borrow + 1u; }}
+    let t2 = a.z - borrow;
+    borrow = select(0u, 1u, a.z < borrow);
+    if t2 >= b.z {{ r.z = t2 - b.z; }}
+    else {{ r.z = 0xFFFFFFFFu - (b.z - t2 - 1u); borrow = borrow + 1u; }}
+    r.w = a.w - b.w - borrow;
+    return r;
+}}
+
+fn ge128(a: vec4<u32>, b: vec4<u32>) -> bool {{
+    if a.w != b.w {{ return a.w > b.w; }}
+    if a.z != b.z {{ return a.z > b.z; }}
+    if a.y != b.y {{ return a.y > b.y; }}
+    return a.x >= b.x;
+}}
+
+fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {{
+    var prod = mul64(a, b);
+    let q128 = vec4<u32>(q.x, q.y, 0u, 0u);
+    for (var shift = 63; shift >= 0; shift--) {{
+        if !ge128(prod, q128) {{ break; }}
+        var shifted_q: vec4<u32>;
+        let s = u32(shift);
+        if s >= 64u {{
+            let ss = s - 64u;
+            shifted_q.x = 0u;
+            shifted_q.y = 0u;
+            shifted_q.z = q.x << ss;
+            shifted_q.w = select(0u, q.x >> (32u - ss), ss > 0u) | (q.y << ss);
+            if ss > 0u {{ shifted_q.z = shifted_q.z | select(0u, q.y >> (32u - ss), ss < 32u); }}
+        }} else if s >= 32u {{
+            let ss = s - 32u;
+            shifted_q.x = 0u;
+            shifted_q.y = q.x << ss;
+            shifted_q.z = select(0u, q.x >> (32u - ss), ss > 0u) | (q.y << ss);
+            shifted_q.w = select(0u, q.y >> (32u - ss), ss > 0u);
+        }} else if s > 0u {{
+            shifted_q.x = q.x << s;
+            shifted_q.y = (q.x >> (32u - s)) | (q.y << s);
+            shifted_q.z = q.y >> (32u - s);
+            shifted_q.w = 0u;
+        }} else {{
+            shifted_q = q128;
+        }}
+        if ge128(prod, shifted_q) {{
+            prod = sub128(prod, shifted_q);
+        }}
+    }}
+    return vec2<u32>(prod.x, prod.y);
+}}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let idx = gid.x;
+    if idx >= {n}u {{ return; }}
+
+    let q = vec2<u32>({q_lo}u, {q_hi}u);
+    let psi_inv = vec2<u32>({psi_inv_lo}u, {psi_inv_hi}u);
+
+    // Compute psi_inv^idx
+    var psi_inv_power = vec2<u32>(1u, 0u);
+    var base = psi_inv;
+    var exp = idx;
+    while exp > 0u {{
+        if (exp & 1u) == 1u {{
+            psi_inv_power = mulmod(psi_inv_power, base, q);
+        }}
+        exp = exp >> 1u;
+        base = mulmod(base, base, q);
+    }}
+
+    // Read input value and multiply by psi_inv^idx
+    let val = vec2<u32>(input[idx * 2u], input[idx * 2u + 1u]);
+    let result = mulmod(val, psi_inv_power, q);
+
+    output[idx * 2u] = result.x;
+    output[idx * 2u + 1u] = result.y;
+}}
+"#, n = n,
+   q_lo = q as u32, q_hi = (q >> 32) as u32,
+   psi_inv_lo = psi_inv as u32, psi_inv_hi = (psi_inv >> 32) as u32);
+
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("untwist_test shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
+
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("untwist_test pipeline"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let input_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("input"),
+            contents: bytemuck::cast_slice(&input_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("output"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("untwist_test bind_group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: input_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: output_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("untwist_test encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("untwist_test pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(((n + 255) / 256) as u32, 1, 1);
+        }
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging, 0, (n * 2 * std::mem::size_of::<u32>()) as u64);
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let buffer_slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GpuError::ExecutionFailed(format!("Channel recv failed: {:?}", e)))?
+            .map_err(|e| GpuError::ExecutionFailed(format!("Buffer mapping failed: {:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let u32_data: &[u32] = bytemuck::cast_slice(&data);
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            let val = (u32_data[i * 2] as u64) | ((u32_data[i * 2 + 1] as u64) << 32);
+            result.push(val);
+        }
+        drop(data);
+        staging.unmap();
+
+        Ok(result)
+    }
+
+    /// Test n_inv scaling in isolation.
+    pub fn test_n_inv_scaling(
+        &self,
+        values: &[u64],
+        mod_idx: usize,
+    ) -> Result<Vec<u64>, GpuError> {
+        let n = values.len();
+        let data = &self.params.rns_data[mod_idx];
+        let q = data.modulus;
+        let n_inv = data.n_inv;
+
+        // Pack input values
+        let mut input_data: Vec<u32> = Vec::with_capacity(n * 2);
+        for &v in values {
+            input_data.push(v as u32);
+            input_data.push((v >> 32) as u32);
+        }
+
+        let shader_source = format!(r#"
+@group(0) @binding(0) var<storage, read> input: array<u32>;
+@group(0) @binding(1) var<storage, read_write> output: array<u32>;
+
+fn u64_mul(a: u32, b: u32) -> vec2<u32> {{
+    let a_lo = a & 0xFFFFu;
+    let a_hi = a >> 16u;
+    let b_lo = b & 0xFFFFu;
+    let b_hi = b >> 16u;
+    let p0 = a_lo * b_lo;
+    let p1 = a_lo * b_hi;
+    let p2 = a_hi * b_lo;
+    let p3 = a_hi * b_hi;
+    var lo = p0;
+    var hi = p3;
+    let mid = p1 + p2;
+    let mid_lo = (mid & 0xFFFFu) << 16u;
+    let mid_hi = mid >> 16u;
+    let new_lo = lo + mid_lo;
+    if new_lo < lo {{ hi = hi + 1u; }}
+    lo = new_lo;
+    hi = hi + mid_hi;
+    if p1 > 0xFFFFFFFFu - p2 {{ hi = hi + 0x10000u; }}
+    return vec2<u32>(lo, hi);
+}}
+
+fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {{
+    let p00 = u64_mul(a.x, b.x);
+    let p01 = u64_mul(a.x, b.y);
+    let p10 = u64_mul(a.y, b.x);
+    let p11 = u64_mul(a.y, b.y);
+    var r0 = p00.x;
+    var r1 = p00.y;
+    var r2 = p11.x;
+    var r3 = p11.y;
+    var carry: u32 = 0u;
+    var sum = r1 + p01.x;
+    if sum < r1 {{ carry = 1u; }}
+    r1 = sum;
+    sum = r2 + carry;
+    carry = 0u;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    carry = 0u;
+    sum = r1 + p10.x;
+    if sum < r1 {{ carry = 1u; }}
+    r1 = sum;
+    sum = r2 + carry;
+    carry = 0u;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    carry = 0u;
+    sum = r2 + p01.y;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    carry = 0u;
+    sum = r2 + p10.y;
+    if sum < r2 {{ carry = 1u; }}
+    r2 = sum;
+    r3 = r3 + carry;
+    return vec4<u32>(r0, r1, r2, r3);
+}}
+
+fn sub128(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {{
+    var r: vec4<u32>;
+    var borrow: u32 = 0u;
+    if a.x >= b.x {{ r.x = a.x - b.x; borrow = 0u; }}
+    else {{ r.x = 0xFFFFFFFFu - (b.x - a.x - 1u); borrow = 1u; }}
+    let t1 = a.y - borrow;
+    borrow = select(0u, 1u, a.y < borrow);
+    if t1 >= b.y {{ r.y = t1 - b.y; }}
+    else {{ r.y = 0xFFFFFFFFu - (b.y - t1 - 1u); borrow = borrow + 1u; }}
+    let t2 = a.z - borrow;
+    borrow = select(0u, 1u, a.z < borrow);
+    if t2 >= b.z {{ r.z = t2 - b.z; }}
+    else {{ r.z = 0xFFFFFFFFu - (b.z - t2 - 1u); borrow = borrow + 1u; }}
+    r.w = a.w - b.w - borrow;
+    return r;
+}}
+
+fn ge128(a: vec4<u32>, b: vec4<u32>) -> bool {{
+    if a.w != b.w {{ return a.w > b.w; }}
+    if a.z != b.z {{ return a.z > b.z; }}
+    if a.y != b.y {{ return a.y > b.y; }}
+    return a.x >= b.x;
+}}
+
+fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {{
+    var prod = mul64(a, b);
+    let q128 = vec4<u32>(q.x, q.y, 0u, 0u);
+    for (var shift = 63; shift >= 0; shift--) {{
+        if !ge128(prod, q128) {{ break; }}
+        var shifted_q: vec4<u32>;
+        let s = u32(shift);
+        if s >= 64u {{
+            let ss = s - 64u;
+            shifted_q.x = 0u;
+            shifted_q.y = 0u;
+            shifted_q.z = q.x << ss;
+            shifted_q.w = select(0u, q.x >> (32u - ss), ss > 0u) | (q.y << ss);
+            if ss > 0u {{ shifted_q.z = shifted_q.z | select(0u, q.y >> (32u - ss), ss < 32u); }}
+        }} else if s >= 32u {{
+            let ss = s - 32u;
+            shifted_q.x = 0u;
+            shifted_q.y = q.x << ss;
+            shifted_q.z = select(0u, q.x >> (32u - ss), ss > 0u) | (q.y << ss);
+            shifted_q.w = select(0u, q.y >> (32u - ss), ss > 0u);
+        }} else if s > 0u {{
+            shifted_q.x = q.x << s;
+            shifted_q.y = (q.x >> (32u - s)) | (q.y << s);
+            shifted_q.z = q.y >> (32u - s);
+            shifted_q.w = 0u;
+        }} else {{
+            shifted_q = q128;
+        }}
+        if ge128(prod, shifted_q) {{
+            prod = sub128(prod, shifted_q);
+        }}
+    }}
+    return vec2<u32>(prod.x, prod.y);
+}}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let idx = gid.x;
+    if idx >= {n}u {{ return; }}
+
+    let q = vec2<u32>({q_lo}u, {q_hi}u);
+    let n_inv = vec2<u32>({n_inv_lo}u, {n_inv_hi}u);
+
+    let val = vec2<u32>(input[idx * 2u], input[idx * 2u + 1u]);
+    let result = mulmod(val, n_inv, q);
+
+    output[idx * 2u] = result.x;
+    output[idx * 2u + 1u] = result.y;
+}}
+"#, n = n,
+   q_lo = q as u32, q_hi = (q >> 32) as u32,
+   n_inv_lo = n_inv as u32, n_inv_hi = (n_inv >> 32) as u32);
+
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("n_inv_test shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_source.into()),
+        });
+
+        let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("n_inv_test pipeline"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let input_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("input"),
+            contents: bytemuck::cast_slice(&input_data),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("output"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("n_inv_test bind_group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: input_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: output_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("n_inv_test encoder"),
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("n_inv_test pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(((n + 255) / 256) as u32, 1, 1);
+        }
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging, 0, (n * 2 * std::mem::size_of::<u32>()) as u64);
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+
+        let buffer_slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| GpuError::ExecutionFailed(format!("Channel recv failed: {:?}", e)))?
+            .map_err(|e| GpuError::ExecutionFailed(format!("Buffer mapping failed: {:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let u32_data: &[u32] = bytemuck::cast_slice(&data);
+        let mut result = Vec::with_capacity(n);
+        for i in 0..n {
+            let val = (u32_data[i * 2] as u64) | ((u32_data[i * 2 + 1] as u64) << 32);
+            result.push(val);
+        }
+        drop(data);
+        staging.unmap();
+
+        Ok(result)
+    }
 }
 // ============================================================================
 // WGSL Shaders
@@ -1959,6 +3029,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 /// Slot encoding shader (INTT mod t to convert slots to coefficients).
 const SLOT_ENCODE_SHADER: &str = r#"
+#import math
+
 struct BatchParams {
     n: u32,
     log_n: u32,
@@ -1985,194 +3057,6 @@ struct ModulusParams {
 
 var<workgroup> shared_lo: array<u32, 8192>;
 var<workgroup> shared_hi: array<u32, 8192>;
-
-fn bit_reverse(x: u32, bits: u32) -> u32 {
-    var v = x;
-    var r: u32 = 0u;
-    for (var i: u32 = 0u; i < bits; i++) {
-        r = (r << 1u) | (v & 1u);
-        v = v >> 1u;
-    }
-    return r;
-}
-
-// 64-bit modular arithmetic helpers
-fn addmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    var sum_lo = a.x + b.x;
-    var carry = 0u;
-    if sum_lo < a.x { carry = 1u; }
-    var sum_hi = a.y + b.y + carry;
-
-    if sum_hi > q.y || (sum_hi == q.y && sum_lo >= q.x) {
-        if sum_lo >= q.x {
-            sum_lo = sum_lo - q.x;
-        } else {
-            sum_lo = 0xFFFFFFFFu - (q.x - sum_lo - 1u);
-            sum_hi = sum_hi - 1u;
-        }
-        sum_hi = sum_hi - q.y;
-    }
-    return vec2<u32>(sum_lo, sum_hi);
-}
-
-fn submod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    if a.y > b.y || (a.y == b.y && a.x >= b.x) {
-        var diff_lo = a.x - b.x;
-        var borrow = 0u;
-        if a.x < b.x { borrow = 1u; }
-        var diff_hi = a.y - b.y - borrow;
-        return vec2<u32>(diff_lo, diff_hi);
-    } else {
-        var diff_lo = b.x - a.x;
-        var borrow = 0u;
-        if b.x < a.x { borrow = 1u; }
-        var diff_hi = b.y - a.y - borrow;
-
-        var res_lo = q.x - diff_lo;
-        borrow = 0u;
-        if q.x < diff_lo { borrow = 1u; }
-        var res_hi = q.y - diff_hi - borrow;
-        return vec2<u32>(res_lo, res_hi);
-    }
-}
-
-fn u64_mul(a: u32, b: u32) -> vec2<u32> {
-    let a_lo = a & 0xFFFFu;
-    let a_hi = a >> 16u;
-    let b_lo = b & 0xFFFFu;
-    let b_hi = b >> 16u;
-
-    let p0 = a_lo * b_lo;
-    let p1 = a_lo * b_hi;
-    let p2 = a_hi * b_lo;
-    let p3 = a_hi * b_hi;
-
-    var lo = p0;
-    var hi = p3;
-
-    let mid = p1 + p2;
-    let mid_lo = (mid & 0xFFFFu) << 16u;
-    let mid_hi = mid >> 16u;
-
-    let new_lo = lo + mid_lo;
-    if new_lo < lo { hi = hi + 1u; }
-    lo = new_lo;
-    hi = hi + mid_hi;
-
-    if p1 > 0xFFFFFFFFu - p2 {
-        hi = hi + 0x10000u;
-    }
-
-    return vec2<u32>(lo, hi);
-}
-
-fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
-    let p00 = u64_mul(a.x, b.x);
-    let p01 = u64_mul(a.x, b.y);
-    let p10 = u64_mul(a.y, b.x);
-    let p11 = u64_mul(a.y, b.y);
-
-    var r0 = p00.x;
-    var r1 = p00.y;
-    var r2 = p11.x;
-    var r3 = p11.y;
-
-    var t = r1 + p01.x;
-    var c: u32 = 0u;
-    if t < r1 { c = 1u; }
-    r1 = t;
-    t = r1 + p10.x;
-    if t < r1 { c = c + 1u; }
-    r1 = t;
-
-    t = r2 + p01.y;
-    var c2: u32 = 0u;
-    if t < r2 { c2 = 1u; }
-    r2 = t;
-    t = r2 + p10.y;
-    if t < r2 { c2 = c2 + 1u; }
-    r2 = t;
-    t = r2 + c;
-    if t < r2 { c2 = c2 + 1u; }
-    r2 = t;
-
-    r3 = r3 + c2;
-
-    return vec4<u32>(r0, r1, r2, r3);
-}
-
-// 128-bit subtraction: a - b, returns (result, borrow)
-fn sub128(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {
-    var r0 = a.x; var r1 = a.y; var r2 = a.z; var r3 = a.w;
-    var borrow = 0u;
-
-    if r0 >= b.x { r0 = r0 - b.x; }
-    else { r0 = 0xFFFFFFFFu - (b.x - r0 - 1u); borrow = 1u; }
-
-    let t1 = r1 - b.y - borrow;
-    if t1 > r1 || (borrow == 1u && t1 == r1) { borrow = 1u; } else { borrow = 0u; }
-    r1 = r1 - b.y;
-    if borrow == 1u { r1 = r1 - 1u; }
-
-    let needs_borrow2 = r2 < b.z + borrow || (r2 == b.z + borrow && borrow > 0u && b.z == 0xFFFFFFFFu);
-    r2 = r2 - b.z - borrow;
-    if needs_borrow2 { borrow = 1u; } else { borrow = 0u; }
-
-    r3 = r3 - b.w - borrow;
-
-    return vec4<u32>(r0, r1, r2, r3);
-}
-
-// Compare 128-bit: returns true if a >= b
-fn ge128(a: vec4<u32>, b: vec4<u32>) -> bool {
-    if a.w != b.w { return a.w > b.w; }
-    if a.z != b.z { return a.z > b.z; }
-    if a.y != b.y { return a.y > b.y; }
-    return a.x >= b.x;
-}
-
-fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    let prod = mul64(a, b);
-
-    // q as 128-bit for comparison
-    let q128 = vec4<u32>(q.x, q.y, 0u, 0u);
-
-    // Reduce 128-bit product mod q using repeated subtraction
-    // For 60-bit q and 120-bit product, need at most ~2^60 subtractions in worst case
-    // But since both inputs are < q, product < q^2, so we need < q subtractions
-    // Use shift-and-subtract for efficiency
-    var r = prod;
-
-    // Find highest bit position of r
-    // Then shift q up and subtract
-    for (var shift = 60u; shift > 0u; shift = shift - 1u) {
-        // q_shifted = q << shift (as 128-bit)
-        var q_shifted: vec4<u32>;
-        if shift >= 96u {
-            q_shifted = vec4<u32>(0u, 0u, 0u, q.x << (shift - 96u));
-        } else if shift >= 64u {
-            let s = shift - 64u;
-            q_shifted = vec4<u32>(0u, 0u, q.x << s, (q.y << s) | (q.x >> (32u - s)));
-        } else if shift >= 32u {
-            let s = shift - 32u;
-            q_shifted = vec4<u32>(0u, q.x << s, (q.y << s) | (q.x >> (32u - s)), q.y >> (32u - s));
-        } else {
-            q_shifted = vec4<u32>(q.x << shift, (q.y << shift) | (q.x >> (32u - shift)), q.y >> (32u - shift), 0u);
-        }
-
-        if ge128(r, q_shifted) {
-            r = sub128(r, q_shifted);
-        }
-    }
-
-    // Final reductions for remaining value
-    for (var i = 0u; i < 3u; i++) {
-        if !ge128(r, q128) { break; }
-        r = sub128(r, q128);
-    }
-
-    return vec2<u32>(r.x, r.y);
-}
 
 @compute @workgroup_size(256, 1, 1)
 fn slot_encode_batched(
@@ -2248,6 +3132,8 @@ fn slot_encode_batched(
 
 /// Forward NTT shader (twist + NTT for RNS modulus).
 const FORWARD_NTT_SHADER: &str = r#"
+#import math
+
 struct BatchParams {
     n: u32,
     log_n: u32,
@@ -2274,166 +3160,6 @@ struct ModulusParams {
 
 var<workgroup> shared_lo: array<u32, 8192>;
 var<workgroup> shared_hi: array<u32, 8192>;
-
-fn bit_reverse(x: u32, bits: u32) -> u32 {
-    var v = x;
-    var r: u32 = 0u;
-    for (var i: u32 = 0u; i < bits; i++) {
-        r = (r << 1u) | (v & 1u);
-        v = v >> 1u;
-    }
-    return r;
-}
-
-fn addmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    var sum_lo = a.x + b.x;
-    var carry = 0u;
-    if sum_lo < a.x { carry = 1u; }
-    var sum_hi = a.y + b.y + carry;
-
-    if sum_hi > q.y || (sum_hi == q.y && sum_lo >= q.x) {
-        if sum_lo >= q.x { sum_lo = sum_lo - q.x; }
-        else { sum_lo = 0xFFFFFFFFu - (q.x - sum_lo - 1u); sum_hi = sum_hi - 1u; }
-        sum_hi = sum_hi - q.y;
-    }
-    return vec2<u32>(sum_lo, sum_hi);
-}
-
-fn submod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    if a.y > b.y || (a.y == b.y && a.x >= b.x) {
-        var diff_lo = a.x - b.x;
-        var borrow = 0u;
-        if a.x < b.x { borrow = 1u; }
-        var diff_hi = a.y - b.y - borrow;
-        return vec2<u32>(diff_lo, diff_hi);
-    } else {
-        var diff_lo = b.x - a.x;
-        var borrow = 0u;
-        if b.x < a.x { borrow = 1u; }
-        var diff_hi = b.y - a.y - borrow;
-        var res_lo = q.x - diff_lo;
-        borrow = 0u;
-        if q.x < diff_lo { borrow = 1u; }
-        var res_hi = q.y - diff_hi - borrow;
-        return vec2<u32>(res_lo, res_hi);
-    }
-}
-
-fn u64_mul(a: u32, b: u32) -> vec2<u32> {
-    let a_lo = a & 0xFFFFu;
-    let a_hi = a >> 16u;
-    let b_lo = b & 0xFFFFu;
-    let b_hi = b >> 16u;
-
-    let p0 = a_lo * b_lo;
-    let p1 = a_lo * b_hi;
-    let p2 = a_hi * b_lo;
-    let p3 = a_hi * b_hi;
-
-    var lo = p0;
-    var hi = p3;
-    let mid = p1 + p2;
-    let mid_lo = (mid & 0xFFFFu) << 16u;
-    let mid_hi = mid >> 16u;
-    let new_lo = lo + mid_lo;
-    if new_lo < lo { hi = hi + 1u; }
-    lo = new_lo;
-    hi = hi + mid_hi;
-    if p1 > 0xFFFFFFFFu - p2 { hi = hi + 0x10000u; }
-    return vec2<u32>(lo, hi);
-}
-
-fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
-    let p00 = u64_mul(a.x, b.x);
-    let p01 = u64_mul(a.x, b.y);
-    let p10 = u64_mul(a.y, b.x);
-    let p11 = u64_mul(a.y, b.y);
-
-    var r0 = p00.x; var r1 = p00.y;
-    var r2 = p11.x; var r3 = p11.y;
-
-    var t = r1 + p01.x; var c: u32 = 0u;
-    if t < r1 { c = 1u; } r1 = t;
-    t = r1 + p10.x; if t < r1 { c = c + 1u; } r1 = t;
-
-    t = r2 + p01.y; var c2: u32 = 0u;
-    if t < r2 { c2 = 1u; } r2 = t;
-    t = r2 + p10.y; if t < r2 { c2 = c2 + 1u; } r2 = t;
-    t = r2 + c; if t < r2 { c2 = c2 + 1u; } r2 = t;
-    r3 = r3 + c2;
-
-    return vec4<u32>(r0, r1, r2, r3);
-}
-
-// Compare 128-bit: returns true if a >= b
-fn ge128(a: vec4<u32>, b: vec4<u32>) -> bool {
-    if a.w != b.w { return a.w > b.w; }
-    if a.z != b.z { return a.z > b.z; }
-    if a.y != b.y { return a.y > b.y; }
-    return a.x >= b.x;
-}
-
-// 128-bit subtraction: a - b
-fn sub128(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {
-    var r0 = a.x; var r1 = a.y; var r2 = a.z; var r3 = a.w;
-    var borrow = 0u;
-
-    if r0 >= b.x { r0 = r0 - b.x; }
-    else { r0 = 0xFFFFFFFFu - (b.x - r0 - 1u); borrow = 1u; }
-
-    var new_r1 = r1 - b.y - borrow;
-    if new_r1 > r1 { borrow = 1u; } else { borrow = 0u; }
-    r1 = new_r1;
-
-    var new_r2 = r2 - b.z - borrow;
-    if new_r2 > r2 { borrow = 1u; } else { borrow = 0u; }
-    r2 = new_r2;
-
-    r3 = r3 - b.w - borrow;
-
-    return vec4<u32>(r0, r1, r2, r3);
-}
-
-// mulmod for 60-bit modulus: a * b mod q where a, b < q
-fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    let prod = mul64(a, b);
-    let q128 = vec4<u32>(q.x, q.y, 0u, 0u);
-    var r = prod;
-
-    // Shift-and-subtract reduction for 128-bit product mod 60-bit q
-    for (var shift = 60u; shift > 0u; shift = shift - 1u) {
-        var q_shifted: vec4<u32>;
-        if shift >= 64u {
-            let s = shift - 64u;
-            if s == 0u {
-                q_shifted = vec4<u32>(0u, 0u, q.x, q.y);
-            } else {
-                q_shifted = vec4<u32>(0u, 0u, q.x << s, (q.y << s) | (q.x >> (32u - s)));
-            }
-        } else if shift >= 32u {
-            let s = shift - 32u;
-            if s == 0u {
-                q_shifted = vec4<u32>(0u, q.x, q.y, 0u);
-            } else {
-                q_shifted = vec4<u32>(0u, q.x << s, (q.y << s) | (q.x >> (32u - s)), q.y >> (32u - s));
-            }
-        } else {
-            q_shifted = vec4<u32>(q.x << shift, (q.y << shift) | (q.x >> (32u - shift)), q.y >> (32u - shift), 0u);
-        }
-
-        if ge128(r, q_shifted) {
-            r = sub128(r, q_shifted);
-        }
-    }
-
-    // Final reductions
-    for (var i = 0u; i < 3u; i++) {
-        if !ge128(r, q128) { break; }
-        r = sub128(r, q128);
-    }
-
-    return vec2<u32>(r.x, r.y);
-}
 
 @compute @workgroup_size(256, 1, 1)
 fn forward_ntt_batched(
@@ -2514,6 +3240,8 @@ fn forward_ntt_batched(
 
 /// Pointwise multiplication shader.
 const POINTWISE_MUL_SHADER: &str = r#"
+#import math
+
 struct BatchParams {
     n: u32,
     log_n: u32,
@@ -2539,76 +3267,6 @@ struct ModulusParams {
 @group(0) @binding(4) var<storage, read_write> out_c0: array<u32>;
 @group(0) @binding(5) var<storage, read_write> out_c1: array<u32>;
 @group(0) @binding(6) var<uniform> mod_params: ModulusParams;
-
-fn u64_mul(a: u32, b: u32) -> vec2<u32> {
-    let a_lo = a & 0xFFFFu;
-    let a_hi = a >> 16u;
-    let b_lo = b & 0xFFFFu;
-    let b_hi = b >> 16u;
-
-    let p0 = a_lo * b_lo;
-    let p1 = a_lo * b_hi;
-    let p2 = a_hi * b_lo;
-    let p3 = a_hi * b_hi;
-
-    var lo = p0;
-    var hi = p3;
-    let mid = p1 + p2;
-    let mid_lo = (mid & 0xFFFFu) << 16u;
-    let mid_hi = mid >> 16u;
-    let new_lo = lo + mid_lo;
-    if new_lo < lo { hi = hi + 1u; }
-    lo = new_lo;
-    hi = hi + mid_hi;
-    if p1 > 0xFFFFFFFFu - p2 { hi = hi + 0x10000u; }
-    return vec2<u32>(lo, hi);
-}
-
-fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
-    let p00 = u64_mul(a.x, b.x);
-    let p01 = u64_mul(a.x, b.y);
-    let p10 = u64_mul(a.y, b.x);
-    let p11 = u64_mul(a.y, b.y);
-
-    var r0 = p00.x; var r1 = p00.y;
-    var r2 = p11.x; var r3 = p11.y;
-
-    var t = r1 + p01.x; var c: u32 = 0u;
-    if t < r1 { c = 1u; } r1 = t;
-    t = r1 + p10.x; if t < r1 { c = c + 1u; } r1 = t;
-
-    t = r2 + p01.y; var c2: u32 = 0u;
-    if t < r2 { c2 = 1u; } r2 = t;
-    t = r2 + p10.y; if t < r2 { c2 = c2 + 1u; } r2 = t;
-    t = r2 + c; if t < r2 { c2 = c2 + 1u; } r2 = t;
-    r3 = r3 + c2;
-
-    return vec4<u32>(r0, r1, r2, r3);
-}
-
-fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    let prod = mul64(a, b);
-    if prod.z == 0u && prod.w == 0u {
-        var r0 = prod.x; var r1 = prod.y;
-        for (var i = 0u; i < 3u; i++) {
-            if r1 < q.y || (r1 == q.y && r0 < q.x) { break; }
-            var borrow = 0u;
-            if r0 >= q.x { r0 = r0 - q.x; }
-            else { r0 = 0xFFFFFFFFu - (q.x - r0 - 1u); borrow = 1u; }
-            r1 = r1 - q.y - borrow;
-        }
-        return vec2<u32>(r0, r1);
-    }
-    var r0 = prod.x; var r1 = prod.y;
-    for (var i = 0u; i < 10u; i++) {
-        if r1 < q.y || (r1 == q.y && r0 < q.x) { break; }
-        var borrow = 0u;
-        if r0 >= q.x { r0 = r0 - q.x; }
-        else { r0 = 0xFFFFFFFFu - (q.x - r0 - 1u); borrow = 1u; }
-        r1 = r1 - q.y - borrow;
-    }
-    return vec2<u32>(r0, r1);
-}
 
 @compute @workgroup_size(256, 1, 1)
 fn pointwise_mul_batched(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -2641,6 +3299,8 @@ fn pointwise_mul_batched(@builtin(global_invocation_id) global_id: vec3<u32>) {
 /// Multi-CT pointwise multiplication shader.
 /// Supports batching across multiple ciphertexts for improved GPU utilization.
 const POINTWISE_MUL_MULTI_CT_SHADER: &str = r#"
+#import math
+
 struct BatchParamsMultiCt {
     n: u32,
     log_n: u32,
@@ -2670,76 +3330,6 @@ struct ModulusParams {
 @group(0) @binding(4) var<storage, read_write> out_c0: array<u32>;
 @group(0) @binding(5) var<storage, read_write> out_c1: array<u32>;
 @group(0) @binding(6) var<uniform> mod_params: ModulusParams;
-
-fn u64_mul(a: u32, b: u32) -> vec2<u32> {
-    let a_lo = a & 0xFFFFu;
-    let a_hi = a >> 16u;
-    let b_lo = b & 0xFFFFu;
-    let b_hi = b >> 16u;
-
-    let p0 = a_lo * b_lo;
-    let p1 = a_lo * b_hi;
-    let p2 = a_hi * b_lo;
-    let p3 = a_hi * b_hi;
-
-    var lo = p0;
-    var hi = p3;
-    let mid = p1 + p2;
-    let mid_lo = (mid & 0xFFFFu) << 16u;
-    let mid_hi = mid >> 16u;
-    let new_lo = lo + mid_lo;
-    if new_lo < lo { hi = hi + 1u; }
-    lo = new_lo;
-    hi = hi + mid_hi;
-    if p1 > 0xFFFFFFFFu - p2 { hi = hi + 0x10000u; }
-    return vec2<u32>(lo, hi);
-}
-
-fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
-    let p00 = u64_mul(a.x, b.x);
-    let p01 = u64_mul(a.x, b.y);
-    let p10 = u64_mul(a.y, b.x);
-    let p11 = u64_mul(a.y, b.y);
-
-    var r0 = p00.x; var r1 = p00.y;
-    var r2 = p11.x; var r3 = p11.y;
-
-    var t = r1 + p01.x; var c: u32 = 0u;
-    if t < r1 { c = 1u; } r1 = t;
-    t = r1 + p10.x; if t < r1 { c = c + 1u; } r1 = t;
-
-    t = r2 + p01.y; var c2: u32 = 0u;
-    if t < r2 { c2 = 1u; } r2 = t;
-    t = r2 + p10.y; if t < r2 { c2 = c2 + 1u; } r2 = t;
-    t = r2 + c; if t < r2 { c2 = c2 + 1u; } r2 = t;
-    r3 = r3 + c2;
-
-    return vec4<u32>(r0, r1, r2, r3);
-}
-
-fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    let prod = mul64(a, b);
-    if prod.z == 0u && prod.w == 0u {
-        var r0 = prod.x; var r1 = prod.y;
-        for (var i = 0u; i < 3u; i++) {
-            if r1 < q.y || (r1 == q.y && r0 < q.x) { break; }
-            var borrow = 0u;
-            if r0 >= q.x { r0 = r0 - q.x; }
-            else { r0 = 0xFFFFFFFFu - (q.x - r0 - 1u); borrow = 1u; }
-            r1 = r1 - q.y - borrow;
-        }
-        return vec2<u32>(r0, r1);
-    }
-    var r0 = prod.x; var r1 = prod.y;
-    for (var i = 0u; i < 10u; i++) {
-        if r1 < q.y || (r1 == q.y && r0 < q.x) { break; }
-        var borrow = 0u;
-        if r0 >= q.x { r0 = r0 - q.x; }
-        else { r0 = 0xFFFFFFFFu - (q.x - r0 - 1u); borrow = 1u; }
-        r1 = r1 - q.y - borrow;
-    }
-    return vec2<u32>(r0, r1);
-}
 
 @compute @workgroup_size(256, 1, 1)
 fn pointwise_mul_multi_ct(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -2783,6 +3373,8 @@ fn pointwise_mul_multi_ct(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
 /// Inverse NTT shader (INTT + untwist for RNS modulus).
 const INVERSE_NTT_SHADER: &str = r#"
+#import math
+
 struct BatchParams {
     n: u32,
     log_n: u32,
@@ -2810,121 +3402,7 @@ struct ModulusParams {
 var<workgroup> shared_lo: array<u32, 8192>;
 var<workgroup> shared_hi: array<u32, 8192>;
 
-fn bit_reverse(x: u32, bits: u32) -> u32 {
-    var v = x;
-    var r: u32 = 0u;
-    for (var i: u32 = 0u; i < bits; i++) {
-        r = (r << 1u) | (v & 1u);
-        v = v >> 1u;
-    }
-    return r;
-}
-
-fn addmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    var sum_lo = a.x + b.x;
-    var carry = 0u;
-    if sum_lo < a.x { carry = 1u; }
-    var sum_hi = a.y + b.y + carry;
-
-    if sum_hi > q.y || (sum_hi == q.y && sum_lo >= q.x) {
-        if sum_lo >= q.x { sum_lo = sum_lo - q.x; }
-        else { sum_lo = 0xFFFFFFFFu - (q.x - sum_lo - 1u); sum_hi = sum_hi - 1u; }
-        sum_hi = sum_hi - q.y;
-    }
-    return vec2<u32>(sum_lo, sum_hi);
-}
-
-fn submod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    if a.y > b.y || (a.y == b.y && a.x >= b.x) {
-        var diff_lo = a.x - b.x;
-        var borrow = 0u;
-        if a.x < b.x { borrow = 1u; }
-        var diff_hi = a.y - b.y - borrow;
-        return vec2<u32>(diff_lo, diff_hi);
-    } else {
-        var diff_lo = b.x - a.x;
-        var borrow = 0u;
-        if b.x < a.x { borrow = 1u; }
-        var diff_hi = b.y - a.y - borrow;
-        var res_lo = q.x - diff_lo;
-        borrow = 0u;
-        if q.x < diff_lo { borrow = 1u; }
-        var res_hi = q.y - diff_hi - borrow;
-        return vec2<u32>(res_lo, res_hi);
-    }
-}
-
-fn u64_mul(a: u32, b: u32) -> vec2<u32> {
-    let a_lo = a & 0xFFFFu;
-    let a_hi = a >> 16u;
-    let b_lo = b & 0xFFFFu;
-    let b_hi = b >> 16u;
-
-    let p0 = a_lo * b_lo;
-    let p1 = a_lo * b_hi;
-    let p2 = a_hi * b_lo;
-    let p3 = a_hi * b_hi;
-
-    var lo = p0;
-    var hi = p3;
-    let mid = p1 + p2;
-    let mid_lo = (mid & 0xFFFFu) << 16u;
-    let mid_hi = mid >> 16u;
-    let new_lo = lo + mid_lo;
-    if new_lo < lo { hi = hi + 1u; }
-    lo = new_lo;
-    hi = hi + mid_hi;
-    if p1 > 0xFFFFFFFFu - p2 { hi = hi + 0x10000u; }
-    return vec2<u32>(lo, hi);
-}
-
-fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
-    let p00 = u64_mul(a.x, b.x);
-    let p01 = u64_mul(a.x, b.y);
-    let p10 = u64_mul(a.y, b.x);
-    let p11 = u64_mul(a.y, b.y);
-
-    var r0 = p00.x; var r1 = p00.y;
-    var r2 = p11.x; var r3 = p11.y;
-
-    var t = r1 + p01.x; var c: u32 = 0u;
-    if t < r1 { c = 1u; } r1 = t;
-    t = r1 + p10.x; if t < r1 { c = c + 1u; } r1 = t;
-
-    t = r2 + p01.y; var c2: u32 = 0u;
-    if t < r2 { c2 = 1u; } r2 = t;
-    t = r2 + p10.y; if t < r2 { c2 = c2 + 1u; } r2 = t;
-    t = r2 + c; if t < r2 { c2 = c2 + 1u; } r2 = t;
-    r3 = r3 + c2;
-
-    return vec4<u32>(r0, r1, r2, r3);
-}
-
-fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
-    let prod = mul64(a, b);
-    if prod.z == 0u && prod.w == 0u {
-        var r0 = prod.x; var r1 = prod.y;
-        for (var i = 0u; i < 3u; i++) {
-            if r1 < q.y || (r1 == q.y && r0 < q.x) { break; }
-            var borrow = 0u;
-            if r0 >= q.x { r0 = r0 - q.x; }
-            else { r0 = 0xFFFFFFFFu - (q.x - r0 - 1u); borrow = 1u; }
-            r1 = r1 - q.y - borrow;
-        }
-        return vec2<u32>(r0, r1);
-    }
-    var r0 = prod.x; var r1 = prod.y;
-    for (var i = 0u; i < 10u; i++) {
-        if r1 < q.y || (r1 == q.y && r0 < q.x) { break; }
-        var borrow = 0u;
-        if r0 >= q.x { r0 = r0 - q.x; }
-        else { r0 = 0xFFFFFFFFu - (q.x - r0 - 1u); borrow = 1u; }
-        r1 = r1 - q.y - borrow;
-    }
-    return vec2<u32>(r0, r1);
-}
-
-// Process c0 for a batch
+// Process c0 for a batch - CT DIT inverse (matches forward NTT structure)
 @compute @workgroup_size(256, 1, 1)
 fn inverse_ntt_batched(
     @builtin(local_invocation_id) local_id: vec3<u32>,
@@ -2941,7 +3419,7 @@ fn inverse_ntt_batched(
     let batch_offset = batch_idx * n;
     let elements_per_thread = n / 256u;
 
-    // Process c0: load with bit-reversal (inline array access)
+    // Process c0: load with bit-reversal (CT DIT takes bit-reversed input)
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         let data_base = (batch_offset + idx) * 2u;
@@ -2952,7 +3430,7 @@ fn inverse_ntt_batched(
     }
     workgroupBarrier();
 
-    // INTT butterfly stages
+    // CT DIT INTT butterfly stages with omega_inv
     for (var stage = 0u; stage < log_n; stage++) {
         let m = 1u << (stage + 1u);
         let half_m = 1u << stage;
@@ -2965,7 +3443,7 @@ fn inverse_ntt_batched(
             let ii = group * m + idx_in_group;
             let jj = ii + half_m;
 
-            // Omega_inv powers at offset n (inline array access)
+            // Omega_inv powers at offset n
             let twiddle_idx = n + idx_in_group * (n / m);
             let tw_base = twiddle_idx * 2u;
             let twiddle = vec2<u32>(inv_twiddles[tw_base], inv_twiddles[tw_base + 1u]);
@@ -2973,6 +3451,7 @@ fn inverse_ntt_batched(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
+            // CT DIT butterfly: new_u = u + w*v, new_v = u - w*v
             let tw_v = mulmod(v, twiddle, q);
             let new_u = addmod(u, tw_v, q);
             let new_v = submod(u, tw_v, q);
@@ -2985,19 +3464,19 @@ fn inverse_ntt_batched(
         workgroupBarrier();
     }
 
-    // Untwist, scale by n^-1, and store (inline array access)
+    // Scale by n^-1, untwist, and store
     let n_inv = vec2<u32>(mod_params.n_inv_lo, mod_params.n_inv_hi);
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
 
+        // Scale by n^-1
+        val = mulmod(val, n_inv, q);
+
         // Untwist: multiply by psi_inv^idx
         let psi_inv_base = idx * 2u;
         let psi_inv_power = vec2<u32>(inv_twiddles[psi_inv_base], inv_twiddles[psi_inv_base + 1u]);
         val = mulmod(val, psi_inv_power, q);
-
-        // Scale by n^-1
-        val = mulmod(val, n_inv, q);
 
         let out_base = (batch_offset + idx) * 2u;
         c0_data[out_base] = val.x;
@@ -3006,7 +3485,7 @@ fn inverse_ntt_batched(
 
     workgroupBarrier();
 
-    // Process c1 similarly (inline array access)
+    // Process c1 similarly - CT DIT inverse
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         let data_base = (batch_offset + idx) * 2u;
@@ -3036,6 +3515,7 @@ fn inverse_ntt_batched(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
+            // CT DIT butterfly: new_u = u + w*v, new_v = u - w*v
             let tw_v = mulmod(v, twiddle, q);
             let new_u = addmod(u, tw_v, q);
             let new_v = submod(u, tw_v, q);
@@ -3052,10 +3532,13 @@ fn inverse_ntt_batched(
         let idx = tid * elements_per_thread + i;
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
 
+        // Scale by n^-1
+        val = mulmod(val, n_inv, q);
+
+        // Untwist: multiply by psi_inv^idx
         let psi_inv_base2 = idx * 2u;
         let psi_inv_power = vec2<u32>(inv_twiddles[psi_inv_base2], inv_twiddles[psi_inv_base2 + 1u]);
         val = mulmod(val, psi_inv_power, q);
-        val = mulmod(val, n_inv, q);
 
         let out_base2 = (batch_offset + idx) * 2u;
         c1_data[out_base2] = val.x;
@@ -3074,6 +3557,6 @@ mod tests {
         assert!(params.is_some());
         let params = params.unwrap();
         assert_eq!(params.n, 8192);
-        assert_eq!(params.k, 4);
+        assert_eq!(params.k, 5); // 5 RNS moduli in goldilocks config
     }
 }

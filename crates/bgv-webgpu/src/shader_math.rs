@@ -1,8 +1,13 @@
 //! Shared math functions for WGSL shaders.
-//! This module is imported by other shaders using naga_oil.
+//!
+//! This module provides WGSL math functions that can be imported by any shader using naga_oil.
+//! Use `#import math` in your shader to access these functions.
+
+use naga_oil::compose::{ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderLanguage, ShaderType};
+use std::collections::HashMap;
 
 /// Shared math module that can be imported by other shaders.
-/// Use `#import math` in your shader and call functions as `math::func_name()`.
+/// Use `#import math` in your shader and call functions directly.
 pub const MATH_MODULE: &str = r#"
 #define_import_path math
 
@@ -115,6 +120,77 @@ fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
     return vec4<u32>(r0, r1, r2, r3);
 }
 
+// 128-bit subtraction: a - b
+fn sub128(a: vec4<u32>, b: vec4<u32>) -> vec4<u32> {
+    var r0 = a.x; var r1 = a.y; var r2 = a.z; var r3 = a.w;
+    var borrow = 0u;
+
+    if r0 >= b.x { r0 = r0 - b.x; }
+    else { r0 = 0xFFFFFFFFu - (b.x - r0 - 1u); borrow = 1u; }
+
+    var new_r1 = r1 - b.y - borrow;
+    if new_r1 > r1 { borrow = 1u; } else { borrow = 0u; }
+    r1 = new_r1;
+
+    var new_r2 = r2 - b.z - borrow;
+    if new_r2 > r2 { borrow = 1u; } else { borrow = 0u; }
+    r2 = new_r2;
+
+    r3 = r3 - b.w - borrow;
+
+    return vec4<u32>(r0, r1, r2, r3);
+}
+
+// Compare 128-bit: returns true if a >= b
+fn ge128(a: vec4<u32>, b: vec4<u32>) -> bool {
+    if a.w != b.w { return a.w > b.w; }
+    if a.z != b.z { return a.z > b.z; }
+    if a.y != b.y { return a.y > b.y; }
+    return a.x >= b.x;
+}
+
+// Modular multiplication using shift-and-subtract reduction
+// For 60-bit modulus: a * b mod q where a, b < q
+fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
+    let prod = mul64(a, b);
+    let q128 = vec4<u32>(q.x, q.y, 0u, 0u);
+    var r = prod;
+
+    // Shift-and-subtract reduction for 128-bit product mod 60-bit q
+    for (var shift = 60u; shift > 0u; shift = shift - 1u) {
+        var q_shifted: vec4<u32>;
+        if shift >= 64u {
+            let s = shift - 64u;
+            if s == 0u {
+                q_shifted = vec4<u32>(0u, 0u, q.x, q.y);
+            } else {
+                q_shifted = vec4<u32>(0u, 0u, q.x << s, (q.y << s) | (q.x >> (32u - s)));
+            }
+        } else if shift >= 32u {
+            let s = shift - 32u;
+            if s == 0u {
+                q_shifted = vec4<u32>(0u, q.x, q.y, 0u);
+            } else {
+                q_shifted = vec4<u32>(0u, q.x << s, (q.y << s) | (q.x >> (32u - s)), q.y >> (32u - s));
+            }
+        } else {
+            q_shifted = vec4<u32>(q.x << shift, (q.y << shift) | (q.x >> (32u - shift)), q.y >> (32u - shift), 0u);
+        }
+
+        if ge128(r, q_shifted) {
+            r = sub128(r, q_shifted);
+        }
+    }
+
+    // Final reductions
+    for (var i = 0u; i < 3u; i++) {
+        if !ge128(r, q128) { break; }
+        r = sub128(r, q128);
+    }
+
+    return vec2<u32>(r.x, r.y);
+}
+
 // Barrett reduction for 128-bit value mod 64-bit q
 // mu is passed as four 32-bit words: mu = mu3*2^96 + mu2*2^64 + mu1*2^32 + mu0
 fn barrett_reduce(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
@@ -221,4 +297,72 @@ fn barrett_reduce(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3:
 
     return vec2<u32>(r0, r1);
 }
+
+// Bit-reverse index
+fn bit_reverse(x: u32, bits: u32) -> u32 {
+    var v = x;
+    var r: u32 = 0u;
+    for (var i: u32 = 0u; i < bits; i++) {
+        r = (r << 1u) | (v & 1u);
+        v = v >> 1u;
+    }
+    return r;
+}
 "#;
+
+/// Composes a shader with the math module imported.
+/// Returns the composed WGSL source string.
+pub fn compose_shader(shader_source: &str, shader_name: &str) -> Result<String, String> {
+    let mut composer = Composer::default();
+
+    // Add the math module
+    if let Err(e) = composer.add_composable_module(ComposableModuleDescriptor {
+        source: MATH_MODULE,
+        file_path: "math.wgsl",
+        language: ShaderLanguage::Wgsl,
+        shader_defs: HashMap::new(),
+        ..Default::default()
+    }) {
+        return Err(format!("Failed to add math module: {}", e.emit_to_string(&composer)));
+    }
+
+    // Compose the shader
+    let naga_module = match composer.make_naga_module(NagaModuleDescriptor {
+        source: shader_source,
+        file_path: shader_name,
+        shader_type: ShaderType::Wgsl,
+        shader_defs: HashMap::new(),
+        ..Default::default()
+    }) {
+        Ok(m) => m,
+        Err(e) => return Err(format!("Failed to compose {}: {}", shader_name, e.emit_to_string(&composer))),
+    };
+
+    // Convert back to WGSL string
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::default(),
+    )
+    .validate(&naga_module)
+    .map_err(|e| format!("Validation failed for {}: {:?}", shader_name, e))?;
+
+    naga::back::wgsl::write_string(
+        &naga_module,
+        &info,
+        naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
+    )
+    .map_err(|e| format!("Failed to write WGSL for {}: {:?}", shader_name, e))
+}
+
+/// Creates a wgpu shader module from composed shader source.
+pub fn create_shader_module(
+    device: &wgpu::Device,
+    shader_source: &str,
+    shader_name: &str,
+) -> Result<wgpu::ShaderModule, String> {
+    let composed = compose_shader(shader_source, shader_name)?;
+    Ok(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(shader_name),
+        source: wgpu::ShaderSource::Wgsl(composed.into()),
+    }))
+}

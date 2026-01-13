@@ -12,12 +12,12 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::{util::DeviceExt, Buffer, BufferUsages, ComputePipeline, Device, Queue};
 
 use crate::error::GpuError;
-use crate::rotation_shader::{
+use super::rotation_shader::{
     BIT_REVERSE_SHADER, DIGIT_DECOMPOSE_SHADER, NTT_BUTTERFLY_SHADER, POINTWISE_MUL_SHADER,
     SCALE_SHADER, TWIST_SHADER,
 };
 // New modular fused shaders with shared math (composed via naga_oil)
-use crate::rotation_shader::{fused, create_shader_module};
+use super::rotation_shader::{fused, create_shader_module};
 
 /// Parameters for RNS BGV on GPU.
 #[derive(Clone, Debug)]
@@ -616,7 +616,7 @@ impl GpuRotationContext {
         });
 
         // Shared memory NTT - all stages in one dispatch
-        use crate::rotation_shader::shared_mem_ntt;
+        use super::rotation_shader::shared_mem_ntt;
         let shared_mem_ntt_fwd_shader = create_shader_module(&device, shared_mem_ntt::SHARED_MEM_NTT_FWD_SHADER, "shared_mem_ntt_fwd.wgsl")
             .expect("Failed to compose shared memory forward NTT shader");
         let shared_mem_ntt_fwd_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

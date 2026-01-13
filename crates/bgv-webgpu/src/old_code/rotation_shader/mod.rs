@@ -6,65 +6,8 @@ pub mod math;
 pub mod fused;
 pub mod shared_mem_ntt;
 
-use naga_oil::compose::{Composer, ComposableModuleDescriptor, NagaModuleDescriptor, ShaderLanguage, ShaderType};
-use std::collections::HashMap;
-
-/// Composes a shader with the math module imported.
-/// Returns the composed WGSL source string.
-pub fn compose_shader(shader_source: &str, shader_name: &str) -> Result<String, String> {
-    let mut composer = Composer::default();
-
-    // Add the math module
-    if let Err(e) = composer.add_composable_module(ComposableModuleDescriptor {
-        source: math::MATH_MODULE,
-        file_path: "math.wgsl",
-        language: ShaderLanguage::Wgsl,
-        shader_defs: HashMap::new(),
-        ..Default::default()
-    }) {
-        return Err(format!("Failed to add math module: {}", e.emit_to_string(&composer)));
-    }
-
-    // Compose the shader
-    let naga_module = match composer.make_naga_module(NagaModuleDescriptor {
-        source: shader_source,
-        file_path: shader_name,
-        shader_type: ShaderType::Wgsl,
-        shader_defs: HashMap::new(),
-        ..Default::default()
-    }) {
-        Ok(m) => m,
-        Err(e) => return Err(format!("Failed to compose {}: {}", shader_name, e.emit_to_string(&composer))),
-    };
-
-    // Convert back to WGSL string
-    let info = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::default(),
-    )
-    .validate(&naga_module)
-    .map_err(|e| format!("Validation failed for {}: {:?}", shader_name, e))?;
-
-    naga::back::wgsl::write_string(
-        &naga_module,
-        &info,
-        naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
-    )
-    .map_err(|e| format!("Failed to write WGSL for {}: {:?}", shader_name, e))
-}
-
-/// Creates a wgpu shader module from composed shader source.
-pub fn create_shader_module(
-    device: &wgpu::Device,
-    shader_source: &str,
-    shader_name: &str,
-) -> Result<wgpu::ShaderModule, String> {
-    let composed = compose_shader(shader_source, shader_name)?;
-    Ok(device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(shader_name),
-        source: wgpu::ShaderSource::Wgsl(composed.into()),
-    }))
-}
+// Re-export compose functions from shader_math for backward compatibility
+pub use crate::shader_math::{compose_shader, create_shader_module};
 
 // Re-export the old shaders for backward compatibility
 // TODO: Remove these once all code is migrated to use the new modular shaders

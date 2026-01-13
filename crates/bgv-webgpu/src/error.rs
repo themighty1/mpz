@@ -14,8 +14,8 @@ pub enum GpuError {
     DeviceCreation(#[from] wgpu::RequestDeviceError),
 
     /// Shader compilation failed.
-    #[error("Shader compilation failed")]
-    ShaderCompilation,
+    #[error("Shader compilation failed: {0}")]
+    ShaderCompilation(String),
 
     /// Buffer size mismatch.
     #[error("Buffer size mismatch: expected {expected}, got {actual}")]
