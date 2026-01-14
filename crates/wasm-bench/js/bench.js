@@ -206,6 +206,11 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "jv_vm_prover", name: "jv_vm_prover/1k", fn: (n) => wasm.jv_vm_prover(n, 1000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         { category: "jv_vm_prover", name: "jv_vm_prover/2k", fn: (n) => wasm.jv_vm_prover(n, 2000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         { category: "jv_vm_prover", name: "jv_vm_prover/3k", fn: (n) => wasm.jv_vm_prover(n, 3000), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "jv_vm_prover", name: "jv_vm_prover/8k", fn: (n) => wasm.jv_vm_prover(n, 8192), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "jv_vm_prover", name: "jv_vm_prover/16k", fn: (n) => wasm.jv_vm_prover(n, 16384), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "jv_vm_prover", name: "jv_vm_prover/32k", fn: (n) => wasm.jv_vm_prover(n, 32768), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "jv_vm_prover", name: "jv_vm_prover/64k", fn: (n) => wasm.jv_vm_prover(n, 65536), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        { category: "jv_vm_prover", name: "jv_vm_prover/128k", fn: (n) => wasm.jv_vm_prover(n, 131072), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         // bgv_justvengers benchmarks (BGV homomorphic encryption pattern)
         // 10 copies, 8192 slots, 5 RNS moduli, sum_slots + mask + 80 CT additions
         { category: "bgv", name: "bgv/justvengers_pattern", fn: (n) => wasm.bgv_justvengers_pattern(n), async: false, returnsBenchResult: true, warmup: 0 },
