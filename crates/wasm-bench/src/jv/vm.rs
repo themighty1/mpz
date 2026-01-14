@@ -187,11 +187,10 @@ async fn jv_record_verifier_messages<const R: usize>(
     let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
     verifier.set_verifier_local_keys(verifier_shares);
 
-    // Note: GPU init disabled for now in vm.rs - using rayon CPU path
-    // WebGPU async init in web workers needs more work
-    // prover.prepare_gpu_async(&setup_msg).await.unwrap_or_else(|e| {
-    //     web_sys::console::log_1(&format!("[jv_vm] GPU init failed: {:?}, using CPU fallback", e).into());
-    // });
+    // Pre-initialize GPU context (async in WASM)
+    prover.prepare_gpu_async(&setup_msg).await.unwrap_or_else(|e| {
+        web_sys::console::log_1(&format!("[jv_vm] GPU init failed: {:?}, using CPU fallback", e).into());
+    });
 
     // P → V: CommitmentMessage (IT-PAC ciphertexts)
     let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
@@ -254,12 +253,13 @@ async fn jv_record_verifier_messages<const R: usize>(
 
 /// Runs a single prover iteration with fresh witness setup.
 #[cfg(target_arch = "wasm32")]
-fn run_prover_iteration<const R: usize>(
+async fn run_prover_iteration<const R: usize>(
     circuits: &CircuitBatch,
     active_branches: &[usize],
     inputs_per_rep: &[Vec<u64>],
     soldering_constraints: &[SolderingConstraint],
     recorded: &JVRecordedMessages,
+    gpu_ctx: &Option<std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>>,
 ) {
     let mut rng = Prg::from_seed(Block::ZERO);
 
@@ -271,10 +271,10 @@ fn run_prover_iteration<const R: usize>(
     // Create VOLE pool for IT-PAC commitments
     let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
 
-    // Note: GPU init disabled for now - using rayon CPU path
-    // prover.prepare_gpu_async(&recorded.setup_msg).await.unwrap_or_else(|e| {
-    //     let _ = e;
-    // });
+    // Set pre-initialized GPU context if available
+    if let Some(ctx) = gpu_ctx {
+        prover.set_gpu_context(ctx.clone());
+    }
 
     // P → V: CommitmentMessage (IT-PAC ciphertexts)
     let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
@@ -373,6 +373,23 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
                 &soldering,
             ).await;
 
+            // Pre-initialize GPU context once (not timed)
+            let gpu_ctx: Option<std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>> = {
+                web_sys::console::log_1(&"[jv_vm] Pre-initializing GPU context...".into());
+                let gpu_start = performance.now();
+                match mpz_justvengers::JVProver::<1>::create_gpu_context_goldilocks(8192).await {
+                    Ok(ctx) => {
+                        let elapsed = performance.now() - gpu_start;
+                        web_sys::console::log_1(&format!("[jv_vm] GPU context created in {:.2}ms", elapsed).into());
+                        Some(ctx)
+                    }
+                    Err(e) => {
+                        web_sys::console::log_1(&format!("[jv_vm] GPU init failed: {:?}, using CPU", e).into());
+                        None
+                    }
+                }
+            };
+
             web_sys::console::log_1(
                 &format!(
                     "[jv_vm] R={}, mults/circuit={}, starting {} iterations",
@@ -393,7 +410,8 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
                     &inputs,
                     &soldering,
                     &recorded,
-                );
+                    &gpu_ctx,
+                ).await;
 
                 total_elapsed_ms += performance.now() - start;
 
@@ -428,8 +446,13 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
         1000 => run_bench!(1000),
         2000 => run_bench!(2000),
         3000 => run_bench!(3000),
+        8192 => run_bench!(8192),
+        16384 => run_bench!(16384),
+        32768 => run_bench!(32768),
+        65536 => run_bench!(65536),
+        131072 => run_bench!(131072),
         _ => Err(format!(
-            "Unsupported reps value: {}. Supported: 1000, 2000, 3000",
+            "Unsupported reps value: {}. Supported: 1000, 2000, 3000, 8192, 16384, 32768, 65536, 131072",
             reps
         )),
     }

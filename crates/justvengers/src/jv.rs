@@ -826,6 +826,24 @@ impl<const R: usize> JVProver<R> {
         }
     }
 
+    /// Async version of create_gpu_context_goldilocks for WASM.
+    /// Returns Arc that can be shared across multiple provers.
+    #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+    pub async fn create_gpu_context_goldilocks(slot_count: usize) -> Result<std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>, JVProverError> {
+        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpu};
+
+        let gpu_params = RnsBatchParams::goldilocks(slot_count)
+            .ok_or(JVProverError::GpuInitFailed)?;
+
+        match RnsSlotMulGpu::new_async(gpu_params).await {
+            Ok(ctx) => Ok(std::sync::Arc::new(ctx)),
+            Err(e) => {
+                eprintln!("[create_gpu_context_goldilocks_async] GPU init failed: {}", e);
+                Err(JVProverError::GpuInitFailed)
+            }
+        }
+    }
+
     /// Sets a pre-initialized GPU context (for sharing across iterations).
     #[cfg(feature = "gpu")]
     pub fn set_gpu_context(&mut self, ctx: std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>) {
