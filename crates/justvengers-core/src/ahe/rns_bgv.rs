@@ -612,8 +612,11 @@ impl RnsCiphertext {
 
     /// Returns the c0 and c1 residues for GPU processing.
     ///
+    /// Extracts the RNS residues that are already in NTT domain.
+    ///
     /// Returns (c0_residues, c1_residues) where each is Vec<Vec<u64>> with shape [num_moduli][n].
-    pub fn precompute_ntt(&self) -> (Vec<Vec<u64>>, Vec<Vec<u64>>) {
+    /// These residues can be directly uploaded to GPU for slot multiplication.
+    pub fn extract_ntt_residues(&self) -> (Vec<Vec<u64>>, Vec<Vec<u64>>) {
         let c0_residues: Vec<Vec<u64>> = self.c0.residues().to_vec();
         let c1_residues: Vec<Vec<u64>> = self.c1.residues().to_vec();
         (c0_residues, c1_residues)

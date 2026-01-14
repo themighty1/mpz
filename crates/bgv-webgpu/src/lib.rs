@@ -20,6 +20,7 @@ pub mod shader_math;
 pub mod slot_mul_shader;
 pub mod slot_mul_gpu;
 pub mod rns_slot_mul;
+pub mod goldilocks_ntt;
 
 // DEPRECATED: rotation-based operations not used in production
 pub mod old_code;
@@ -28,14 +29,13 @@ pub use error::GpuError;
 pub use gpu::{GpuContext, GpuCiphertext, SlotWiseMul};
 pub use slot_mul_gpu::{SlotMulGpuContext, TwiddleFactors};
 pub use rns_slot_mul::{RnsSlotMulGpu, RnsBatchParams, RnsModulusNttData, PlaintextNttData};
+pub use goldilocks_ntt::GoldilocksNttGpu;
 
 // Re-export old rotation types for backwards compatibility
 pub use old_code::{
     GpuRotationContext, GpuRnsParams, GpuRnsPoly, GpuRnsCiphertext, NttModulusData,
     GpuGaloisKey, GpuGaloisKeys, gpu_automorphism, gpu_add, gpu_ntt_mul, gpu_ntt_mul_single,
-    gpu_key_switch, gpu_apply_automorphism, gpu_sum_slots, rotation_exponent,
-    SumSlotsWorkspace, gpu_sum_slots_batched, gpu_sum_slots_batched_profiled,
-    gpu_sum_slots_batched_2x,
+    gpu_key_switch, gpu_apply_automorphism, rotation_exponent,
 };
 
 /// The modulus for Goldilocks field operations.

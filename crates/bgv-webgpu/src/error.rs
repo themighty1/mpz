@@ -28,4 +28,8 @@ pub enum GpuError {
     /// GPU execution failed.
     #[error("GPU execution failed: {0}")]
     ExecutionFailed(String),
+
+    /// Buffer mapping failed.
+    #[error("Buffer async mapping failed: {0}")]
+    BufferMapping(#[from] wgpu::BufferAsyncError),
 }

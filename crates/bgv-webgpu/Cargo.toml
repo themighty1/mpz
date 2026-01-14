@@ -26,11 +26,8 @@ rand = { workspace = true }
 criterion = { workspace = true }
 mpz-justvengers-core = { path = "../justvengers-core" }
 mpz-core = { path = "../core" }
+mpz-fields = { path = "../fields" }
 
 [[bench]]
 name = "gpu_bench"
-harness = false
-
-[[bench]]
-name = "sum_slots_bench"
 harness = false

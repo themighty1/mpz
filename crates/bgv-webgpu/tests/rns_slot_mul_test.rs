@@ -9,7 +9,7 @@ fn test_params_creation() {
     assert!(params.is_some());
     let params = params.unwrap();
     assert_eq!(params.n, 8192);
-    assert_eq!(params.k, 4);
+    assert_eq!(params.k, 5);
     assert_eq!(params.t, 0xFFFFFFFF00000001u64);
 }
 

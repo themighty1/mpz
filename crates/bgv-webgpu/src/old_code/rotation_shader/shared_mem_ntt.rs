@@ -61,7 +61,7 @@ fn shared_mem_ntt_fwd(@builtin(local_invocation_id) local_id: vec3<u32>) {
         let psi_base = idx * 2u;
         let psi = vec2<u32>(psi_powers[psi_base], psi_powers[psi_base + 1u]);
         let prod = math::mul64(val, psi);
-        val = math::barrett_reduce(prod, q, mu0, mu1, mu2, mu3);
+        val = math::barrett_reduce_60bit(prod, q, mu0, mu1, mu2, mu3);
 
         // Store to bit-reversed position in shared memory
         let rev_idx = bit_reverse(idx, log_n);
@@ -98,7 +98,7 @@ fn shared_mem_ntt_fwd(@builtin(local_invocation_id) local_id: vec3<u32>) {
 
             // Butterfly: u' = u + t*w, v' = u - t*w
             let prod = math::mul64(v, twiddle);
-            let t = math::barrett_reduce(prod, q, mu0, mu1, mu2, mu3);
+            let t = math::barrett_reduce_60bit(prod, q, mu0, mu1, mu2, mu3);
 
             let new_u = math::addmod(u, t, q);
             let new_v = math::submod(u, t, q);
@@ -215,7 +215,7 @@ fn shared_mem_ntt_inv(@builtin(local_invocation_id) local_id: vec3<u32>) {
 
             // Butterfly: u' = u + t*w, v' = u - t*w
             let prod = math::mul64(v, twiddle);
-            let t = math::barrett_reduce(prod, q, mu0, mu1, mu2, mu3);
+            let t = math::barrett_reduce_60bit(prod, q, mu0, mu1, mu2, mu3);
 
             let new_u = math::addmod(u, t, q);
             let new_v = math::submod(u, t, q);
@@ -240,13 +240,13 @@ fn shared_mem_ntt_inv(@builtin(local_invocation_id) local_id: vec3<u32>) {
 
         // Scale by n^-1
         let prod1 = math::mul64(val, n_inv_val);
-        val = math::barrett_reduce(prod1, q, mu0, mu1, mu2, mu3);
+        val = math::barrett_reduce_60bit(prod1, q, mu0, mu1, mu2, mu3);
 
         // Untwist (multiply by psi^-idx)
         let psi_base = idx * 2u;
         let inv_psi = vec2<u32>(inv_psi_powers[psi_base], inv_psi_powers[psi_base + 1u]);
         let prod2 = math::mul64(val, inv_psi);
-        val = math::barrett_reduce(prod2, q, mu0, mu1, mu2, mu3);
+        val = math::barrett_reduce_60bit(prod2, q, mu0, mu1, mu2, mu3);
 
         let base = idx * 2u;
         data[base] = val.x;
@@ -337,7 +337,7 @@ fn shared_mem_ntt_partial(
                     let v = vec2<u32>(shared_lo[j], shared_hi[j]);
 
                     let prod = math::mul64(v, twiddle);
-                    let t = math::barrett_reduce(prod, q, mu0, mu1, mu2, mu3);
+                    let t = math::barrett_reduce_60bit(prod, q, mu0, mu1, mu2, mu3);
 
                     let new_u = math::addmod(u, t, q);
                     let new_v = math::submod(u, t, q);

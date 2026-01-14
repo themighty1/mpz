@@ -640,6 +640,27 @@ pub struct JVProver<const R: usize> {
     /// Wrapped in Arc for Clone support (GPU handles can't be cloned).
     #[cfg(feature = "gpu")]
     gpu_context: Option<std::sync::Arc<RnsSlotMulGpu>>,
+    /// Total GPU time in milliseconds (accumulated across all GPU operations).
+    #[cfg(feature = "gpu")]
+    total_gpu_time_ms: f64,
+    /// Performance timing breakdown
+    timing_intt_ms: f64,
+    timing_collapse_ms: f64,
+    timing_poly_div_ms: f64,
+    timing_open_ms: f64,
+    timing_mk_poly_ms: f64,
+    timing_itpac_ms: f64,
+    timing_packing_ms: f64,
+    timing_setup_ms: f64,
+    timing_disclose_ms: f64,
+    timing_commit_soldering_ms: f64,
+    timing_lpzk_accumulation_ms: f64,
+    timing_reveal_soldering_ms: f64,
+    timing_mk_binary_ms: f64,
+    timing_mk_sum_ms: f64,
+    timing_open_polynomial_ms: f64,
+    timing_mk_commit_vole_ms: f64,
+    timing_mk_commit_packing_ms: f64,
 }
 
 /// Protocol phases for the optimized prover.
@@ -701,6 +722,26 @@ impl<const R: usize> JVProver<R> {
             // GPU context
             #[cfg(feature = "gpu")]
             gpu_context: None,
+            #[cfg(feature = "gpu")]
+            total_gpu_time_ms: 0.0,
+            // Timing fields
+            timing_intt_ms: 0.0,
+            timing_collapse_ms: 0.0,
+            timing_poly_div_ms: 0.0,
+            timing_open_ms: 0.0,
+            timing_mk_poly_ms: 0.0,
+            timing_itpac_ms: 0.0,
+            timing_packing_ms: 0.0,
+            timing_setup_ms: 0.0,
+            timing_disclose_ms: 0.0,
+            timing_commit_soldering_ms: 0.0,
+            timing_lpzk_accumulation_ms: 0.0,
+            timing_reveal_soldering_ms: 0.0,
+            timing_mk_binary_ms: 0.0,
+            timing_mk_sum_ms: 0.0,
+            timing_open_polynomial_ms: 0.0,
+            timing_mk_commit_vole_ms: 0.0,
+            timing_mk_commit_packing_ms: 0.0,
         }
     }
 
@@ -722,6 +763,36 @@ impl<const R: usize> JVProver<R> {
     /// Returns active branches.
     pub fn active_branches(&self) -> &[usize] {
         &self.active_branches
+    }
+
+    /// Returns total GPU time in milliseconds (accumulated across all GPU operations).
+    #[cfg(feature = "gpu")]
+    pub fn total_gpu_time_ms(&self) -> f64 {
+        self.total_gpu_time_ms
+    }
+
+    /// Returns timing breakdown for performance analysis.
+    /// (intt, collapse, poly_div, open, mk_poly, itpac, packing, setup, disclose, commit_soldering, lpzk_accumulation, reveal_soldering)
+    pub fn timing_breakdown(&self) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
+        (
+            self.timing_intt_ms,
+            self.timing_collapse_ms,
+            self.timing_poly_div_ms,
+            self.timing_open_ms,
+            self.timing_mk_poly_ms,
+            self.timing_itpac_ms,
+            self.timing_packing_ms,
+            self.timing_setup_ms,
+            self.timing_disclose_ms,
+            self.timing_commit_soldering_ms,
+            self.timing_lpzk_accumulation_ms,
+            self.timing_reveal_soldering_ms,
+            self.timing_mk_binary_ms,
+            self.timing_mk_sum_ms,
+            self.timing_open_polynomial_ms,
+            self.timing_mk_commit_vole_ms,
+            self.timing_mk_commit_packing_ms,
+        )
     }
 
     /// Prepares GPU context asynchronously from setup message.
@@ -868,6 +939,9 @@ impl<const R: usize> JVProver<R> {
         circuits: &CircuitBatch,
         inputs_per_rep: &[Vec<u64>],
     ) -> Result<(), JVProverError> {
+        #[cfg(target_arch = "wasm32")]
+        let setup_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         if self.phase != JVProverPhase::Init {
             return Err(JVProverError::InvalidPhase);
         }
@@ -902,6 +976,12 @@ impl<const R: usize> JVProver<R> {
         self.num_branches = circuits.num_branches();
 
         self.phase = JVProverPhase::Setup;
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_setup_ms += web_sys::window().unwrap().performance().unwrap().now() - setup_timing_start;
+        }
+
         Ok(())
     }
 
@@ -1064,6 +1144,9 @@ impl<const R: usize> JVProver<R> {
         self.ciphertext_commitments = Vec::with_capacity(witness_len);
 
         let interp_start = profile_start!();
+        #[cfg(target_arch = "wasm32")]
+        let intt_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         for pos in 0..witness_len {
             // Collect values at this position across all repetitions
             let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
@@ -1071,6 +1154,11 @@ impl<const R: usize> JVProver<R> {
             // Interpolate to get polynomial coefficients (uses INTT for Goldilocks)
             let poly = self.interpolate_values(&values, eval_points);
             self.wire_polynomials.push(poly);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_intt_ms += web_sys::window().unwrap().performance().unwrap().now() - intt_timing_start;
         }
         profile_end!(interp_start, "[commit] interpolation ({} polys): {:?}", witness_len);
 
@@ -1087,6 +1175,9 @@ impl<const R: usize> JVProver<R> {
 
         // Create IT-PAC commitments with VOLE masking and collect blinders
         let itpac_start = profile_start!();
+        #[cfg(target_arch = "wasm32")]
+        let itpac_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         let vole_pool = self.vole_pool.as_mut().ok_or(JVProverError::MissingSetupData)?;
         let mut vole_blinders = Vec::with_capacity(num_polys);
         for poly in &self.wire_polynomials {
@@ -1098,6 +1189,11 @@ impl<const R: usize> JVProver<R> {
                 vole_blinders.push(0);
             }
         }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_itpac_ms += web_sys::window().unwrap().performance().unwrap().now() - itpac_timing_start;
+        }
         profile_end!(itpac_start, "[commit] IT-PAC creation ({} polys): {:?}", num_polys);
 
         // For R > slot_count, we evaluate each polynomial across multiple chunks
@@ -1106,7 +1202,7 @@ impl<const R: usize> JVProver<R> {
         let bgv_start = profile_start!();
 
         // GPU-only path: GPU context must be initialized
-        let mut collapsed_cts: Vec<RnsCiphertext> = {
+        let (mut collapsed_cts, gpu_time, collapse_time) = {
             if let Some(ref gpu_ctx) = self.gpu_context {
                 Self::commit_gpu_batched_with_ctx(
                     gpu_ctx,
@@ -1121,8 +1217,13 @@ impl<const R: usize> JVProver<R> {
                 panic!("GPU context not initialized - GPU is the only supported path")
             }
         };
+        self.total_gpu_time_ms += gpu_time;
+        self.timing_collapse_ms += collapse_time;
 
         // Step 2: Ensure even number for 2-way packing
+        #[cfg(target_arch = "wasm32")]
+        let packing_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         if collapsed_cts.len() % 2 != 0 {
             // Add a zero ciphertext for padding
             let zero_coeffs = vec![0u64; slot_count];
@@ -1136,6 +1237,11 @@ impl<const R: usize> JVProver<R> {
             let ct_commitment = Self::compute_rns_ciphertext_commitment(&packed_ct);
             self.ciphertext_commitments.push(ct_commitment);
             self.rns_ciphertexts.push(packed_ct);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_packing_ms += web_sys::window().unwrap().performance().unwrap().now() - packing_timing_start;
         }
 
         profile_end!(bgv_start, "[commit] BGV evaluate+collapse+pack ({} polys x {} chunks -> {} packed CTs): {:?}",
@@ -1219,10 +1325,18 @@ impl<const R: usize> JVProver<R> {
         self.ciphertext_commitments = Vec::with_capacity(witness_len);
 
         let interp_start = profile_start!();
+        #[cfg(target_arch = "wasm32")]
+        let intt_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         for pos in 0..witness_len {
             let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
             let poly = self.interpolate_values(&values, eval_points);
             self.wire_polynomials.push(poly);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_intt_ms += web_sys::window().unwrap().performance().unwrap().now() - intt_timing_start;
         }
         profile_end!(interp_start, "[commit] interpolation ({} polys): {:?}", witness_len);
 
@@ -1235,6 +1349,9 @@ impl<const R: usize> JVProver<R> {
         let t = packed_powers_chunks[0].t;
 
         let itpac_start = profile_start!();
+        #[cfg(target_arch = "wasm32")]
+        let itpac_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         let vole_pool = self.vole_pool.as_mut().ok_or(JVProverError::MissingSetupData)?;
         let mut vole_blinders = Vec::with_capacity(num_polys);
         for poly in &self.wire_polynomials {
@@ -1245,12 +1362,17 @@ impl<const R: usize> JVProver<R> {
                 vole_blinders.push(0);
             }
         }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_itpac_ms += web_sys::window().unwrap().performance().unwrap().now() - itpac_timing_start;
+        }
         profile_end!(itpac_start, "[commit] IT-PAC creation ({} polys): {:?}", num_polys);
 
         let bgv_start = profile_start!();
 
         // GPU-only path: GPU context must be initialized
-        let mut collapsed_cts: Vec<RnsCiphertext> = {
+        let (mut collapsed_cts, gpu_time, collapse_time) = {
             if let Some(ref gpu_ctx) = self.gpu_context {
                 Self::commit_gpu_batched_with_ctx(
                     gpu_ctx,
@@ -1265,8 +1387,13 @@ impl<const R: usize> JVProver<R> {
                 panic!("GPU context not initialized - GPU is the only supported path")
             }
         };
+        self.total_gpu_time_ms += gpu_time;
+        self.timing_collapse_ms += collapse_time;
 
         // Step 2: Ensure even number for 2-way packing
+        #[cfg(target_arch = "wasm32")]
+        let packing_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         if collapsed_cts.len() % 2 != 0 {
             let zero_coeffs = vec![0u64; slot_count];
             let evaluator = PackedProverEvaluator::new(&packed_powers_chunks[0]);
@@ -1279,6 +1406,11 @@ impl<const R: usize> JVProver<R> {
             let ct_commitment = Self::compute_rns_ciphertext_commitment(&packed_ct);
             self.ciphertext_commitments.push(ct_commitment);
             self.rns_ciphertexts.push(packed_ct);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_packing_ms += web_sys::window().unwrap().performance().unwrap().now() - packing_timing_start;
         }
 
         profile_end!(bgv_start, "[commit] BGV evaluate+collapse+pack ({} polys x {} chunks -> {} packed CTs): {:?}",
@@ -1318,6 +1450,7 @@ impl<const R: usize> JVProver<R> {
     /// `seed_offset` is added to poly_idx when generating RNG seeds for blinding.
     /// Wire polynomials use 0, MK polynomials use 0x1000.
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    /// Returns (ciphertexts, total_gpu_time_ms, collapse_time_ms)
     fn commit_gpu_batched_with_ctx(
         gpu_ctx: &RnsSlotMulGpu,
         polynomials: &[Vec<u64>],
@@ -1326,7 +1459,7 @@ impl<const R: usize> JVProver<R> {
         slot_count: usize,
         t: u64,
         seed_offset: usize,
-    ) -> Result<Vec<RnsCiphertext>, String> {
+    ) -> Result<(Vec<RnsCiphertext>, f64, f64), String> {
         let num_polys = polynomials.len();
         let num_chunks = packed_powers_chunks.len();
 
@@ -1349,32 +1482,31 @@ impl<const R: usize> JVProver<R> {
 
         // Precompute NTT for all CTs
         #[cfg(target_arch = "wasm32")]
-        wasm_log!("[IT-PAC] Starting NTT precomputation for {} chunks...", num_chunks);
+        wasm_log!("[IT-PAC] Starting NTT residue extraction for {} chunks...", num_chunks);
 
         let mut all_cts_ntt: Vec<(Vec<Vec<u64>>, Vec<Vec<u64>>)> = Vec::with_capacity(num_chunks);
         for (chunk_idx, chunk) in packed_powers_chunks.iter().enumerate() {
             #[cfg(target_arch = "wasm32")]
-            wasm_log!("[IT-PAC] NTT precompute chunk {}/{}", chunk_idx + 1, num_chunks);
+            wasm_log!("[IT-PAC] Extracting NTT residues chunk {}/{}", chunk_idx + 1, num_chunks);
 
-            let ntt_result = chunk.powers_ct.precompute_ntt();
+            let ntt_result = chunk.powers_ct.extract_ntt_residues();
             all_cts_ntt.push(ntt_result);
         }
 
         #[cfg(target_arch = "wasm32")]
-        wasm_log!("[IT-PAC] NTT precomputation complete");
+        wasm_log!("[IT-PAC] NTT residue extraction complete");
 
         // Process in groups of chunks that fit in GPU buffer
         let mut chunk_results: Vec<Vec<RnsCiphertext>> = vec![Vec::new(); num_chunks];
         let mut gpu_calls = 0;
+        let mut accumulated_gpu_time_ms = 0.0;
 
         #[cfg(target_arch = "wasm32")]
         wasm_log!("[IT-PAC] Starting GPU slot multiplication for {} chunks (max {} chunks per GPU call)...", num_chunks, max_chunks_per_call);
 
-        for group_start in (0..num_chunks).step_by(max_chunks_per_call) {
+        // Helper to prepare group data
+        let prepare_group_data = |group_start: usize| {
             let group_end = (group_start + max_chunks_per_call).min(num_chunks);
-
-            #[cfg(target_arch = "wasm32")]
-            wasm_log!("[IT-PAC] GPU dispatch {}: processing chunks {}-{}/{}", gpu_calls + 1, group_start, group_end - 1, num_chunks);
 
             // Collect CTs for this group
             let group_c0_ntt: Vec<Vec<Vec<u64>>> = (group_start..group_end)
@@ -1400,14 +1532,40 @@ impl<const R: usize> JVProver<R> {
                 })
                 .collect();
 
-            // GPU dispatch for this group
-            let (group_c0_results, group_c1_results) = gpu_ctx
-                .mul_batched_multi_ct(
-                    &group_c0_ntt,
-                    &group_c1_ntt,
-                    &group_plaintext_slots,
-                    num_polys,
-                )
+            (group_start, group_end, group_c0_ntt, group_c1_ntt, group_plaintext_slots)
+        };
+
+        // Prepare first batch outside loop
+        let group_starts: Vec<usize> = (0..num_chunks).step_by(max_chunks_per_call).collect();
+        let mut next_group_data = if !group_starts.is_empty() {
+            Some(prepare_group_data(group_starts[0]))
+        } else {
+            None
+        };
+
+        for group_idx in 0..group_starts.len() {
+            let (group_start, group_end, group_c0_ntt, group_c1_ntt, group_plaintext_slots) =
+                next_group_data.take().expect("next_group_data should be Some");
+
+            #[cfg(target_arch = "wasm32")]
+            wasm_log!("[IT-PAC] GPU dispatch {}: processing chunks {}-{}/{}", gpu_calls + 1, group_start, group_end - 1, num_chunks);
+
+            // Start GPU work
+            let gpu_result = gpu_ctx.mul_batched_multi_ct(
+                &group_c0_ntt,
+                &group_c1_ntt,
+                &group_plaintext_slots,
+                num_polys,
+            );
+
+            // OPTIMIZATION: Prepare NEXT batch while GPU works on current batch
+            // Note: On native, GPU work may block, but this still helps with cache/memory prep
+            if group_idx + 1 < group_starts.len() {
+                next_group_data = Some(prepare_group_data(group_starts[group_idx + 1]));
+            }
+
+            // Get GPU results
+            let (group_c0_results, group_c1_results) = gpu_result
                 .map_err(|e| format!("GPU mul failed: {}", e))?;
 
             gpu_calls += 1;
@@ -1470,6 +1628,9 @@ impl<const R: usize> JVProver<R> {
         let collapse_start = profile_start!();
 
         #[cfg(target_arch = "wasm32")]
+        let collapse_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
+        #[cfg(target_arch = "wasm32")]
         wasm_log!("[IT-PAC] Starting collapse across {} chunks for {} polynomials...", num_chunks, num_polys);
 
         let mut collapsed_cts: Vec<RnsCiphertext> = Vec::with_capacity(num_polys);
@@ -1489,12 +1650,24 @@ impl<const R: usize> JVProver<R> {
         #[cfg(target_arch = "wasm32")]
         wasm_log!("[IT-PAC] Collapse complete");
 
+        let collapse_time_ms = {
+            #[cfg(target_arch = "wasm32")]
+            {
+                web_sys::window().unwrap().performance().unwrap().now() - collapse_timing_start
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                0.0 // No precise timing on native
+            }
+        };
+
         profile_end!(collapse_start, "[commit] GPU collapse: {:?}");
 
-        Ok(collapsed_cts)
+        Ok((collapsed_cts, accumulated_gpu_time_ms, collapse_time_ms))
     }
 
     /// WASM async version of commit_gpu_batched_with_ctx (avoids blocking main thread)
+    /// Returns (ciphertexts, total_gpu_time_ms, collapse_time_ms)
     #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
     async fn commit_gpu_batched_with_ctx(
         gpu_ctx: &RnsSlotMulGpu,
@@ -1504,7 +1677,7 @@ impl<const R: usize> JVProver<R> {
         slot_count: usize,
         t: u64,
         seed_offset: usize,
-    ) -> Result<Vec<RnsCiphertext>, String> {
+    ) -> Result<(Vec<RnsCiphertext>, f64, f64), String> {
         let num_polys = polynomials.len();
         let num_chunks = packed_powers_chunks.len();
 
@@ -1525,32 +1698,31 @@ impl<const R: usize> JVProver<R> {
 
         // Precompute NTT for all CTs
         #[cfg(target_arch = "wasm32")]
-        wasm_log!("[IT-PAC] Starting NTT precomputation for {} chunks...", num_chunks);
+        wasm_log!("[IT-PAC] Starting NTT residue extraction for {} chunks...", num_chunks);
 
         let mut all_cts_ntt: Vec<(Vec<Vec<u64>>, Vec<Vec<u64>>)> = Vec::with_capacity(num_chunks);
         for (chunk_idx, chunk) in packed_powers_chunks.iter().enumerate() {
             #[cfg(target_arch = "wasm32")]
-            wasm_log!("[IT-PAC] NTT precompute chunk {}/{}", chunk_idx + 1, num_chunks);
+            wasm_log!("[IT-PAC] Extracting NTT residues chunk {}/{}", chunk_idx + 1, num_chunks);
 
-            let ntt_result = chunk.powers_ct.precompute_ntt();
+            let ntt_result = chunk.powers_ct.extract_ntt_residues();
             all_cts_ntt.push(ntt_result);
         }
 
         #[cfg(target_arch = "wasm32")]
-        wasm_log!("[IT-PAC] NTT precomputation complete");
+        wasm_log!("[IT-PAC] NTT residue extraction complete");
 
         // Process in groups of chunks that fit in GPU buffer
         let mut chunk_results: Vec<Vec<RnsCiphertext>> = vec![Vec::new(); num_chunks];
         let mut gpu_calls = 0;
+        let mut accumulated_gpu_time_ms = 0.0;
 
         #[cfg(target_arch = "wasm32")]
         wasm_log!("[IT-PAC] Starting GPU slot multiplication for {} chunks (max {} chunks per GPU call)...", num_chunks, max_chunks_per_call);
 
-        for group_start in (0..num_chunks).step_by(max_chunks_per_call) {
+        // Helper to prepare group data
+        let prepare_group_data = |group_start: usize| {
             let group_end = (group_start + max_chunks_per_call).min(num_chunks);
-
-            #[cfg(target_arch = "wasm32")]
-            wasm_log!("[IT-PAC] GPU dispatch {}: processing chunks {}-{}/{}", gpu_calls + 1, group_start, group_end - 1, num_chunks);
 
             // Collect CTs for this group
             let group_c0_ntt: Vec<Vec<Vec<u64>>> = (group_start..group_end)
@@ -1576,18 +1748,77 @@ impl<const R: usize> JVProver<R> {
                 })
                 .collect();
 
-            // GPU dispatch for this group (ASYNC on WASM)
-            let (group_c0_results, group_c1_results) = gpu_ctx
-                .mul_batched_multi_ct(
-                    &group_c0_ntt,
-                    &group_c1_ntt,
-                    &group_plaintext_slots,
-                    num_polys,
-                )
+            (group_start, group_end, group_c0_ntt, group_c1_ntt, group_plaintext_slots)
+        };
+
+        // Prepare first batch outside loop
+        let group_starts: Vec<usize> = (0..num_chunks).step_by(max_chunks_per_call).collect();
+        let mut next_group_data = if !group_starts.is_empty() {
+            Some(prepare_group_data(group_starts[0]))
+        } else {
+            None
+        };
+
+        for group_idx in 0..group_starts.len() {
+            let (group_start, group_end, group_c0_ntt, group_c1_ntt, group_plaintext_slots) =
+                next_group_data.take().expect("next_group_data should be Some");
+
+            #[cfg(target_arch = "wasm32")]
+            wasm_log!("[IT-PAC] GPU dispatch {}: processing chunks {}-{}/{}", gpu_calls + 1, group_start, group_end - 1, num_chunks);
+
+            // Start GPU work (don't await yet) and measure timing
+            #[cfg(target_arch = "wasm32")]
+            let gpu_start = web_sys::window().unwrap().performance().unwrap().now();
+
+            let gpu_future = gpu_ctx.mul_batched_multi_ct(
+                &group_c0_ntt,
+                &group_c1_ntt,
+                &group_plaintext_slots,
+                num_polys,
+            );
+
+            // OPTIMIZATION: Prepare NEXT batch while GPU works on current batch
+            #[cfg(target_arch = "wasm32")]
+            let cpu_prep_time = if group_idx + 1 < group_starts.len() {
+                wasm_log!("[IT-PAC] Preparing next batch while GPU works...");
+
+                let prep_start = web_sys::window().unwrap().performance().unwrap().now();
+                next_group_data = Some(prepare_group_data(group_starts[group_idx + 1]));
+                web_sys::window().unwrap().performance().unwrap().now() - prep_start
+            } else {
+                0.0
+            };
+
+            #[cfg(not(target_arch = "wasm32"))]
+            if group_idx + 1 < group_starts.len() {
+                next_group_data = Some(prepare_group_data(group_starts[group_idx + 1]));
+            }
+
+            // Now wait for GPU to finish and measure wait time
+            #[cfg(target_arch = "wasm32")]
+            let wait_start = web_sys::window().unwrap().performance().unwrap().now();
+
+            let (group_c0_results, group_c1_results) = gpu_future
                 .await
                 .map_err(|e| format!("GPU mul failed: {}", e))?;
 
+            #[cfg(target_arch = "wasm32")]
+            let wait_time = web_sys::window().unwrap().performance().unwrap().now() - wait_start;
+            #[cfg(target_arch = "wasm32")]
+            let total_gpu_time = web_sys::window().unwrap().performance().unwrap().now() - gpu_start;
+
             gpu_calls += 1;
+
+            // Log timing analysis and accumulate GPU time
+            #[cfg(target_arch = "wasm32")]
+            {
+                let overlap = cpu_prep_time.min(total_gpu_time - wait_time);
+                wasm_log!(
+                    "[IT-PAC] Timing: GPU={:.2}ms, CPU_prep={:.2}ms, Wait={:.2}ms, Overlap={:.2}ms",
+                    total_gpu_time, cpu_prep_time, wait_time, overlap
+                );
+                accumulated_gpu_time_ms += total_gpu_time;
+            }
 
             #[cfg(target_arch = "wasm32")]
             wasm_log!("[IT-PAC] GPU dispatch {} complete, processing results...", gpu_calls);
@@ -1647,6 +1878,9 @@ impl<const R: usize> JVProver<R> {
         let collapse_start = profile_start!();
 
         #[cfg(target_arch = "wasm32")]
+        let collapse_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
+        #[cfg(target_arch = "wasm32")]
         wasm_log!("[IT-PAC] Starting collapse across {} chunks for {} polynomials...", num_chunks, num_polys);
 
         let mut collapsed_cts: Vec<RnsCiphertext> = Vec::with_capacity(num_polys);
@@ -1666,9 +1900,20 @@ impl<const R: usize> JVProver<R> {
         #[cfg(target_arch = "wasm32")]
         wasm_log!("[IT-PAC] Collapse complete");
 
+        let collapse_time_ms = {
+            #[cfg(target_arch = "wasm32")]
+            {
+                web_sys::window().unwrap().performance().unwrap().now() - collapse_timing_start
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                0.0 // Should not happen (this is WASM-only function)
+            }
+        };
+
         profile_end!(collapse_start, "[commit] GPU collapse: {:?}");
 
-        Ok(collapsed_cts)
+        Ok((collapsed_cts, accumulated_gpu_time_ms, collapse_time_ms))
     }
 
     /// CPU parallel slot multiplication (rayon fallback).
@@ -1852,11 +2097,19 @@ impl<const R: usize> JVProver<R> {
         }
 
         // Step 2: Interpolate each row to get MK_1(·), ..., MK_B(·)
+        #[cfg(target_arch = "wasm32")]
+        let mk_poly_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         self.mk_polynomials = Vec::with_capacity(num_branches);
         for i in 0..num_branches {
             let row_values = &mk_matrix[i];
             let poly = self.interpolate_values(row_values, eval_points);
             self.mk_polynomials.push(poly);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_mk_poly_ms += web_sys::window().unwrap().performance().unwrap().now() - mk_poly_timing_start;
         }
 
         // Step 3: Create commitments using packed evaluation (rotation-free)
@@ -1893,7 +2146,7 @@ impl<const R: usize> JVProver<R> {
 
         // Evaluate each MK polynomial across all chunks and collapse
         // GPU-only path: GPU context must be initialized
-        let mut collapsed_cts: Vec<RnsCiphertext> = {
+        let (mut collapsed_cts, gpu_time, collapse_time) = {
             if let Some(ref gpu_ctx) = self.gpu_context {
                 Self::commit_gpu_batched_with_ctx(
                     gpu_ctx,
@@ -1908,6 +2161,8 @@ impl<const R: usize> JVProver<R> {
                 panic!("GPU context not initialized for commit_mk - GPU is the only supported path")
             }
         };
+        self.total_gpu_time_ms += gpu_time;
+        self.timing_collapse_ms += collapse_time;
 
         // Ensure even number for 2-way packing
         if collapsed_cts.len() % 2 != 0 {
@@ -1951,11 +2206,19 @@ impl<const R: usize> JVProver<R> {
             mk_matrix[active_branch][j] = 1;
         }
 
+        #[cfg(target_arch = "wasm32")]
+        let mk_poly_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         self.mk_polynomials = Vec::with_capacity(num_branches);
         for i in 0..num_branches {
             let row_values = &mk_matrix[i];
             let poly = self.interpolate_values(row_values, eval_points);
             self.mk_polynomials.push(poly);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_mk_poly_ms += web_sys::window().unwrap().performance().unwrap().now() - mk_poly_timing_start;
         }
 
         self.mk_itpac_commitments = Vec::with_capacity(num_branches);
@@ -1985,7 +2248,7 @@ impl<const R: usize> JVProver<R> {
         let t = packed_powers_chunks[0].t;
 
         // GPU-only path with async on WASM
-        let mut collapsed_cts: Vec<RnsCiphertext> = {
+        let (mut collapsed_cts, gpu_time, collapse_time) = {
             if let Some(ref gpu_ctx) = self.gpu_context {
                 Self::commit_gpu_batched_with_ctx(
                     gpu_ctx,
@@ -2000,6 +2263,8 @@ impl<const R: usize> JVProver<R> {
                 panic!("GPU context not initialized for commit_mk - GPU is the only supported path")
             }
         };
+        self.total_gpu_time_ms += gpu_time;
+        self.timing_collapse_ms += collapse_time;
 
         if collapsed_cts.len() % 2 != 0 {
             let zero_coeffs = vec![0u64; slot_count];
@@ -2158,6 +2423,9 @@ impl<const R: usize> JVProver<R> {
         gamma: u64,
         topology_vectors: &[TopologyVector],
     ) -> Result<JVOpenMessage, JVProverError> {
+        #[cfg(target_arch = "wasm32")]
+        let perf = web_sys::window().unwrap().performance().unwrap();
+
         if self.phase != JVProverPhase::Disclosed {
             return Err(JVProverError::InvalidPhase);
         }
@@ -2170,8 +2438,21 @@ impl<const R: usize> JVProver<R> {
         }
 
         // Generate MK binary and sum proofs
+        #[cfg(target_arch = "wasm32")]
+        let mk_binary_start = perf.now();
         let mk_binary_proof = self.prove_mk_binary(gamma)?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_mk_binary_ms += perf.now() - mk_binary_start;
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        let mk_sum_start = perf.now();
         let mk_sum_proof = self.prove_mk_sum()?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_mk_sum_ms += perf.now() - mk_sum_start;
+        }
 
         // Compute universal hashes h_i for each topology vector
         let universal_hashes: Vec<u64> = topology_vectors
@@ -2191,6 +2472,9 @@ impl<const R: usize> JVProver<R> {
 
         // Compute H_hash(X) = Σᵢ h_i · MK_i(X)
         // The universal hash check verifies that this matches the disclosed topology products
+        #[cfg(target_arch = "wasm32")]
+        let open_poly_start = perf.now();
+
         let mut h_hash = vec![0u64];
 
         for (i, mk_poly) in self.mk_polynomials.iter().enumerate() {
@@ -2206,6 +2490,11 @@ impl<const R: usize> JVProver<R> {
 
         // Compute quotient Q_hash(X) = H_hash(X) / Z(X)
         let (quotient_coeffs, _remainder) = poly_div(&h_hash, z_poly, self.modulus);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_open_polynomial_ms += perf.now() - open_poly_start;
+        }
 
         // Extract MAC values and tags from MK IT-PAC commitments
         let mut mk_mac_values = Vec::with_capacity(self.mk_itpac_commitments.len());
@@ -2268,11 +2557,22 @@ impl<const R: usize> JVProver<R> {
     }
 
     /// Generates soldering commitment.
-    pub fn commit_soldering(&self) -> Result<Option<SolderingCommitMessage>, JVProverError> {
+    pub fn commit_soldering(&mut self) -> Result<Option<SolderingCommitMessage>, JVProverError> {
+        #[cfg(target_arch = "wasm32")]
+        let timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         if self.phase != JVProverPhase::Committed {
             return Err(JVProverError::InvalidPhase);
         }
-        Ok(self.soldering_prover.as_ref().map(|s| s.commit()))
+
+        let result = Ok(self.soldering_prover.as_ref().map(|s| s.commit()));
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_commit_soldering_ms += web_sys::window().unwrap().performance().unwrap().now() - timing_start;
+        }
+
+        result
     }
 
     /// Generates disclosure message.
@@ -2285,6 +2585,9 @@ impl<const R: usize> JVProver<R> {
         chi: u64,
         topology_vectors: &[TopologyVector],
     ) -> Result<JVDisclosureMessage, JVProverError> {
+        #[cfg(target_arch = "wasm32")]
+        let timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         if self.phase != JVProverPhase::Committed {
             return Err(JVProverError::InvalidPhase);
         }
@@ -2308,6 +2611,11 @@ impl<const R: usize> JVProver<R> {
         let aggregated_poly_eval = self.compute_aggregated_eval(chi);
 
         self.phase = JVProverPhase::Disclosed;
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_disclose_ms += web_sys::window().unwrap().performance().unwrap().now() - timing_start;
+        }
 
         Ok(JVDisclosureMessage {
             topology_products,
@@ -2334,13 +2642,24 @@ impl<const R: usize> JVProver<R> {
     ///
     /// This reduces communication from O(S×R) to O(R).
     pub fn reveal_soldering_aggregated(
-        &self,
+        &mut self,
         challenge: &SolderingChallengeMessage,
     ) -> Result<Option<AggregatedSolderingReveal>, JVProverError> {
+        #[cfg(target_arch = "wasm32")]
+        let timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         if self.phase != JVProverPhase::Disclosed && self.phase != JVProverPhase::Committed {
             return Err(JVProverError::InvalidPhase);
         }
-        Ok(self.soldering_prover.as_ref().map(|s| s.reveal_aggregated(challenge.phi, challenge.psi)))
+
+        let result = Ok(self.soldering_prover.as_ref().map(|s| s.reveal_aggregated(challenge.phi, challenge.psi)));
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_reveal_soldering_ms += web_sys::window().unwrap().performance().unwrap().now() - timing_start;
+        }
+
+        result
     }
 
     /// Generates LPZK proof for multiplication verification.
@@ -2487,6 +2806,10 @@ impl<const R: usize> JVProver<R> {
         // Q(X) = H(X) / Z(X)
 
         let lpzk_poly_start = profile_start!();
+
+        #[cfg(target_arch = "wasm32")]
+        let lpzk_accumulation_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         let mut h_poly = vec![0u64]; // Start with zero polynomial
         gamma_power = 1u64;
 
@@ -2528,6 +2851,12 @@ impl<const R: usize> JVProver<R> {
 
             gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
         }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_lpzk_accumulation_ms += web_sys::window().unwrap().performance().unwrap().now() - lpzk_accumulation_timing_start;
+        }
+
         profile_end!(lpzk_poly_start, "[lpzk] poly accumulation ({} mults, h_poly deg={}): {:?}", num_mults, h_poly.len());
 
         // Use cached vanishing polynomial Z(X) = Π(X - αⱼ)
@@ -2536,7 +2865,17 @@ impl<const R: usize> JVProver<R> {
 
         // Compute quotient Q(X) = H(X) / Z(X)
         let div_start = profile_start!();
+
+        #[cfg(target_arch = "wasm32")]
+        let poly_div_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         let (quotient_coeffs, _remainder) = poly_div(&h_poly, z_poly, self.modulus);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_poly_div_ms += web_sys::window().unwrap().performance().unwrap().now() - poly_div_timing_start;
+        }
+
         profile_end!(div_start, "[lpzk] poly_div (h_deg={}, z_deg={}): {:?}", h_poly.len(), z_poly.len());
 
         self.phase = JVProverPhase::Done;
@@ -2557,7 +2896,10 @@ impl<const R: usize> JVProver<R> {
     /// - The polynomial coefficients for each wire position
     /// - The MAC values (f(Λ) values - currently placeholder)
     /// - The MAC tags for IT-MAC verification
-    pub fn open_itpac(&self) -> Result<ItPacOpenMessage, JVProverError> {
+    pub fn open_itpac(&mut self) -> Result<ItPacOpenMessage, JVProverError> {
+        #[cfg(target_arch = "wasm32")]
+        let open_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         // Collect polynomial coefficients
         let polynomials = self.wire_polynomials.clone();
 
@@ -2572,6 +2914,11 @@ impl<const R: usize> JVProver<R> {
 
             // Get the MAC tag m = k + f(Λ)·Δ from the prover's share
             mac_tags.push(itpac.mac().prover_share().mac());
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_open_ms += web_sys::window().unwrap().performance().unwrap().now() - open_timing_start;
         }
 
         Ok(ItPacOpenMessage {

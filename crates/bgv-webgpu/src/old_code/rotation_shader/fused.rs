@@ -44,7 +44,7 @@ fn fused_twist(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let psi = vec2<u32>(psi_powers[psi_base], psi_powers[psi_base + 1u]);
 
     let prod = math::mul64(val, psi);
-    let result = math::barrett_reduce(prod, q, mu0, mu1, mu2, mu3);
+    let result = math::barrett_reduce_60bit(prod, q, mu0, mu1, mu2, mu3);
 
     data[base] = result.x;
     data[base + 1u] = result.y;
@@ -153,7 +153,7 @@ fn fused_butterfly(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let v = vec2<u32>(data[base_j], data[base_j + 1u]);
 
     let prod = math::mul64(v, twiddle);
-    let t = math::barrett_reduce(prod, q, mu0, mu1, mu2, mu3);
+    let t = math::barrett_reduce_60bit(prod, q, mu0, mu1, mu2, mu3);
 
     let new_i = math::addmod(u, t, q);
     let new_j = math::submod(u, t, q);
@@ -207,7 +207,7 @@ fn fused_pointwise(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let bv = vec2<u32>(b[base], b[base + 1u]);
 
     let prod = math::mul64(av, bv);
-    let res = math::barrett_reduce(prod, q, mu0, mu1, mu2, mu3);
+    let res = math::barrett_reduce_60bit(prod, q, mu0, mu1, mu2, mu3);
 
     result[base] = res.x;
     result[base + 1u] = res.y;
@@ -255,7 +255,7 @@ fn fused_scale(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let val = vec2<u32>(data[base], data[base + 1u]);
 
     let prod = math::mul64(val, scalar);
-    let res = math::barrett_reduce(prod, q, mu0, mu1, mu2, mu3);
+    let res = math::barrett_reduce_60bit(prod, q, mu0, mu1, mu2, mu3);
 
     data[base] = res.x;
     data[base + 1u] = res.y;

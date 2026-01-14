@@ -14,15 +14,23 @@ pub const MATH_MODULE: &str = r#"
 // Modular addition: (a + b) mod q
 fn addmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
     var sum_lo = a.x + b.x;
-    var carry = 0u;
+    var carry: u32 = 0u;
     if sum_lo < a.x { carry = 1u; }
-    var sum_hi = a.y + b.y + carry;
 
-    if sum_hi > q.y || (sum_hi == q.y && sum_lo >= q.x) {
+    var sum_hi = a.y + b.y;
+    var carry_hi: u32 = 0u;
+    if sum_hi < a.y { carry_hi = 1u; }
+    let tmp = sum_hi + carry;
+    if tmp < sum_hi { carry_hi = carry_hi + 1u; }
+    sum_hi = tmp;
+
+    // If carry_hi > 0, sum >= 2^64 > q, so we need to subtract q
+    // Also subtract if sum >= q (normal case)
+    if carry_hi > 0u || sum_hi > q.y || (sum_hi == q.y && sum_lo >= q.x) {
         if sum_lo >= q.x {
             sum_lo = sum_lo - q.x;
         } else {
-            sum_lo = 0xFFFFFFFFu - (q.x - sum_lo - 1u);
+            sum_lo = sum_lo + (0xFFFFFFFFu - q.x) + 1u;
             sum_hi = sum_hi - 1u;
         }
         sum_hi = sum_hi - q.y;
@@ -191,9 +199,12 @@ fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
     return vec2<u32>(r.x, r.y);
 }
 
-// Barrett reduction for 128-bit value mod 64-bit q
+// Barrett reduction for 60-bit RNS moduli (optimized)
+// Only uses lower 64 bits of input - sufficient when q < 2^60 and inputs < q
+// For products of two values < 2^60, the result fits in ~120 bits but we only
+// need to reduce values that are already partially reduced.
 // mu is passed as four 32-bit words: mu = mu3*2^96 + mu2*2^64 + mu1*2^32 + mu0
-fn barrett_reduce(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
+fn barrett_reduce_60bit(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
     var r0 = x.x;
     var r1 = x.y;
 
@@ -292,6 +303,212 @@ fn barrett_reduce(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3:
             r1 = r1 - sub1;
         } else {
             r1 = r1 + (0xFFFFFFFFu - sub1) + 1u;
+        }
+    }
+
+    return vec2<u32>(r0, r1);
+}
+
+// Barrett reduction for 64-bit Goldilocks modulus (full 128-bit input)
+// Handles the full 128-bit product when multiplying two 64-bit Goldilocks elements.
+// Uses all four 32-bit words of the input (x.x, x.y, x.z, x.w).
+// mu is passed as four 32-bit words: mu ≈ 2^128 / q
+fn barrett_reduce_64bit(x: vec4<u32>, q: vec2<u32>, mu0: u32, mu1: u32, mu2: u32, mu3: u32) -> vec2<u32> {
+    // Fast path: x already < q (high 64 bits are zero)
+    if x.w == 0u && x.z == 0u && (x.y < q.y || (x.y == q.y && x.x < q.x)) {
+        return vec2<u32>(x.x, x.y);
+    }
+
+    // We need to compute floor(x * mu / 2^128) where x is 128-bit and mu is 128-bit
+    // This gives us a quotient estimate q_est, then r = x - q_est * q
+    //
+    // x = x0 + x1*2^32 + x2*2^64 + x3*2^96  (128-bit)
+    // mu = mu0 + mu1*2^32 + mu2*2^64 + mu3*2^96  (128-bit)
+    //
+    // We need bits 128-255 of x * mu (i.e., floor(x * mu / 2^128))
+
+    // Compute all 16 partial products (32x32 -> 64)
+    let p00 = u64_mul(x.x, mu0);
+    let p01 = u64_mul(x.x, mu1);
+    let p02 = u64_mul(x.x, mu2);
+    let p03 = u64_mul(x.x, mu3);
+    let p10 = u64_mul(x.y, mu0);
+    let p11 = u64_mul(x.y, mu1);
+    let p12 = u64_mul(x.y, mu2);
+    let p13 = u64_mul(x.y, mu3);
+    let p20 = u64_mul(x.z, mu0);
+    let p21 = u64_mul(x.z, mu1);
+    let p22 = u64_mul(x.z, mu2);
+    let p23 = u64_mul(x.z, mu3);
+    let p30 = u64_mul(x.w, mu0);
+    let p31 = u64_mul(x.w, mu1);
+    let p32 = u64_mul(x.w, mu2);
+    let p33 = u64_mul(x.w, mu3);
+
+    // Accumulate columns to compute q_est = bits 128-191 of x*mu
+    // pij = xi * muj, pij.x contributes to column (i+j), pij.y to column (i+j+1)
+    var t: u32;
+
+    // Column 1 (bits 32-63): pij.x where i+j=1, pij.y where i+j=0
+    var col1: u32 = p00.y;
+    var c1: u32 = 0u;
+    t = col1 + p01.x; if t < col1 { c1 = 1u; } col1 = t;
+    t = col1 + p10.x; if t < col1 { c1 = c1 + 1u; } col1 = t;
+
+    // Column 2 (bits 64-95): pij.x where i+j=2, pij.y where i+j=1
+    var col2: u32 = p01.y;
+    var c2: u32 = 0u;
+    t = col2 + p10.y; if t < col2 { c2 = 1u; } col2 = t;
+    t = col2 + p02.x; if t < col2 { c2 = c2 + 1u; } col2 = t;
+    t = col2 + p11.x; if t < col2 { c2 = c2 + 1u; } col2 = t;
+    t = col2 + p20.x; if t < col2 { c2 = c2 + 1u; } col2 = t;
+    t = col2 + c1; if t < col2 { c2 = c2 + 1u; } col2 = t;
+
+    // Column 3 (bits 96-127): pij.x where i+j=3, pij.y where i+j=2
+    var col3: u32 = p02.y;
+    var c3: u32 = 0u;
+    t = col3 + p11.y; if t < col3 { c3 = 1u; } col3 = t;
+    t = col3 + p20.y; if t < col3 { c3 = c3 + 1u; } col3 = t;
+    t = col3 + p03.x; if t < col3 { c3 = c3 + 1u; } col3 = t;
+    t = col3 + p12.x; if t < col3 { c3 = c3 + 1u; } col3 = t;
+    t = col3 + p21.x; if t < col3 { c3 = c3 + 1u; } col3 = t;
+    t = col3 + p30.x; if t < col3 { c3 = c3 + 1u; } col3 = t;
+    t = col3 + c2; if t < col3 { c3 = c3 + 1u; } col3 = t;
+
+    // Column 4 (bits 128-159): pij.x where i+j=4, pij.y where i+j=3
+    var col4: u32 = p03.y;
+    var c4: u32 = 0u;
+    t = col4 + p12.y; if t < col4 { c4 = 1u; } col4 = t;
+    t = col4 + p21.y; if t < col4 { c4 = c4 + 1u; } col4 = t;
+    t = col4 + p30.y; if t < col4 { c4 = c4 + 1u; } col4 = t;
+    t = col4 + p13.x; if t < col4 { c4 = c4 + 1u; } col4 = t;
+    t = col4 + p22.x; if t < col4 { c4 = c4 + 1u; } col4 = t;
+    t = col4 + p31.x; if t < col4 { c4 = c4 + 1u; } col4 = t;
+    t = col4 + c3; if t < col4 { c4 = c4 + 1u; } col4 = t;
+
+    // Column 5 (bits 160-191): pij.x where i+j=5, pij.y where i+j=4
+    var col5: u32 = p13.y;
+    var c5: u32 = 0u;
+    t = col5 + p22.y; if t < col5 { c5 = 1u; } col5 = t;
+    t = col5 + p31.y; if t < col5 { c5 = c5 + 1u; } col5 = t;
+    t = col5 + p23.x; if t < col5 { c5 = c5 + 1u; } col5 = t;
+    t = col5 + p32.x; if t < col5 { c5 = c5 + 1u; } col5 = t;
+    t = col5 + c4; if t < col5 { c5 = c5 + 1u; } col5 = t;
+
+    // Column 6 (bits 192-223): pij.x where i+j=6, pij.y where i+j=5
+    var col6: u32 = p23.y;
+    var c6: u32 = 0u;
+    t = col6 + p32.y; if t < col6 { c6 = 1u; } col6 = t;
+    t = col6 + p33.x; if t < col6 { c6 = c6 + 1u; } col6 = t;
+    t = col6 + c5; if t < col6 { c6 = c6 + 1u; } col6 = t;
+
+    // Column 7 (bits 224-255): pij.y where i+j=6
+    var col7: u32 = p33.y;
+    t = col7 + c6; col7 = t;
+
+    // q_est = (col7, col6, col5, col4) >> 64 = (col7, col6) as 64-bit value
+    // Actually we want bits 128-191 of x*mu as our q_est (64-bit)
+    var q_est_lo = col4;
+    var q_est_hi = col5;
+
+    // Compute q_est * q (64-bit * 64-bit = 128-bit, but we only need low 128 bits)
+    let qe00 = u64_mul(q_est_lo, q.x);
+    let qe01 = u64_mul(q_est_lo, q.y);
+    let qe10 = u64_mul(q_est_hi, q.x);
+    let qe11 = u64_mul(q_est_hi, q.y);
+
+    var sub0 = qe00.x;
+    var sub1 = qe00.y;
+    var sub2: u32 = 0u;
+    var sub3 = qe11.y;
+    var sc: u32 = 0u;
+
+    t = sub1 + qe01.x; if t < sub1 { sc = 1u; } sub1 = t;
+    t = sub1 + qe10.x; if t < sub1 { sc = sc + 1u; } sub1 = t;
+
+    var sc2: u32 = 0u;
+    t = sub2 + qe01.y; if t < sub2 { sc2 = 1u; } sub2 = t;
+    t = sub2 + qe10.y; if t < sub2 { sc2 = sc2 + 1u; } sub2 = t;
+    t = sub2 + qe11.x; if t < sub2 { sc2 = sc2 + 1u; } sub2 = t;
+    t = sub2 + sc; if t < sub2 { sc2 = sc2 + 1u; } sub2 = t;
+
+    // Propagate carry to sub3
+    t = sub3 + sc2; sub3 = t;
+
+    // r = x - q_est * q
+    // sub = (sub0, sub1, sub2, ...) is q_est * q (up to 128+ bits)
+    // x = (x.x, x.y, x.z, x.w) is the full 128-bit input
+    // Result r should be < 2q, so fits in 65 bits
+
+    var r0 = x.x;
+    var r1 = x.y;
+    var r2 = x.z;
+    var r3 = x.w;
+    var borrow: u32 = 0u;
+
+    // Subtract sub0 from r0
+    if r0 >= sub0 {
+        r0 = r0 - sub0;
+    } else {
+        r0 = r0 + (0xFFFFFFFFu - sub0) + 1u;
+        borrow = 1u;
+    }
+
+    // Subtract sub1 + borrow from r1
+    var sub1b = sub1 + borrow;
+    borrow = 0u;
+    if sub1b < sub1 { borrow = 1u; }  // sub1 + old_borrow overflowed
+    if r1 >= sub1b {
+        r1 = r1 - sub1b;
+    } else {
+        r1 = r1 + (0xFFFFFFFFu - sub1b) + 1u;
+        borrow = borrow + 1u;
+    }
+
+    // Subtract sub2 + borrow from r2
+    var sub2b = sub2 + borrow;
+    borrow = 0u;
+    if sub2b < sub2 { borrow = 1u; }
+    if r2 >= sub2b {
+        r2 = r2 - sub2b;
+    } else {
+        r2 = r2 + (0xFFFFFFFFu - sub2b) + 1u;
+        borrow = borrow + 1u;
+    }
+
+    // Subtract sub3 + borrow from r3
+    var sub3b = sub3 + borrow;
+    if r3 >= sub3b {
+        r3 = r3 - sub3b;
+    } else {
+        r3 = r3 + (0xFFFFFFFFu - sub3b) + 1u;
+    }
+
+    // Now r = (r0, r1, r2, r3) but result should fit in ~65 bits
+    // If r2 or r3 are non-zero, we need to reduce further (shouldn't happen for correct q_est)
+    // For safety, check if r >= q and correct
+
+    // Final corrections: subtract q while r >= q
+    // Since q_est might be off by 1-2, r could be in [0, 3q)
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        // Check if (r1, r0) >= (q.y, q.x) considering r2 might have a bit set
+        if r2 > 0u || r1 > q.y || (r1 == q.y && r0 >= q.x) {
+            borrow = 0u;
+            if r0 >= q.x {
+                r0 = r0 - q.x;
+            } else {
+                r0 = r0 + (0xFFFFFFFFu - q.x) + 1u;
+                borrow = 1u;
+            }
+            var qyb = q.y + borrow;
+            if r1 >= qyb {
+                r1 = r1 - qyb;
+            } else {
+                r1 = r1 + (0xFFFFFFFFu - qyb) + 1u;
+                if r2 > 0u { r2 = r2 - 1u; }
+            }
+        } else {
+            break;
         }
     }
 
