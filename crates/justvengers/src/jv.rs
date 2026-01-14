@@ -1071,11 +1071,10 @@ impl<const R: usize> JVProver<R> {
         // Result: (B+C)/2 ciphertexts regardless of number of chunks.
         let bgv_start = profile_start!();
 
-        // GPU-accelerated path: uses pre-initialized gpu_context
-        #[cfg(feature = "gpu")]
+        // GPU-only path: GPU context must be initialized
         let mut collapsed_cts: Vec<RnsCiphertext> = {
             if let Some(ref gpu_ctx) = self.gpu_context {
-                let gpu_result = Self::commit_gpu_batched_with_ctx(
+                Self::commit_gpu_batched_with_ctx(
                     gpu_ctx,
                     &self.wire_polynomials,
                     packed_powers_chunks,
@@ -1083,101 +1082,10 @@ impl<const R: usize> JVProver<R> {
                     slot_count,
                     t,
                     0, // seed_offset for wire polynomials
-                );
-
-                match gpu_result {
-                    Ok(cts) => {
-                        eprintln!("[commit] GPU path succeeded");
-                        cts
-                    }
-                    Err(e) => {
-                        eprintln!("[commit] GPU path failed ({}), falling back to CPU", e);
-                        Self::commit_cpu_parallel(&self.wire_polynomials, packed_powers_chunks, &vole_blinders, slot_count)
-                    }
-                }
+                ).expect("GPU commit failed - GPU is the only supported path")
             } else {
-                eprintln!("[commit] No GPU context, using CPU path");
-                Self::commit_cpu_parallel(&self.wire_polynomials, packed_powers_chunks, &vole_blinders, slot_count)
+                panic!("GPU context not initialized - GPU is the only supported path")
             }
-        };
-
-        // CPU path with rayon parallelization (when GPU feature not enabled)
-        #[cfg(all(feature = "rayon", not(feature = "gpu")))]
-        let mut collapsed_cts: Vec<RnsCiphertext> = {
-            use rayon::prelude::*;
-            self.wire_polynomials
-                .par_iter()
-                .enumerate()
-                .map(|(poly_idx, poly)| {
-                    let vole_blinder = vole_blinders[poly_idx];
-                    let mut collapsed_ct: Option<RnsCiphertext> = None;
-
-                    for (chunk_idx, powers_chunk) in packed_powers_chunks.iter().enumerate() {
-                        let chunk_start = chunk_idx * slot_count;
-
-                        // Extract coefficients for this chunk, padding with 0 if needed
-                        let mut coeffs = vec![0u64; slot_count];
-                        for (i, &coeff) in poly.iter().skip(chunk_start).take(slot_count).enumerate() {
-                            coeffs[i] = coeff;
-                        }
-
-                        let evaluator = PackedProverEvaluator::new(powers_chunk);
-
-                        // Chunk 0: evaluate with blinding
-                        // Chunks 1+: evaluate without blinding (just slot-wise mul)
-                        let chunk_ct = if chunk_idx == 0 {
-                            let mut rng = Prg::from_seed(Block::from([poly_idx as u8; 16]));
-                            evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
-                        } else {
-                            evaluator.evaluate_row_unblinded(&coeffs)
-                        };
-
-                        // Collapse by adding to accumulated CT
-                        collapsed_ct = Some(match collapsed_ct {
-                            None => chunk_ct,
-                            Some(acc) => acc.add(&chunk_ct),
-                        });
-                    }
-
-                    collapsed_ct.unwrap()
-                })
-                .collect()
-        };
-
-        // Sequential CPU path (no rayon, no GPU)
-        #[cfg(not(any(feature = "rayon", feature = "gpu")))]
-        let mut collapsed_cts: Vec<RnsCiphertext> = {
-            let mut result = Vec::with_capacity(num_polys);
-            for (poly_idx, poly) in self.wire_polynomials.iter().enumerate() {
-                let vole_blinder = vole_blinders[poly_idx];
-                let mut collapsed_ct: Option<RnsCiphertext> = None;
-
-                for (chunk_idx, powers_chunk) in packed_powers_chunks.iter().enumerate() {
-                    let chunk_start = chunk_idx * slot_count;
-
-                    let mut coeffs = vec![0u64; slot_count];
-                    for (i, &coeff) in poly.iter().skip(chunk_start).take(slot_count).enumerate() {
-                        coeffs[i] = coeff;
-                    }
-
-                    let evaluator = PackedProverEvaluator::new(powers_chunk);
-
-                    let chunk_ct = if chunk_idx == 0 {
-                        let mut rng = Prg::from_seed(Block::from([poly_idx as u8; 16]));
-                        evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
-                    } else {
-                        evaluator.evaluate_row_unblinded(&coeffs)
-                    };
-
-                    collapsed_ct = Some(match collapsed_ct {
-                        None => chunk_ct,
-                        Some(acc) => acc.add(&chunk_ct),
-                    });
-                }
-
-                result.push(collapsed_ct.unwrap());
-            }
-            result
         };
 
         // Step 2: Ensure even number for 2-way packing
@@ -1585,11 +1493,10 @@ impl<const R: usize> JVProver<R> {
         let t = packed_powers_chunks[0].t;
 
         // Evaluate each MK polynomial across all chunks and collapse
-        // GPU-accelerated path: uses pre-initialized gpu_context
-        #[cfg(feature = "gpu")]
+        // GPU-only path: GPU context must be initialized
         let mut collapsed_cts: Vec<RnsCiphertext> = {
             if let Some(ref gpu_ctx) = self.gpu_context {
-                let gpu_result = Self::commit_gpu_batched_with_ctx(
+                Self::commit_gpu_batched_with_ctx(
                     gpu_ctx,
                     &self.mk_polynomials,
                     packed_powers_chunks,
@@ -1597,97 +1504,10 @@ impl<const R: usize> JVProver<R> {
                     slot_count,
                     t,
                     0x1000, // seed_offset for MK polynomials
-                );
-
-                match gpu_result {
-                    Ok(cts) => {
-                        eprintln!("[commit_mk] GPU path succeeded");
-                        cts
-                    }
-                    Err(e) => {
-                        eprintln!("[commit_mk] GPU path failed ({}), falling back to CPU", e);
-                        Self::commit_mk_cpu_parallel(&self.mk_polynomials, packed_powers_chunks, &vole_blinders, slot_count)
-                    }
-                }
+                ).expect("GPU commit_mk failed - GPU is the only supported path")
             } else {
-                eprintln!("[commit_mk] No GPU context, using CPU path");
-                Self::commit_mk_cpu_parallel(&self.mk_polynomials, packed_powers_chunks, &vole_blinders, slot_count)
+                panic!("GPU context not initialized for commit_mk - GPU is the only supported path")
             }
-        };
-
-        // CPU path with rayon parallelization (when GPU feature not enabled)
-        #[cfg(all(feature = "rayon", not(feature = "gpu")))]
-        let mut collapsed_cts: Vec<RnsCiphertext> = {
-            use rayon::prelude::*;
-            self.mk_polynomials
-                .par_iter()
-                .enumerate()
-                .map(|(poly_idx, poly)| {
-                    let vole_blinder = vole_blinders[poly_idx];
-                    let mut collapsed_ct: Option<RnsCiphertext> = None;
-
-                    for (chunk_idx, powers_chunk) in packed_powers_chunks.iter().enumerate() {
-                        let chunk_start = chunk_idx * slot_count;
-
-                        let mut coeffs = vec![0u64; slot_count];
-                        for (i, &coeff) in poly.iter().skip(chunk_start).take(slot_count).enumerate() {
-                            coeffs[i] = coeff;
-                        }
-
-                        let evaluator = PackedProverEvaluator::new(powers_chunk);
-
-                        let chunk_ct = if chunk_idx == 0 {
-                            let mut rng = Prg::from_seed(Block::from([(poly_idx + 0x1000) as u8; 16]));
-                            evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
-                        } else {
-                            evaluator.evaluate_row_unblinded(&coeffs)
-                        };
-
-                        collapsed_ct = Some(match collapsed_ct {
-                            None => chunk_ct,
-                            Some(acc) => acc.add(&chunk_ct),
-                        });
-                    }
-
-                    collapsed_ct.unwrap()
-                })
-                .collect()
-        };
-
-        // Serial CPU path (when neither GPU nor rayon enabled)
-        #[cfg(not(any(feature = "rayon", feature = "gpu")))]
-        let mut collapsed_cts: Vec<RnsCiphertext> = {
-            let mut result = Vec::with_capacity(num_branches);
-            for (poly_idx, poly) in self.mk_polynomials.iter().enumerate() {
-                let vole_blinder = vole_blinders[poly_idx];
-                let mut collapsed_ct: Option<RnsCiphertext> = None;
-
-                for (chunk_idx, powers_chunk) in packed_powers_chunks.iter().enumerate() {
-                    let chunk_start = chunk_idx * slot_count;
-
-                    let mut coeffs = vec![0u64; slot_count];
-                    for (i, &coeff) in poly.iter().skip(chunk_start).take(slot_count).enumerate() {
-                        coeffs[i] = coeff;
-                    }
-
-                    let evaluator = PackedProverEvaluator::new(powers_chunk);
-
-                    let chunk_ct = if chunk_idx == 0 {
-                        let mut rng = Prg::from_seed(Block::from([(poly_idx + 0x1000) as u8; 16]));
-                        evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
-                    } else {
-                        evaluator.evaluate_row_unblinded(&coeffs)
-                    };
-
-                    collapsed_ct = Some(match collapsed_ct {
-                        None => chunk_ct,
-                        Some(acc) => acc.add(&chunk_ct),
-                    });
-                }
-
-                result.push(collapsed_ct.unwrap());
-            }
-            result
         };
 
         // Ensure even number for 2-way packing

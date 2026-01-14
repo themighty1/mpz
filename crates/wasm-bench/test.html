@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head><title>Test</title></head>
+<body>
+<script type="module">
+console.log("TEST: Basic JS log");
+import init, { jv_vm_prover } from './pkg/mpz_wasm_bench.js';
+await init();
+console.log("TEST: WASM loaded");
+try {
+  const result = await jv_vm_prover(1, 1000);
+  console.log("TEST: Result:", result);
+} catch (e) {
+  console.log("TEST: Error:", e);
+}
+</script>
+</body>
+</html>

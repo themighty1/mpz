@@ -21,17 +21,14 @@ rand_chacha = { workspace = true }
 futures = { workspace = true }
 blake3 = { workspace = true }
 
-# Optional parallelization
-rayon = { workspace = true, optional = true }
-
-# Optional GPU acceleration
+# GPU acceleration (now mandatory via default feature)
 bgv-webgpu = { path = "../bgv-webgpu", optional = true }
 
 [features]
-default = []
-rayon = ["mpz-justvengers-core/rayon", "dep:rayon"]
+default = ["gpu"]
+gpu = ["dep:bgv-webgpu"]
 mersenne = ["mpz-fields/mersenne"]
-gpu = ["dep:bgv-webgpu", "rayon"]  # GPU path requires rayon for fallback
+# rayon removed - GPU is now the only supported path
 
 [dev-dependencies]
 rand = { workspace = true }

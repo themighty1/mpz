@@ -7,7 +7,12 @@ let andGateCount = 0;
 // Initialize WASM module
 export async function init(wasmModule) {
     wasm = wasmModule;
-    andGateCount = wasm.garble_core_aes128_and_count();
+    // Only call if garble functions are available (may be disabled)
+    if (typeof wasm.garble_core_aes128_and_count === 'function') {
+        andGateCount = wasm.garble_core_aes128_and_count();
+    } else {
+        andGateCount = 0; // garble module not compiled
+    }
 }
 
 // Progress callback (set by runner)
@@ -211,6 +216,17 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "jv_vm_prover", name: "jv_vm_prover/32k", fn: (n) => wasm.jv_vm_prover(n, 32768), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         { category: "jv_vm_prover", name: "jv_vm_prover/64k", fn: (n) => wasm.jv_vm_prover(n, 65536), async: true, returnsBenchResult: true, warmup: 1, mt: true },
         { category: "jv_vm_prover", name: "jv_vm_prover/128k", fn: (n) => wasm.jv_vm_prover(n, 131072), async: true, returnsBenchResult: true, warmup: 1, mt: true },
+        // jv_vm_prover_main_thread benchmarks (NO web_spawn, WITH GPU - workaround for web_spawn bug)
+        // GPU is async and runs on GPU hardware without blocking main thread
+        // See commit 240d7d58 on debug/webspawn-bug-investigation
+        { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/1k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 1000), async: true, returnsBenchResult: true, warmup: 1, mt: false },
+        { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/2k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 2000), async: true, returnsBenchResult: true, warmup: 1, mt: false },
+        { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/3k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 3000), async: true, returnsBenchResult: true, warmup: 1, mt: false },
+        { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/8k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 8192), async: true, returnsBenchResult: true, warmup: 1, mt: false },
+        { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/16k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 16384), async: true, returnsBenchResult: true, warmup: 1, mt: false },
+        { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/32k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 32768), async: true, returnsBenchResult: true, warmup: 1, mt: false },
+        { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/64k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 65536), async: true, returnsBenchResult: true, warmup: 1, mt: false },
+        { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/128k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 131072), async: true, returnsBenchResult: true, warmup: 1, mt: false },
         // bgv_justvengers benchmarks (BGV homomorphic encryption pattern)
         // 10 copies, 8192 slots, 5 RNS moduli, sum_slots + mask + 80 CT additions
         { category: "bgv", name: "bgv/justvengers_pattern", fn: (n) => wasm.bgv_justvengers_pattern(n), async: false, returnsBenchResult: true, warmup: 0 },

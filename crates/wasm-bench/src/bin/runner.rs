@@ -43,6 +43,7 @@ const ALL_GROUPS: &[&str] = &[
     "garble",
     "ferret_sender",
     "jv_vm_prover",
+    "jv_vm_prover_main_thread",
     "bgv",
 ];
 
@@ -83,6 +84,14 @@ const ALL_BENCHMARKS: &[&str] = &[
     "jv_vm_prover/32k",
     "jv_vm_prover/64k",
     "jv_vm_prover/128k",
+    "jv_vm_prover_main_thread/1k",
+    "jv_vm_prover_main_thread/2k",
+    "jv_vm_prover_main_thread/3k",
+    "jv_vm_prover_main_thread/8k",
+    "jv_vm_prover_main_thread/16k",
+    "jv_vm_prover_main_thread/32k",
+    "jv_vm_prover_main_thread/64k",
+    "jv_vm_prover_main_thread/128k",
     "bgv/justvengers_pattern",
     "bgv/justvengers_pattern_parallel",
     "bgv/justvengers_pattern_webgpu",

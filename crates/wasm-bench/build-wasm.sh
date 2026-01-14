@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build WASM benchmark with atomics/simd (requires nightly)
+# Build WASM benchmark with simd128 (requires nightly)
+# NOTE: atomics disabled - not needed for WebGPU and causes Atomics.wait errors
 set -e
 cd "$(dirname "$0")"
 
@@ -7,7 +8,7 @@ cd "$(dirname "$0")"
 echo "Ensuring wasm-pack version (rev 32e52ca)..."
 cargo install --git https://github.com/rustwasm/wasm-pack.git --rev 32e52ca
 
-echo "Building with nightly (atomics, simd128, build-std)..."
+echo "Building with nightly (simd128, build-std, no atomics)..."
 rustup run nightly \
     wasm-pack build . \
         --profile wasm \
