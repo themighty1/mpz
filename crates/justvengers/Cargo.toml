@@ -24,6 +24,11 @@ blake3 = { workspace = true }
 # GPU acceleration (now mandatory via default feature)
 bgv-webgpu = { path = "../bgv-webgpu", optional = true }
 
+# WASM dependencies for logging (target-specific)
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["console"] }
+
 [features]
 default = ["gpu"]
 gpu = ["dep:bgv-webgpu"]

@@ -95,6 +95,18 @@ macro_rules! profile_end {
     ($start:expr, $($arg:tt)*) => { let _ = $start; };
 }
 
+// WASM console logging
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsValue;
+
+// WASM console logging helper
+#[cfg(target_arch = "wasm32")]
+macro_rules! wasm_log {
+    ($($arg:tt)*) => {
+        web_sys::console::log_1(&JsValue::from_str(&format!($($arg)*)))
+    };
+}
+
 // Optional GPU acceleration for slot multiplication
 #[cfg(feature = "gpu")]
 use bgv_webgpu::{RnsSlotMulGpu, RnsBatchParams};
@@ -977,7 +989,29 @@ impl<const R: usize> JVProver<R> {
     /// # Arguments
     /// * `setup_msg` - Setup message from verifier containing encrypted powers
     /// * `vole_pool` - Pool of VOLE correlations for IT-MAC generation
+    // Native (sync) version
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn commit(
+        &mut self,
+        setup_msg: &JVSetupMessage,
+        vole_pool: VolePool<ItMacFieldType>,
+    ) -> Result<JVCommitmentMessage, JVProverError> {
+        self.commit_impl(setup_msg, vole_pool)
+    }
+
+    /// WASM async version (same as sync version, but awaits GPU operations)
+    #[cfg(target_arch = "wasm32")]
+    pub async fn commit(
+        &mut self,
+        setup_msg: &JVSetupMessage,
+        vole_pool: VolePool<ItMacFieldType>,
+    ) -> Result<JVCommitmentMessage, JVProverError> {
+        self.commit_impl(setup_msg, vole_pool).await
+    }
+
+    // Shared implementation (conditional async on WASM)
+    #[cfg(not(target_arch = "wasm32"))]
+    fn commit_impl(
         &mut self,
         setup_msg: &JVSetupMessage,
         vole_pool: VolePool<ItMacFieldType>,
@@ -1136,6 +1170,146 @@ impl<const R: usize> JVProver<R> {
         })
     }
 
+    // WASM async implementation (same logic but awaits GPU calls)
+    #[cfg(target_arch = "wasm32")]
+    async fn commit_impl(
+        &mut self,
+        setup_msg: &JVSetupMessage,
+        vole_pool: VolePool<ItMacFieldType>,
+    ) -> Result<JVCommitmentMessage, JVProverError> {
+        if self.phase != JVProverPhase::Setup {
+            return Err(JVProverError::InvalidPhase);
+        }
+
+        let eval_points = &setup_msg.eval_points;
+
+        // Validate eval_points length
+        let expected_len = if self.modulus == GOLDILOCKS {
+            R.next_power_of_two()
+        } else {
+            R
+        };
+
+        if eval_points.len() != expected_len {
+            return Err(JVProverError::WrongEvaluationPoints);
+        }
+
+        self.eval_points = Some(eval_points.to_vec());
+        let vanish_start = profile_start!();
+        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
+        self.vanishing_poly = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
+        profile_end!(vanish_start, "[commit] vanishing_poly ({} points): {:?}", actual_eval_points.len());
+
+        self.vole_pool = Some(vole_pool);
+        self.ahe_seed_commitment = Some(setup_msg.ahe_seed_commitment);
+        self.ahe_public_key = Some(setup_msg.ahe_public_key.clone());
+
+        self.packed_powers_chunks = setup_msg.packed_powers_chunks.clone();
+        self.rns_public_key = setup_msg.rns_public_key.clone();
+
+        let intt_start = profile_start!();
+        if self.modulus == GOLDILOCKS {
+            self.intt_context = Some(InttContext::new(eval_points.len()));
+        }
+        profile_end!(intt_start, "[commit] INTT context: {:?}");
+
+        let witness_len = self.witnesses[0].len();
+        self.wire_polynomials = Vec::with_capacity(witness_len);
+        self.itpac_commitments = Vec::with_capacity(witness_len);
+        self.ciphertext_commitments = Vec::with_capacity(witness_len);
+
+        let interp_start = profile_start!();
+        for pos in 0..witness_len {
+            let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
+            let poly = self.interpolate_values(&values, eval_points);
+            self.wire_polynomials.push(poly);
+        }
+        profile_end!(interp_start, "[commit] interpolation ({} polys): {:?}", witness_len);
+
+        let packed_powers_chunks = self.packed_powers_chunks.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        let num_polys = self.wire_polynomials.len();
+        let _num_chunks = packed_powers_chunks.len();
+        let slot_count = packed_powers_chunks[0].num_powers;
+        let t = packed_powers_chunks[0].t;
+
+        let itpac_start = profile_start!();
+        let vole_pool = self.vole_pool.as_mut().ok_or(JVProverError::MissingSetupData)?;
+        let mut vole_blinders = Vec::with_capacity(num_polys);
+        for poly in &self.wire_polynomials {
+            if let Some(random_mac) = vole_pool.get_random() {
+                vole_blinders.push(random_mac.prover_share().value().inner());
+                self.itpac_commitments.push(ItPac::new(poly.clone(), random_mac));
+            } else {
+                vole_blinders.push(0);
+            }
+        }
+        profile_end!(itpac_start, "[commit] IT-PAC creation ({} polys): {:?}", num_polys);
+
+        let bgv_start = profile_start!();
+
+        // GPU-only path: GPU context must be initialized
+        let mut collapsed_cts: Vec<RnsCiphertext> = {
+            if let Some(ref gpu_ctx) = self.gpu_context {
+                Self::commit_gpu_batched_with_ctx(
+                    gpu_ctx,
+                    &self.wire_polynomials,
+                    packed_powers_chunks,
+                    &vole_blinders,
+                    slot_count,
+                    t,
+                    0, // seed_offset for wire polynomials
+                ).await.expect("GPU commit failed - GPU is the only supported path")
+            } else {
+                panic!("GPU context not initialized - GPU is the only supported path")
+            }
+        };
+
+        // Step 2: Ensure even number for 2-way packing
+        if collapsed_cts.len() % 2 != 0 {
+            let zero_coeffs = vec![0u64; slot_count];
+            let evaluator = PackedProverEvaluator::new(&packed_powers_chunks[0]);
+            collapsed_cts.push(evaluator.evaluate_row_unblinded(&zero_coeffs));
+        }
+
+        // Step 3: 2-way pack pairs of collapsed ciphertexts
+        for pair in collapsed_cts.chunks(2) {
+            let packed_ct = RnsCiphertext::pack_2way(&pair[0], &pair[1]);
+            let ct_commitment = Self::compute_rns_ciphertext_commitment(&packed_ct);
+            self.ciphertext_commitments.push(ct_commitment);
+            self.rns_ciphertexts.push(packed_ct);
+        }
+
+        profile_end!(bgv_start, "[commit] BGV evaluate+collapse+pack ({} polys x {} chunks -> {} packed CTs): {:?}",
+            num_polys, packed_powers_chunks.len(), self.rns_ciphertexts.len());
+
+        // Step 9 from paper: Commit to input polynomial coefficients as IT-MACs
+        let input_mac_start = profile_start!();
+        self.input_coeff_macs = Vec::with_capacity(self.num_inputs);
+
+        for input_idx in 0..self.num_inputs {
+            let poly_coeffs = &self.wire_polynomials[input_idx];
+            let mut coeff_macs = Vec::with_capacity(poly_coeffs.len());
+
+            for _coeff in poly_coeffs {
+                if let Some(random_mac) = vole_pool.get_random() {
+                    coeff_macs.push(random_mac);
+                }
+            }
+
+            self.input_coeff_macs.push(coeff_macs);
+        }
+        profile_end!(input_mac_start, "[commit] input MACs ({} inputs): {:?}", self.num_inputs);
+
+        self.phase = JVProverPhase::Committed;
+
+        Ok(JVCommitmentMessage {
+            num_polynomials: witness_len,
+            ciphertext_commitments: self.ciphertext_commitments.clone(),
+        })
+    }
+
     /// GPU-accelerated batched slot multiplication with pre-initialized context.
     ///
     /// Uses multi-CT batching to process chunks in GPU dispatches,
@@ -1143,7 +1317,7 @@ impl<const R: usize> JVProver<R> {
     ///
     /// `seed_offset` is added to poly_idx when generating RNG seeds for blinding.
     /// Wire polynomials use 0, MK polynomials use 0x1000.
-    #[cfg(feature = "gpu")]
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
     fn commit_gpu_batched_with_ctx(
         gpu_ctx: &RnsSlotMulGpu,
         polynomials: &[Vec<u64>],
@@ -1174,17 +1348,33 @@ impl<const R: usize> JVProver<R> {
         let max_chunks_per_call = (max_batches / num_polys).max(1);
 
         // Precompute NTT for all CTs
-        let all_cts_ntt: Vec<(Vec<Vec<u64>>, Vec<Vec<u64>>)> = packed_powers_chunks
-            .iter()
-            .map(|chunk| chunk.powers_ct.precompute_ntt())
-            .collect();
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] Starting NTT precomputation for {} chunks...", num_chunks);
+
+        let mut all_cts_ntt: Vec<(Vec<Vec<u64>>, Vec<Vec<u64>>)> = Vec::with_capacity(num_chunks);
+        for (chunk_idx, chunk) in packed_powers_chunks.iter().enumerate() {
+            #[cfg(target_arch = "wasm32")]
+            wasm_log!("[IT-PAC] NTT precompute chunk {}/{}", chunk_idx + 1, num_chunks);
+
+            let ntt_result = chunk.powers_ct.precompute_ntt();
+            all_cts_ntt.push(ntt_result);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] NTT precomputation complete");
 
         // Process in groups of chunks that fit in GPU buffer
         let mut chunk_results: Vec<Vec<RnsCiphertext>> = vec![Vec::new(); num_chunks];
         let mut gpu_calls = 0;
 
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] Starting GPU slot multiplication for {} chunks (max {} chunks per GPU call)...", num_chunks, max_chunks_per_call);
+
         for group_start in (0..num_chunks).step_by(max_chunks_per_call) {
             let group_end = (group_start + max_chunks_per_call).min(num_chunks);
+
+            #[cfg(target_arch = "wasm32")]
+            wasm_log!("[IT-PAC] GPU dispatch {}: processing chunks {}-{}/{}", gpu_calls + 1, group_start, group_end - 1, num_chunks);
 
             // Collect CTs for this group
             let group_c0_ntt: Vec<Vec<Vec<u64>>> = (group_start..group_end)
@@ -1221,6 +1411,9 @@ impl<const R: usize> JVProver<R> {
                 .map_err(|e| format!("GPU mul failed: {}", e))?;
 
             gpu_calls += 1;
+
+            #[cfg(target_arch = "wasm32")]
+            wasm_log!("[IT-PAC] GPU dispatch {} complete, processing results...", gpu_calls);
 
             // Reshape and store results for this group
             for (local_chunk_idx, global_chunk_idx) in (group_start..group_end).enumerate() {
@@ -1261,6 +1454,9 @@ impl<const R: usize> JVProver<R> {
             }
         }
 
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] All GPU dispatches complete ({} total calls)", gpu_calls);
+
         profile_end!(
             gpu_start,
             "[commit] GPU multi-CT slot mul ({} polys x {} chunks, {} GPU calls, max {} chunks/call): {:?}",
@@ -1272,15 +1468,204 @@ impl<const R: usize> JVProver<R> {
 
         // Collapse across chunks (add CTs per polynomial)
         let collapse_start = profile_start!();
-        let collapsed_cts: Vec<RnsCiphertext> = (0..num_polys)
-            .map(|poly_idx| {
-                let mut acc = chunk_results[0][poly_idx].clone();
-                for chunk_idx in 1..num_chunks {
-                    acc = acc.add(&chunk_results[chunk_idx][poly_idx]);
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] Starting collapse across {} chunks for {} polynomials...", num_chunks, num_polys);
+
+        let mut collapsed_cts: Vec<RnsCiphertext> = Vec::with_capacity(num_polys);
+        for poly_idx in 0..num_polys {
+            #[cfg(target_arch = "wasm32")]
+            if poly_idx % 100 == 0 || poly_idx == num_polys - 1 {
+                wasm_log!("[IT-PAC] Collapsing polynomial {}/{}", poly_idx + 1, num_polys);
+            }
+
+            let mut acc = chunk_results[0][poly_idx].clone();
+            for chunk_idx in 1..num_chunks {
+                acc = acc.add(&chunk_results[chunk_idx][poly_idx]);
+            }
+            collapsed_cts.push(acc);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] Collapse complete");
+
+        profile_end!(collapse_start, "[commit] GPU collapse: {:?}");
+
+        Ok(collapsed_cts)
+    }
+
+    /// WASM async version of commit_gpu_batched_with_ctx (avoids blocking main thread)
+    #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
+    async fn commit_gpu_batched_with_ctx(
+        gpu_ctx: &RnsSlotMulGpu,
+        polynomials: &[Vec<u64>],
+        packed_powers_chunks: &[PackedEncryptedPowers],
+        vole_blinders: &[u64],
+        slot_count: usize,
+        t: u64,
+        seed_offset: usize,
+    ) -> Result<Vec<RnsCiphertext>, String> {
+        let num_polys = polynomials.len();
+        let num_chunks = packed_powers_chunks.len();
+
+        // Get reference CT for params
+        let ref_ct = &packed_powers_chunks[0].powers_ct;
+        let rns_params = ref_ct.rns_params().clone();
+        let bgv_params = ref_ct.bgv_params().clone();
+
+        let k = rns_params.moduli().len();
+
+        let gpu_start = profile_start!();
+
+        // Calculate max chunks per GPU call to stay under buffer limits
+        const MAX_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+        let bytes_per_batch = k * slot_count * 2 * 4;
+        let max_batches = MAX_BUFFER_SIZE / bytes_per_batch;
+        let max_chunks_per_call = (max_batches / num_polys).max(1);
+
+        // Precompute NTT for all CTs
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] Starting NTT precomputation for {} chunks...", num_chunks);
+
+        let mut all_cts_ntt: Vec<(Vec<Vec<u64>>, Vec<Vec<u64>>)> = Vec::with_capacity(num_chunks);
+        for (chunk_idx, chunk) in packed_powers_chunks.iter().enumerate() {
+            #[cfg(target_arch = "wasm32")]
+            wasm_log!("[IT-PAC] NTT precompute chunk {}/{}", chunk_idx + 1, num_chunks);
+
+            let ntt_result = chunk.powers_ct.precompute_ntt();
+            all_cts_ntt.push(ntt_result);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] NTT precomputation complete");
+
+        // Process in groups of chunks that fit in GPU buffer
+        let mut chunk_results: Vec<Vec<RnsCiphertext>> = vec![Vec::new(); num_chunks];
+        let mut gpu_calls = 0;
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] Starting GPU slot multiplication for {} chunks (max {} chunks per GPU call)...", num_chunks, max_chunks_per_call);
+
+        for group_start in (0..num_chunks).step_by(max_chunks_per_call) {
+            let group_end = (group_start + max_chunks_per_call).min(num_chunks);
+
+            #[cfg(target_arch = "wasm32")]
+            wasm_log!("[IT-PAC] GPU dispatch {}: processing chunks {}-{}/{}", gpu_calls + 1, group_start, group_end - 1, num_chunks);
+
+            // Collect CTs for this group
+            let group_c0_ntt: Vec<Vec<Vec<u64>>> = (group_start..group_end)
+                .map(|i| all_cts_ntt[i].0.clone())
+                .collect();
+            let group_c1_ntt: Vec<Vec<Vec<u64>>> = (group_start..group_end)
+                .map(|i| all_cts_ntt[i].1.clone())
+                .collect();
+
+            // Prepare plaintext slots for this group
+            let group_plaintext_slots: Vec<Vec<u64>> = (group_start..group_end)
+                .flat_map(|chunk_idx| {
+                    let chunk_start = chunk_idx * slot_count;
+                    polynomials.iter().map(move |poly| {
+                        let mut coeffs = vec![0u64; slot_count];
+                        for (i, &coeff) in
+                            poly.iter().skip(chunk_start).take(slot_count).enumerate()
+                        {
+                            coeffs[i] = coeff % t;
+                        }
+                        coeffs
+                    })
+                })
+                .collect();
+
+            // GPU dispatch for this group (ASYNC on WASM)
+            let (group_c0_results, group_c1_results) = gpu_ctx
+                .mul_batched_multi_ct(
+                    &group_c0_ntt,
+                    &group_c1_ntt,
+                    &group_plaintext_slots,
+                    num_polys,
+                )
+                .await
+                .map_err(|e| format!("GPU mul failed: {}", e))?;
+
+            gpu_calls += 1;
+
+            #[cfg(target_arch = "wasm32")]
+            wasm_log!("[IT-PAC] GPU dispatch {} complete, processing results...", gpu_calls);
+
+            // Reshape and store results for this group
+            for (local_chunk_idx, global_chunk_idx) in (group_start..group_end).enumerate() {
+                let mut cts: Vec<RnsCiphertext> = Vec::with_capacity(num_polys);
+                for poly_idx in 0..num_polys {
+                    let batch_idx = local_chunk_idx * num_polys + poly_idx;
+                    let ct = RnsCiphertext::from_residues(
+                        group_c0_results[batch_idx].clone(),
+                        group_c1_results[batch_idx].clone(),
+                        rns_params.clone(),
+                        bgv_params.clone(),
+                    );
+
+                    // Apply blinding for chunk 0
+                    let ct = if global_chunk_idx == 0 {
+                        let vole_blinder = vole_blinders[poly_idx];
+                        let mut rng = Prg::from_seed(Block::from([(poly_idx + seed_offset) as u8; 16]));
+
+                        // Generate blinders: r_0..r_{n-2} random, r_{n-1} = vole_u - sum
+                        let mut blinders = Vec::with_capacity(slot_count);
+                        let mut sum: u128 = 0;
+                        for _ in 0..slot_count - 1 {
+                            let r: u64 = rng.random::<u64>() % t;
+                            blinders.push(r);
+                            sum = (sum + r as u128) % t as u128;
+                        }
+                        let r_last = ((vole_blinder as u128 + t as u128 - sum) % t as u128) as u64;
+                        blinders.push(r_last);
+
+                        ct.sub_plaintext_slots(&blinders)
+                    } else {
+                        ct
+                    };
+
+                    cts.push(ct);
                 }
-                acc
-            })
-            .collect();
+                chunk_results[global_chunk_idx] = cts;
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] All GPU dispatches complete ({} total calls)", gpu_calls);
+
+        profile_end!(
+            gpu_start,
+            "[commit] GPU multi-CT slot mul ({} polys x {} chunks, {} GPU calls, max {} chunks/call): {:?}",
+            num_polys,
+            num_chunks,
+            gpu_calls,
+            max_chunks_per_call
+        );
+
+        // Collapse across chunks (add CTs per polynomial)
+        let collapse_start = profile_start!();
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] Starting collapse across {} chunks for {} polynomials...", num_chunks, num_polys);
+
+        let mut collapsed_cts: Vec<RnsCiphertext> = Vec::with_capacity(num_polys);
+        for poly_idx in 0..num_polys {
+            #[cfg(target_arch = "wasm32")]
+            if poly_idx % 100 == 0 || poly_idx == num_polys - 1 {
+                wasm_log!("[IT-PAC] Collapsing polynomial {}/{}", poly_idx + 1, num_polys);
+            }
+
+            let mut acc = chunk_results[0][poly_idx].clone();
+            for chunk_idx in 1..num_chunks {
+                acc = acc.add(&chunk_results[chunk_idx][poly_idx]);
+            }
+            collapsed_cts.push(acc);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] Collapse complete");
+
         profile_end!(collapse_start, "[commit] GPU collapse: {:?}");
 
         Ok(collapsed_cts)
@@ -1432,7 +1817,21 @@ impl<const R: usize> JVProver<R> {
     ///
     /// IMPORTANT: This must be called BEFORE γ is issued to prevent the malicious
     /// prover from choosing MK polynomials based on γ.
+    // Native (sync) version
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn commit_mk_polynomials(&mut self) -> Result<MKCommitmentMessage, JVProverError> {
+        self.commit_mk_polynomials_impl()
+    }
+
+    /// WASM async version (same as sync version, but awaits GPU operations)
+    #[cfg(target_arch = "wasm32")]
+    pub async fn commit_mk_polynomials(&mut self) -> Result<MKCommitmentMessage, JVProverError> {
+        self.commit_mk_polynomials_impl().await
+    }
+
+    // Shared implementation (conditional async on WASM)
+    #[cfg(not(target_arch = "wasm32"))]
+    fn commit_mk_polynomials_impl(&mut self) -> Result<MKCommitmentMessage, JVProverError> {
         if self.phase != JVProverPhase::Committed {
             return Err(JVProverError::InvalidPhase);
         }
@@ -1525,6 +1924,96 @@ impl<const R: usize> JVProver<R> {
             self.mk_rns_ciphertexts.push(packed_ct);
         }
         let _ = num_chunks; // silence unused warning
+
+        Ok(MKCommitmentMessage {
+            num_branches,
+            ciphertext_commitments: self.mk_ciphertext_commitments.clone(),
+        })
+    }
+
+    // WASM async implementation
+    #[cfg(target_arch = "wasm32")]
+    async fn commit_mk_polynomials_impl(&mut self) -> Result<MKCommitmentMessage, JVProverError> {
+        if self.phase != JVProverPhase::Committed {
+            return Err(JVProverError::InvalidPhase);
+        }
+
+        let eval_points = self.eval_points.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+        let num_branches = self.num_branches;
+
+        if num_branches == 0 {
+            return Err(JVProverError::MissingSetupData);
+        }
+
+        let mut mk_matrix: Vec<Vec<u64>> = vec![vec![0u64; R]; num_branches];
+        for (j, &active_branch) in self.active_branches.iter().enumerate() {
+            mk_matrix[active_branch][j] = 1;
+        }
+
+        self.mk_polynomials = Vec::with_capacity(num_branches);
+        for i in 0..num_branches {
+            let row_values = &mk_matrix[i];
+            let poly = self.interpolate_values(row_values, eval_points);
+            self.mk_polynomials.push(poly);
+        }
+
+        self.mk_itpac_commitments = Vec::with_capacity(num_branches);
+        self.mk_ciphertext_commitments = Vec::with_capacity(num_branches);
+        self.mk_rns_ciphertexts = Vec::new();
+
+        let packed_powers_chunks = self.packed_powers_chunks.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        let num_chunks = packed_powers_chunks.len();
+        let slot_count = packed_powers_chunks[0].num_powers;
+
+        let mut vole_blinders = Vec::with_capacity(num_branches);
+        if let Some(vole_pool) = self.vole_pool.as_mut() {
+            for poly in &self.mk_polynomials {
+                if let Some(random_mac) = vole_pool.get_random() {
+                    vole_blinders.push(random_mac.prover_share().value().inner());
+                    self.mk_itpac_commitments.push(ItPac::new(poly.clone(), random_mac));
+                } else {
+                    vole_blinders.push(0);
+                }
+            }
+        } else {
+            vole_blinders.resize(num_branches, 0);
+        }
+
+        let t = packed_powers_chunks[0].t;
+
+        // GPU-only path with async on WASM
+        let mut collapsed_cts: Vec<RnsCiphertext> = {
+            if let Some(ref gpu_ctx) = self.gpu_context {
+                Self::commit_gpu_batched_with_ctx(
+                    gpu_ctx,
+                    &self.mk_polynomials,
+                    packed_powers_chunks,
+                    &vole_blinders,
+                    slot_count,
+                    t,
+                    0x1000, // seed_offset for MK polynomials
+                ).await.expect("GPU commit_mk failed - GPU is the only supported path")
+            } else {
+                panic!("GPU context not initialized for commit_mk - GPU is the only supported path")
+            }
+        };
+
+        if collapsed_cts.len() % 2 != 0 {
+            let zero_coeffs = vec![0u64; slot_count];
+            let evaluator = PackedProverEvaluator::new(&packed_powers_chunks[0]);
+            collapsed_cts.push(evaluator.evaluate_row_unblinded(&zero_coeffs));
+        }
+
+        for pair in collapsed_cts.chunks(2) {
+            let packed_ct = RnsCiphertext::pack_2way(&pair[0], &pair[1]);
+            let ct_commitment = Self::compute_rns_ciphertext_commitment(&packed_ct);
+            self.mk_ciphertext_commitments.push(ct_commitment);
+            self.mk_rns_ciphertexts.push(packed_ct);
+        }
+        let _ = num_chunks;
 
         Ok(MKCommitmentMessage {
             num_branches,
@@ -3866,6 +4355,7 @@ pub fn extract_verifier_shares_from_pool(
 /// Runs the optimized JustVengers protocol.
 ///
 /// This achieves O(R+B+C) communication instead of O(RC).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn run_jv_protocol<const R: usize>(
     circuits: &CircuitBatch,
     active_branches: &[usize],
@@ -3904,7 +4394,10 @@ pub fn run_jv_protocol<const R: usize>(
     verifier.set_verifier_local_keys(verifier_shares);
 
     // Phase 1: Commit (using real IT-PAC)
+    #[cfg(not(target_arch = "wasm32"))]
     let commitment = prover.commit(&setup_msg, vole_pool).map_err(|_| JVProtocolError::ProverError)?;
+    #[cfg(target_arch = "wasm32")]
+    let commitment = prover.commit(&setup_msg, vole_pool).await.map_err(|_| JVProtocolError::ProverError)?;
 
     // Phase 1a: Commit input polynomial coefficients (for extractability - Paper Step 9)
     // This enables the simulator to extract the actual witness values
@@ -3913,7 +4406,11 @@ pub fn run_jv_protocol<const R: usize>(
 
     // Phase 1b: Commit MK polynomials (for ZK branch hiding)
     // MUST be committed BEFORE γ is issued to prevent malicious prover attacks
+    #[cfg(not(target_arch = "wasm32"))]
     let _mk_commitment = prover.commit_mk_polynomials()
+        .map_err(|_| JVProtocolError::ProverError)?;
+    #[cfg(target_arch = "wasm32")]
+    let _mk_commitment = prover.commit_mk_polynomials().await
         .map_err(|_| JVProtocolError::ProverError)?;
 
     let soldering_commit = prover.commit_soldering().map_err(|_| JVProtocolError::ProverError)?;
@@ -3986,6 +4483,94 @@ pub fn run_jv_protocol<const R: usize>(
     let _ = verifier.verify_input_coeff_macs(&input_coeffs);
 
     // Phase 6: LPZK proof
+    let lpzk_proof = prover.prove_multiplications().map_err(|_| JVProtocolError::ProverError)?;
+    let result = verifier.verify_multiplications(lpzk_proof)
+        .map_err(|_| JVProtocolError::VerifierError)?;
+
+    Ok(result)
+}
+
+/// WASM async version (same logic but awaits GPU calls)
+#[cfg(target_arch = "wasm32")]
+pub async fn run_jv_protocol<const R: usize>(
+    circuits: &CircuitBatch,
+    active_branches: &[usize],
+    inputs_per_rep: &[Vec<u64>],
+    soldering_constraints: &[SolderingConstraint],
+    modulus: u64,
+) -> Result<bool, JVProtocolError> {
+    use rand::SeedableRng;
+    let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
+
+    if inputs_per_rep.len() != R || active_branches.len() != R {
+        return Err(JVProtocolError::InvalidInputs);
+    }
+
+    let mut prover = JVProver::<R>::new(active_branches.to_vec(), modulus);
+    prover.setup(circuits, inputs_per_rep).map_err(|_| JVProtocolError::ProverError)?;
+    prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).map_err(|_| JVProtocolError::ProverError)?;
+
+    let mut verifier = JVVerifier::<R>::new(modulus, &mut rng);
+    let setup_msg = verifier.setup(circuits, &mut rng).map_err(|_| JVProtocolError::VerifierError)?;
+    verifier.setup_soldering(soldering_constraints.to_vec()).map_err(|_| JVProtocolError::VerifierError)?;
+
+    let circuit_size = circuits.get(0).map(|c| c.num_wires()).unwrap_or(10);
+    let vole_pool = VolePool::generate(verifier.global_key(), circuit_size * 2, &mut rng);
+    let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
+    verifier.set_verifier_local_keys(verifier_shares);
+
+    // Phase 1: Commit - async on WASM
+    let commitment = prover.commit(&setup_msg, vole_pool).await.map_err(|_| JVProtocolError::ProverError)?;
+    let input_coeff_msg = prover.commit_input_coefficients()
+        .map_err(|_| JVProtocolError::ProverError)?;
+    let _mk_commitment = prover.commit_mk_polynomials().await
+        .map_err(|_| JVProtocolError::ProverError)?;
+    let soldering_commit = prover.commit_soldering().map_err(|_| JVProtocolError::ProverError)?;
+
+    verifier.receive_input_coeff_macs(input_coeff_msg)
+        .map_err(|_| JVProtocolError::VerifierError)?;
+
+    let chi = verifier.receive_commitment(commitment).map_err(|_| JVProtocolError::VerifierError)?;
+    let gamma: u64 = rng.random_range(1..modulus);
+
+    let soldering_challenge = if let Some(commit) = soldering_commit {
+        verifier.receive_soldering_commit(commit, &mut rng)
+            .map_err(|_| JVProtocolError::SolderingError)?
+    } else {
+        None
+    };
+
+    // Phase 3: Aggregation ρ
+    let rho: u64 = rng.random_range(1..modulus);
+
+    // Phase 5: Open with ZK branch hiding
+    let open_msg = prover.open(rho, gamma, verifier.topology_vectors())
+        .map_err(|_| JVProtocolError::ProverError)?;
+    let open_valid = verifier.receive_open(open_msg, gamma)
+        .map_err(|_| JVProtocolError::VerifierError)?;
+
+    if !open_valid {
+        return Err(JVProtocolError::MkProofVerificationFailed);
+    }
+
+    // Phase 5b: IT-PAC Opening
+    let itpac_open_msg = prover.open_itpac()
+        .map_err(|_| JVProtocolError::ProverError)?;
+
+    if !verifier.verify_itpac_opening(&itpac_open_msg) {
+        return Err(JVProtocolError::ItPacVerificationFailed);
+    }
+
+    // Phase 5c: Verify input coefficient IT-MACs
+    let num_inputs = prover.num_inputs();
+    let input_coeffs: Vec<Vec<u64>> = itpac_open_msg.polynomials
+        .iter()
+        .take(num_inputs)
+        .cloned()
+        .collect();
+
+    let _ = verifier.verify_input_coeff_macs(&input_coeffs);
+
     let lpzk_proof = prover.prove_multiplications().map_err(|_| JVProtocolError::ProverError)?;
     let result = verifier.verify_multiplications(lpzk_proof)
         .map_err(|_| JVProtocolError::VerifierError)?;

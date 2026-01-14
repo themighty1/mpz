@@ -17,6 +17,9 @@ use wgpu::{util::DeviceExt, Buffer, BufferUsages, ComputePipeline, Device, Queue
 use crate::error::GpuError;
 use crate::math::{compute_powers, mod_mul, mod_inverse, find_psi, find_primitive_root};
 
+#[cfg(target_arch = "wasm32")]
+use futures::TryFutureExt;
+
 /// Precomputed NTT data for a single RNS modulus.
 #[derive(Clone)]
 pub struct RnsModulusNttData {
@@ -789,6 +792,7 @@ impl RnsSlotMulGpu {
     ///
     /// # Returns
     /// (c0_results, c1_results) where each is [total_batches][k][n] in coefficient domain
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn mul_batched_multi_ct(
         &self,
         cts_c0_ntt: &[Vec<Vec<u64>>],
@@ -1125,6 +1129,373 @@ impl RnsSlotMulGpu {
         Ok((c0_results, c1_results))
     }
 
+    /// WASM async version of mul_batched_multi_ct (avoids blocking on main thread)
+    #[cfg(target_arch = "wasm32")]
+    pub async fn mul_batched_multi_ct(
+        &self,
+        cts_c0_ntt: &[Vec<Vec<u64>>],
+        cts_c1_ntt: &[Vec<Vec<u64>>],
+        plaintext_slots: &[Vec<u64>],
+        batches_per_ct: usize,
+    ) -> Result<(Vec<Vec<Vec<u64>>>, Vec<Vec<Vec<u64>>>), GpuError> {
+        let num_cts = cts_c0_ntt.len();
+        let total_batches = plaintext_slots.len();
+
+        if num_cts == 0 || total_batches == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let n = self.params.n;
+        let k = self.params.k;
+
+        // Validate inputs
+        if cts_c1_ntt.len() != num_cts {
+            return Err(GpuError::InvalidParams(
+                "c0 and c1 CT counts must match".to_string(),
+            ));
+        }
+
+        for (i, ct) in cts_c0_ntt.iter().enumerate() {
+            if ct.len() != k {
+                return Err(GpuError::InvalidParams(format!(
+                    "CT {} c0 should have {} moduli, got {}",
+                    i,
+                    k,
+                    ct.len()
+                )));
+            }
+        }
+
+        // === Step 1: Upload all CTs NTT to GPU (concatenated) ===
+        let all_c0_flat: Vec<u32> = cts_c0_ntt
+            .iter()
+            .flat_map(|ct| {
+                ct.iter()
+                    .flat_map(|residue| residue.iter().flat_map(|&x| [x as u32, (x >> 32) as u32]))
+            })
+            .collect();
+
+        let all_c1_flat: Vec<u32> = cts_c1_ntt
+            .iter()
+            .flat_map(|ct| {
+                ct.iter()
+                    .flat_map(|residue| residue.iter().flat_map(|&x| [x as u32, (x >> 32) as u32]))
+            })
+            .collect();
+
+        let cts_c0_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("multi_ct_c0_ntt"),
+                contents: bytemuck::cast_slice(&all_c0_flat),
+                usage: BufferUsages::STORAGE,
+            });
+
+        let cts_c1_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("multi_ct_c1_ntt"),
+                contents: bytemuck::cast_slice(&all_c1_flat),
+                usage: BufferUsages::STORAGE,
+            });
+
+        // === Step 2: Upload plaintext slots ===
+        let slots_flat: Vec<u32> = plaintext_slots
+            .iter()
+            .flat_map(|batch| batch.iter().flat_map(|&x| [x as u32, (x >> 32) as u32]))
+            .collect();
+
+        let slots_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("plaintext_slots"),
+                contents: bytemuck::cast_slice(&slots_flat),
+                usage: BufferUsages::STORAGE,
+            });
+
+        // === Step 3: Allocate intermediate and output buffers ===
+        let batch_size = total_batches * n * 2 * std::mem::size_of::<u32>();
+        let rns_batch_size = total_batches * k * n * 2 * std::mem::size_of::<u32>();
+
+        let encoded_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("encoded_coeffs"),
+            size: batch_size as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let pt_ntt_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pt_ntt"),
+            size: rns_batch_size as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let out_c0_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("out_c0"),
+            size: rns_batch_size as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let out_c1_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("out_c1"),
+            size: rns_batch_size as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let regular_batch_params = GpuBatchParams {
+            n: n as u32,
+            log_n: (n as u32).trailing_zeros(),
+            num_batches: total_batches as u32,
+            num_moduli: k as u32,
+        };
+
+        let regular_batch_params_buffer =
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("batch_params"),
+                    contents: bytemuck::bytes_of(&regular_batch_params),
+                    usage: BufferUsages::UNIFORM,
+                });
+
+        // === Step 4: Execute pipeline ===
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("multi_ct_slot_mul encoder"),
+            });
+
+        // 4a: Slot encode (INTT mod t)
+        {
+            let bind_group_layout = self.slot_encode_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("slot_encode bind group"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: regular_batch_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: slots_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: encoded_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.plaintext_twiddles_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.plaintext_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("slot_encode pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.slot_encode_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(total_batches as u32, 1, 1);
+        }
+
+        // 4b-4d: For each RNS modulus, do forward NTT, pointwise mul (multi-CT), inverse NTT
+        for mod_idx in 0..k {
+            // Forward NTT
+            {
+                let bind_group_layout = self.forward_ntt_pipeline.get_bind_group_layout(0);
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("forward_ntt_{} bind group", mod_idx)),
+                    layout: &bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: regular_batch_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: encoded_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: pt_ntt_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.rns_twiddles_buffers[mod_idx].as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.rns_params_buffers[mod_idx].as_entire_binding(),
+                        },
+                    ],
+                });
+
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(&format!("forward_ntt_{} pass", mod_idx)),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.forward_ntt_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(total_batches as u32, 1, 1);
+            }
+
+            // Pointwise multiplication (multi-CT version)
+            {
+                let multi_ct_params = GpuBatchParamsMultiCt {
+                    n: n as u32,
+                    log_n: (n as u32).trailing_zeros(),
+                    num_batches: total_batches as u32,
+                    num_moduli: k as u32,
+                    num_cts: num_cts as u32,
+                    batches_per_ct: batches_per_ct as u32,
+                    mod_idx: mod_idx as u32,
+                    _pad: 0,
+                };
+
+                let multi_ct_params_buffer =
+                    self.device
+                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some(&format!("batch_params_multi_ct_{}", mod_idx)),
+                            contents: bytemuck::bytes_of(&multi_ct_params),
+                            usage: BufferUsages::UNIFORM,
+                        });
+
+                let bind_group_layout = self.pointwise_mul_multi_ct_pipeline.get_bind_group_layout(0);
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("pointwise_mul_multi_ct_{} bind group", mod_idx)),
+                    layout: &bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: multi_ct_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: cts_c0_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: cts_c1_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: pt_ntt_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: out_c0_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: out_c1_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(&format!("pointwise_mul_multi_ct_{} pass", mod_idx)),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pointwise_mul_multi_ct_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(total_batches as u32, 1, 1);
+            }
+
+            // Inverse NTT
+            {
+                let bind_group_layout = self.inverse_ntt_pipeline.get_bind_group_layout(0);
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("inverse_ntt_{} bind group", mod_idx)),
+                    layout: &bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: regular_batch_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: out_c0_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: out_c0_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.rns_twiddles_buffers[mod_idx].as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.rns_params_buffers[mod_idx].as_entire_binding(),
+                        },
+                    ],
+                });
+
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(&format!("inverse_ntt_c0_{} pass", mod_idx)),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.inverse_ntt_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(total_batches as u32, 1, 1);
+            }
+
+            {
+                let bind_group_layout = self.inverse_ntt_pipeline.get_bind_group_layout(0);
+                let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("inverse_ntt_c1_{} bind group", mod_idx)),
+                    layout: &bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: regular_batch_params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: out_c1_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: out_c1_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.rns_twiddles_buffers[mod_idx].as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.rns_params_buffers[mod_idx].as_entire_binding(),
+                        },
+                    ],
+                });
+
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(&format!("inverse_ntt_c1_{} pass", mod_idx)),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.inverse_ntt_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(total_batches as u32, 1, 1);
+            }
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+
+        // === Step 5: Read back results using async ===
+        let c0_results = self.read_rns_batch_async(&out_c0_buffer, total_batches, k, n).await?;
+        let c1_results = self.read_rns_batch_async(&out_c1_buffer, total_batches, k, n).await?;
+
+        Ok((c0_results, c1_results))
+    }
+
     /// Performs batched INTT (inverse NTT) mod Goldilocks.
     ///
     /// This is useful for polynomial interpolation: given evaluation values,
@@ -1305,6 +1676,66 @@ impl RnsSlotMulGpu {
         Ok(results)
     }
 
+    // WASM async version of read_batch (avoids blocking)
+    #[cfg(target_arch = "wasm32")]
+    async fn read_batch_async(
+        &self,
+        buffer: &Buffer,
+        num_batches: usize,
+        n: usize,
+    ) -> Result<Vec<Vec<u64>>, GpuError> {
+        let size = (num_batches * n * 2 * std::mem::size_of::<u32>()) as u64;
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("read encoder"),
+            });
+
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+        self.queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging.slice(..size);
+
+        // Use wasm_bindgen_futures for proper async
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+
+        receiver
+            .await
+            .map_err(|_| GpuError::ExecutionFailed("map_async canceled".to_string()))?
+            .map_err(|e| GpuError::ExecutionFailed(format!("Buffer mapping failed: {:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let u32_data: &[u32] = bytemuck::cast_slice(&data);
+
+        // Reshape: [num_batches][n]
+        let mut results = Vec::with_capacity(num_batches);
+        for batch_idx in 0..num_batches {
+            let mut coeffs = Vec::with_capacity(n);
+            for elem_idx in 0..n {
+                let idx = (batch_idx * n + elem_idx) * 2;
+                let val = (u32_data[idx] as u64) | ((u32_data[idx + 1] as u64) << 32);
+                coeffs.push(val);
+            }
+            results.push(coeffs);
+        }
+
+        drop(data);
+        staging.unmap();
+
+        Ok(results)
+    }
+
     fn upload_rns_poly(&self, poly: &[Vec<u64>]) -> Result<Buffer, GpuError> {
         let flat: Vec<u32> = poly
             .iter()
@@ -1356,6 +1787,71 @@ impl RnsSlotMulGpu {
 
         rx.recv()
             .map_err(|e| GpuError::ExecutionFailed(e.to_string()))?
+            .map_err(|e| GpuError::ExecutionFailed(format!("Buffer mapping failed: {:?}", e)))?;
+
+        let data = buffer_slice.get_mapped_range();
+        let u32_data: &[u32] = bytemuck::cast_slice(&data);
+
+        // Reshape: [num_batches][k][n]
+        let mut results = Vec::with_capacity(num_batches);
+        for batch_idx in 0..num_batches {
+            let mut batch = Vec::with_capacity(k);
+            for mod_idx in 0..k {
+                let mut residue = Vec::with_capacity(n);
+                for elem_idx in 0..n {
+                    let idx = ((batch_idx * k + mod_idx) * n + elem_idx) * 2;
+                    let val = (u32_data[idx] as u64) | ((u32_data[idx + 1] as u64) << 32);
+                    residue.push(val);
+                }
+                batch.push(residue);
+            }
+            results.push(batch);
+        }
+
+        drop(data);
+        staging.unmap();
+
+        Ok(results)
+    }
+
+    // WASM async version of read_rns_batch (avoids blocking)
+    #[cfg(target_arch = "wasm32")]
+    async fn read_rns_batch_async(
+        &self,
+        buffer: &Buffer,
+        num_batches: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Vec<Vec<Vec<u64>>>, GpuError> {
+        let size = (num_batches * k * n * 2 * std::mem::size_of::<u32>()) as u64;
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging"),
+            size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("read encoder"),
+            });
+
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+        self.queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging.slice(..size);
+
+        // Use wasm_bindgen_futures for proper async
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+
+        receiver
+            .await
+            .map_err(|_| GpuError::ExecutionFailed("map_async canceled".to_string()))?
             .map_err(|e| GpuError::ExecutionFailed(format!("Buffer mapping failed: {:?}", e)))?;
 
         let data = buffer_slice.get_mapped_range();

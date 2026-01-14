@@ -203,12 +203,12 @@ async fn jv_record_verifier_messages<const R: usize>(
 
     // P → V: CommitmentMessage (IT-PAC ciphertexts)
     web_sys::console::log_1(&"[jv_record] Prover commit (IT-PAC)...".into());
-    let commitment = prover.commit(&setup_msg, vole_pool).unwrap();
+    let commitment = prover.commit(&setup_msg, vole_pool).await.unwrap();
     web_sys::console::log_1(&"[jv_record] Prover commit done".into());
 
     // P → V: MK polynomial commitment
     web_sys::console::log_1(&"[jv_record] Prover commit MK polynomials...".into());
-    let _mk_commitment = prover.commit_mk_polynomials().unwrap();
+    let _mk_commitment = prover.commit_mk_polynomials().await.unwrap();
     web_sys::console::log_1(&"[jv_record] MK commit done".into());
 
     // P → V: Soldering commitment (optional)
@@ -302,10 +302,10 @@ async fn run_prover_iteration<const R: usize>(
     prover.set_gpu_context(gpu_ctx.clone());
 
     // P → V: CommitmentMessage (IT-PAC ciphertexts)
-    let _commitment = prover.commit(&recorded.setup_msg, vole_pool).unwrap();
+    let _commitment = prover.commit(&recorded.setup_msg, vole_pool).await.unwrap();
 
     // P → V: MK polynomial commitment
-    let _mk_commitment = prover.commit_mk_polynomials().unwrap();
+    let _mk_commitment = prover.commit_mk_polynomials().await.unwrap();
 
     // P → V: Soldering commitment (optional)
     let _soldering_commit = prover.commit_soldering().unwrap();
