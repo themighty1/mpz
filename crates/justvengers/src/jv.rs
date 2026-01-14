@@ -787,6 +787,51 @@ impl<const R: usize> JVProver<R> {
         self.gpu_context.is_some()
     }
 
+    /// Prepares GPU context with hardcoded Goldilocks parameters.
+    /// Use this for benchmarks to initialize GPU before receiving verifier data.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    pub fn prepare_gpu_goldilocks(&mut self, slot_count: usize) -> Result<(), JVProverError> {
+        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpu};
+
+        let gpu_params = RnsBatchParams::goldilocks(slot_count)
+            .ok_or(JVProverError::GpuInitFailed)?;
+
+        match RnsSlotMulGpu::new(gpu_params) {
+            Ok(ctx) => {
+                self.gpu_context = Some(std::sync::Arc::new(ctx));
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("[prepare_gpu_goldilocks] GPU init failed: {}", e);
+                Err(JVProverError::GpuInitFailed)
+            }
+        }
+    }
+
+    /// Creates a pre-initialized GPU context for Goldilocks parameters.
+    /// Returns Arc that can be shared across multiple provers.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    pub fn create_gpu_context_goldilocks(slot_count: usize) -> Result<std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>, JVProverError> {
+        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpu};
+
+        let gpu_params = RnsBatchParams::goldilocks(slot_count)
+            .ok_or(JVProverError::GpuInitFailed)?;
+
+        match RnsSlotMulGpu::new(gpu_params) {
+            Ok(ctx) => Ok(std::sync::Arc::new(ctx)),
+            Err(e) => {
+                eprintln!("[create_gpu_context_goldilocks] GPU init failed: {}", e);
+                Err(JVProverError::GpuInitFailed)
+            }
+        }
+    }
+
+    /// Sets a pre-initialized GPU context (for sharing across iterations).
+    #[cfg(feature = "gpu")]
+    pub fn set_gpu_context(&mut self, ctx: std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>) {
+        self.gpu_context = Some(ctx);
+    }
+
     /// Initializes the prover with per-repetition circuits.
     pub fn setup(
         &mut self,
@@ -1019,6 +1064,7 @@ impl<const R: usize> JVProver<R> {
                     &vole_blinders,
                     slot_count,
                     t,
+                    0, // seed_offset for wire polynomials
                 );
 
                 match gpu_result {
@@ -1168,16 +1214,20 @@ impl<const R: usize> JVProver<R> {
     ///
     /// Uses multi-CT batching to process chunks in GPU dispatches,
     /// splitting into groups if buffer size exceeds GPU limits.
+    ///
+    /// `seed_offset` is added to poly_idx when generating RNG seeds for blinding.
+    /// Wire polynomials use 0, MK polynomials use 0x1000.
     #[cfg(feature = "gpu")]
     fn commit_gpu_batched_with_ctx(
         gpu_ctx: &RnsSlotMulGpu,
-        wire_polynomials: &[Vec<u64>],
+        polynomials: &[Vec<u64>],
         packed_powers_chunks: &[PackedEncryptedPowers],
         vole_blinders: &[u64],
         slot_count: usize,
         t: u64,
+        seed_offset: usize,
     ) -> Result<Vec<RnsCiphertext>, String> {
-        let num_polys = wire_polynomials.len();
+        let num_polys = polynomials.len();
         let num_chunks = packed_powers_chunks.len();
 
         // Get reference CT for params
@@ -1222,7 +1272,7 @@ impl<const R: usize> JVProver<R> {
             let group_plaintext_slots: Vec<Vec<u64>> = (group_start..group_end)
                 .flat_map(|chunk_idx| {
                     let chunk_start = chunk_idx * slot_count;
-                    wire_polynomials.iter().map(move |poly| {
+                    polynomials.iter().map(move |poly| {
                         let mut coeffs = vec![0u64; slot_count];
                         for (i, &coeff) in
                             poly.iter().skip(chunk_start).take(slot_count).enumerate()
@@ -1261,7 +1311,7 @@ impl<const R: usize> JVProver<R> {
                     // Apply blinding for chunk 0
                     let ct = if global_chunk_idx == 0 {
                         let vole_blinder = vole_blinders[poly_idx];
-                        let mut rng = Prg::from_seed(Block::from([poly_idx as u8; 16]));
+                        let mut rng = Prg::from_seed(Block::from([(poly_idx + seed_offset) as u8; 16]));
 
                         // Generate blinders: r_0..r_{n-2} random, r_{n-1} = vole_u - sum
                         let mut blinders = Vec::with_capacity(slot_count);
@@ -1339,6 +1389,53 @@ impl<const R: usize> JVProver<R> {
 
                     let chunk_ct = if chunk_idx == 0 {
                         let mut rng = Prg::from_seed(Block::from([poly_idx as u8; 16]));
+                        evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
+                    } else {
+                        evaluator.evaluate_row_unblinded(&coeffs)
+                    };
+
+                    collapsed_ct = Some(match collapsed_ct {
+                        None => chunk_ct,
+                        Some(acc) => acc.add(&chunk_ct),
+                    });
+                }
+
+                collapsed_ct.unwrap()
+            })
+            .collect()
+    }
+
+    /// CPU parallel slot multiplication for MK polynomials (rayon fallback).
+    /// Uses seed_offset of 0x1000 to match GPU path RNG seeds.
+    #[cfg(feature = "rayon")]
+    fn commit_mk_cpu_parallel(
+        mk_polynomials: &[Vec<u64>],
+        packed_powers_chunks: &[PackedEncryptedPowers],
+        vole_blinders: &[u64],
+        slot_count: usize,
+    ) -> Vec<RnsCiphertext> {
+        use rayon::prelude::*;
+
+        mk_polynomials
+            .par_iter()
+            .enumerate()
+            .map(|(poly_idx, poly)| {
+                let vole_blinder = vole_blinders[poly_idx];
+                let mut collapsed_ct: Option<RnsCiphertext> = None;
+
+                for (chunk_idx, powers_chunk) in packed_powers_chunks.iter().enumerate() {
+                    let chunk_start = chunk_idx * slot_count;
+
+                    let mut coeffs = vec![0u64; slot_count];
+                    for (i, &coeff) in poly.iter().skip(chunk_start).take(slot_count).enumerate() {
+                        coeffs[i] = coeff;
+                    }
+
+                    let evaluator = PackedProverEvaluator::new(powers_chunk);
+
+                    let chunk_ct = if chunk_idx == 0 {
+                        // Use 0x1000 offset for MK polynomials
+                        let mut rng = Prg::from_seed(Block::from([(poly_idx + 0x1000) as u8; 16]));
                         evaluator.evaluate_row_blinded(&coeffs, vole_blinder, &mut rng)
                     } else {
                         evaluator.evaluate_row_unblinded(&coeffs)
@@ -1466,8 +1563,42 @@ impl<const R: usize> JVProver<R> {
             vole_blinders.resize(num_branches, 0);
         }
 
-        // Evaluate each MK polynomial across all chunks and collapse (parallel)
-        #[cfg(feature = "rayon")]
+        // Get t for GPU path
+        let t = packed_powers_chunks[0].t;
+
+        // Evaluate each MK polynomial across all chunks and collapse
+        // GPU-accelerated path: uses pre-initialized gpu_context
+        #[cfg(feature = "gpu")]
+        let mut collapsed_cts: Vec<RnsCiphertext> = {
+            if let Some(ref gpu_ctx) = self.gpu_context {
+                let gpu_result = Self::commit_gpu_batched_with_ctx(
+                    gpu_ctx,
+                    &self.mk_polynomials,
+                    packed_powers_chunks,
+                    &vole_blinders,
+                    slot_count,
+                    t,
+                    0x1000, // seed_offset for MK polynomials
+                );
+
+                match gpu_result {
+                    Ok(cts) => {
+                        eprintln!("[commit_mk] GPU path succeeded");
+                        cts
+                    }
+                    Err(e) => {
+                        eprintln!("[commit_mk] GPU path failed ({}), falling back to CPU", e);
+                        Self::commit_mk_cpu_parallel(&self.mk_polynomials, packed_powers_chunks, &vole_blinders, slot_count)
+                    }
+                }
+            } else {
+                eprintln!("[commit_mk] No GPU context, using CPU path");
+                Self::commit_mk_cpu_parallel(&self.mk_polynomials, packed_powers_chunks, &vole_blinders, slot_count)
+            }
+        };
+
+        // CPU path with rayon parallelization (when GPU feature not enabled)
+        #[cfg(all(feature = "rayon", not(feature = "gpu")))]
         let mut collapsed_cts: Vec<RnsCiphertext> = {
             use rayon::prelude::*;
             self.mk_polynomials
@@ -1505,7 +1636,8 @@ impl<const R: usize> JVProver<R> {
                 .collect()
         };
 
-        #[cfg(not(feature = "rayon"))]
+        // Serial CPU path (when neither GPU nor rayon enabled)
+        #[cfg(not(any(feature = "rayon", feature = "gpu")))]
         let mut collapsed_cts: Vec<RnsCiphertext> = {
             let mut result = Vec::with_capacity(num_branches);
             for (poly_idx, poly) in self.mk_polynomials.iter().enumerate() {

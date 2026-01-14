@@ -366,3 +366,35 @@ pub fn create_shader_module(
         source: wgpu::ShaderSource::Wgsl(composed.into()),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compose_shader_with_math_prefix() {
+        // Test that math::addmod/submod/mulmod/bit_reverse work with module prefix
+        let test_shader = r#"
+#import math
+
+@compute @workgroup_size(64, 1, 1)
+fn test_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx = id.x;
+    let rev = math::bit_reverse(idx, 8u);
+    let a = vec2<u32>(1u, 0u);
+    let b = vec2<u32>(2u, 0u);
+    let q = vec2<u32>(0xFFFFFFFFu, 0u);
+    let sum = math::addmod(a, b, q);
+    let diff = math::submod(a, b, q);
+    let prod = math::mulmod(a, b, q);
+}
+"#;
+        let result = compose_shader(test_shader, "test.wgsl");
+        match result {
+            Ok(composed) => {
+                println!("Composed shader:\n{}", composed);
+            }
+            Err(e) => panic!("Failed to compose shader: {}", e),
+        }
+    }
+}

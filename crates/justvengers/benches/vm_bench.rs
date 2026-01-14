@@ -212,6 +212,14 @@ async fn run_protocol_record_verifier<const R: usize>(
     ctx_v.io_mut().send(setup_msg.clone()).await.unwrap();
     let setup_msg_recv: JVSetupMessage = ctx_p.io_mut().expect_next().await.unwrap();
 
+    // Initialize GPU context if available
+    #[cfg(feature = "gpu")]
+    {
+        if let Err(e) = prover.prepare_gpu(&setup_msg_recv) {
+            eprintln!("[record] GPU init failed: {:?}, using CPU", e);
+        }
+    }
+
     // P → V: Commitment
     let commitment = prover.commit(&setup_msg_recv, vole_pool).unwrap();
     ctx_p.io_mut().send(commitment.clone()).await.unwrap();
@@ -315,6 +323,12 @@ fn record_for_prover<const R: usize>(
     })
 }
 
+/// Pre-initialized GPU context type for sharing across iterations.
+#[cfg(feature = "gpu")]
+type SharedGpuContext = Option<std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>>;
+#[cfg(not(feature = "gpu"))]
+type SharedGpuContext = ();
+
 /// Runs prover only with replay context.
 async fn run_prover_with_replay<const R: usize>(
     ctx: &mut Context,
@@ -323,6 +337,7 @@ async fn run_prover_with_replay<const R: usize>(
     inputs_per_rep: &[Vec<u64>],
     soldering_constraints: &[SolderingConstraint],
     recorded_messages: &JVRecordedMessages,
+    gpu_ctx: &SharedGpuContext,
 ) {
     let total_start = std::time::Instant::now();
     let mut rng = Prg::from_seed(Block::ZERO);
@@ -331,6 +346,14 @@ async fn run_prover_with_replay<const R: usize>(
     let new_start = std::time::Instant::now();
     let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
     eprintln!("[bench] new: {:?}", new_start.elapsed());
+
+    // Set pre-initialized GPU context if available
+    #[cfg(feature = "gpu")]
+    if let Some(ctx) = gpu_ctx {
+        prover.set_gpu_context(ctx.clone());
+    }
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu_ctx;
 
     let setup_start = std::time::Instant::now();
     prover.setup(circuits, inputs_per_rep).unwrap();
@@ -433,6 +456,23 @@ fn bench_jv_vm(c: &mut Criterion) {
     let soldering = create_soldering_constraints(state_offset);
     let num_mults = sample_circuit.num_mults();
 
+    // Pre-initialize GPU context once (outside of timed benchmark)
+    #[cfg(feature = "gpu")]
+    let gpu_ctx: SharedGpuContext = {
+        eprintln!("[bench] Pre-initializing GPU context...");
+        let start = std::time::Instant::now();
+        match JVProver::<1>::create_gpu_context_goldilocks(8192) {
+            Ok(ctx) => {
+                eprintln!("[bench] GPU context created in {:?}", start.elapsed());
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("[bench] GPU init failed: {:?}, using CPU", e);
+                None
+            }
+        }
+    };
+
     // 8K reps (1 chunk)
     {
         const R: usize = 8192;
@@ -444,12 +484,16 @@ fn bench_jv_vm(c: &mut Criterion) {
         let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
         group.throughput(Throughput::Elements(total_mults));
 
+        #[cfg(feature = "gpu")]
+        let gpu_ctx_ref = &gpu_ctx;
+
         group.bench_function("8K_reps", |b| {
             b.iter(|| {
                 block_on(async {
                     let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
                     run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages,
+                        #[cfg(feature = "gpu")] gpu_ctx_ref,
                     ).await;
                 });
                 black_box(())
@@ -468,12 +512,16 @@ fn bench_jv_vm(c: &mut Criterion) {
         let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
         group.throughput(Throughput::Elements(total_mults));
 
+        #[cfg(feature = "gpu")]
+        let gpu_ctx_ref = &gpu_ctx;
+
         group.bench_function("16K_reps", |b| {
             b.iter(|| {
                 block_on(async {
                     let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
                     run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages,
+                        #[cfg(feature = "gpu")] gpu_ctx_ref,
                     ).await;
                 });
                 black_box(())
@@ -492,12 +540,16 @@ fn bench_jv_vm(c: &mut Criterion) {
         let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
         group.throughput(Throughput::Elements(total_mults));
 
+        #[cfg(feature = "gpu")]
+        let gpu_ctx_ref = &gpu_ctx;
+
         group.bench_function("32K_reps", |b| {
             b.iter(|| {
                 block_on(async {
                     let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
                     run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages,
+                        #[cfg(feature = "gpu")] gpu_ctx_ref,
                     ).await;
                 });
                 black_box(())
@@ -516,12 +568,16 @@ fn bench_jv_vm(c: &mut Criterion) {
         let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
         group.throughput(Throughput::Elements(total_mults));
 
+        #[cfg(feature = "gpu")]
+        let gpu_ctx_ref = &gpu_ctx;
+
         group.bench_function("64K_reps", |b| {
             b.iter(|| {
                 block_on(async {
                     let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
                     run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages,
+                        #[cfg(feature = "gpu")] gpu_ctx_ref,
                     ).await;
                 });
                 black_box(())
@@ -540,12 +596,16 @@ fn bench_jv_vm(c: &mut Criterion) {
         let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
         group.throughput(Throughput::Elements(total_mults));
 
+        #[cfg(feature = "gpu")]
+        let gpu_ctx_ref = &gpu_ctx;
+
         group.bench_function("128K_reps", |b| {
             b.iter(|| {
                 block_on(async {
                     let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
                     run_prover_with_replay::<R>(
-                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                        &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages,
+                        #[cfg(feature = "gpu")] gpu_ctx_ref,
                     ).await;
                 });
                 black_box(())
@@ -569,6 +629,25 @@ fn bench_jv_vm_8k(c: &mut Criterion) {
     let soldering = create_soldering_constraints(state_offset);
     let num_mults = sample_circuit.num_mults();
 
+    // Pre-initialize GPU context once
+    #[cfg(feature = "gpu")]
+    let gpu_ctx: SharedGpuContext = {
+        eprintln!("[bench] Pre-initializing GPU context...");
+        let start = std::time::Instant::now();
+        match JVProver::<1>::create_gpu_context_goldilocks(8192) {
+            Ok(ctx) => {
+                eprintln!("[bench] GPU context created in {:?}", start.elapsed());
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("[bench] GPU init failed: {:?}, using CPU", e);
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_ctx: SharedGpuContext = ();
+
     const R: usize = 8192;
     let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
     let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
@@ -583,7 +662,7 @@ fn bench_jv_vm_8k(c: &mut Criterion) {
             block_on(async {
                 let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
                 run_prover_with_replay::<R>(
-                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages, &gpu_ctx
                 ).await;
             });
             black_box(())
@@ -606,6 +685,25 @@ fn bench_jv_vm_16k(c: &mut Criterion) {
     let soldering = create_soldering_constraints(state_offset);
     let num_mults = sample_circuit.num_mults();
 
+    // Pre-initialize GPU context once
+    #[cfg(feature = "gpu")]
+    let gpu_ctx: SharedGpuContext = {
+        eprintln!("[bench] Pre-initializing GPU context...");
+        let start = std::time::Instant::now();
+        match JVProver::<1>::create_gpu_context_goldilocks(8192) {
+            Ok(ctx) => {
+                eprintln!("[bench] GPU context created in {:?}", start.elapsed());
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("[bench] GPU init failed: {:?}, using CPU", e);
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_ctx: SharedGpuContext = ();
+
     const R: usize = 16384;
     let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
     let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
@@ -620,7 +718,7 @@ fn bench_jv_vm_16k(c: &mut Criterion) {
             block_on(async {
                 let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
                 run_prover_with_replay::<R>(
-                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages, &gpu_ctx
                 ).await;
             });
             black_box(())
@@ -643,6 +741,25 @@ fn bench_jv_vm_32k(c: &mut Criterion) {
     let soldering = create_soldering_constraints(state_offset);
     let num_mults = sample_circuit.num_mults();
 
+    // Pre-initialize GPU context once
+    #[cfg(feature = "gpu")]
+    let gpu_ctx: SharedGpuContext = {
+        eprintln!("[bench] Pre-initializing GPU context...");
+        let start = std::time::Instant::now();
+        match JVProver::<1>::create_gpu_context_goldilocks(8192) {
+            Ok(ctx) => {
+                eprintln!("[bench] GPU context created in {:?}", start.elapsed());
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("[bench] GPU init failed: {:?}, using CPU", e);
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_ctx: SharedGpuContext = ();
+
     const R: usize = 32768;
     let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
     let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
@@ -657,7 +774,7 @@ fn bench_jv_vm_32k(c: &mut Criterion) {
             block_on(async {
                 let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
                 run_prover_with_replay::<R>(
-                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages, &gpu_ctx
                 ).await;
             });
             black_box(())
@@ -680,6 +797,25 @@ fn bench_jv_vm_64k(c: &mut Criterion) {
     let soldering = create_soldering_constraints(state_offset);
     let num_mults = sample_circuit.num_mults();
 
+    #[cfg(feature = "gpu")]
+    let gpu_ctx: SharedGpuContext = {
+        let start = std::time::Instant::now();
+        eprintln!("[bench] Pre-initializing GPU context for 64K reps...");
+        match JVProver::<1>::create_gpu_context_goldilocks(8192) {
+            Ok(ctx) => {
+                eprintln!("[bench] GPU context created in {:?}", start.elapsed());
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("[bench] GPU context creation failed: {:?}", e);
+                eprintln!("[bench] Falling back to CPU");
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_ctx: SharedGpuContext = ();
+
     const R: usize = 65536;
     let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
     let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
@@ -689,12 +825,17 @@ fn bench_jv_vm_64k(c: &mut Criterion) {
     let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
     group.throughput(Throughput::Elements(total_mults));
 
+    #[cfg(feature = "gpu")]
+    let gpu_ctx_ref = &gpu_ctx;
+    #[cfg(not(feature = "gpu"))]
+    let gpu_ctx_ref = &gpu_ctx;
+
     group.bench_function("64K_reps", |b| {
         b.iter(|| {
             block_on(async {
                 let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
                 run_prover_with_replay::<R>(
-                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages, gpu_ctx_ref
                 ).await;
             });
             black_box(())
@@ -717,6 +858,25 @@ fn bench_jv_vm_128k(c: &mut Criterion) {
     let soldering = create_soldering_constraints(state_offset);
     let num_mults = sample_circuit.num_mults();
 
+    #[cfg(feature = "gpu")]
+    let gpu_ctx: SharedGpuContext = {
+        let start = std::time::Instant::now();
+        eprintln!("[bench] Pre-initializing GPU context for 128K reps...");
+        match JVProver::<1>::create_gpu_context_goldilocks(8192) {
+            Ok(ctx) => {
+                eprintln!("[bench] GPU context created in {:?}", start.elapsed());
+                Some(ctx)
+            }
+            Err(e) => {
+                eprintln!("[bench] GPU context creation failed: {:?}", e);
+                eprintln!("[bench] Falling back to CPU");
+                None
+            }
+        }
+    };
+    #[cfg(not(feature = "gpu"))]
+    let gpu_ctx: SharedGpuContext = ();
+
     const R: usize = 131072;
     let (inputs, branches, _acc) = generate_vm_inputs_per_rep(R);
     let (recorded_bytes, recorded_messages) = record_for_prover::<R>(&circuits, &branches, &inputs, &soldering);
@@ -726,12 +886,17 @@ fn bench_jv_vm_128k(c: &mut Criterion) {
     let total_mults = (R * NUM_BRANCHES * num_mults) as u64;
     group.throughput(Throughput::Elements(total_mults));
 
+    #[cfg(feature = "gpu")]
+    let gpu_ctx_ref = &gpu_ctx;
+    #[cfg(not(feature = "gpu"))]
+    let gpu_ctx_ref = &gpu_ctx;
+
     group.bench_function("128K_reps", |b| {
         b.iter(|| {
             block_on(async {
                 let mut ctx = replay_st_context(recorded_bytes.clone(), max_frame_length(R));
                 run_prover_with_replay::<R>(
-                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages
+                    &mut ctx, &circuits, &branches, &inputs, &soldering, &recorded_messages, gpu_ctx_ref
                 ).await;
             });
             black_box(())
