@@ -22,6 +22,9 @@ pub mod slot_mul_gpu;
 pub mod rns_slot_mul;
 pub mod goldilocks_ntt;
 
+#[cfg(test)]
+mod recmo_test;
+
 // DEPRECATED: rotation-based operations not used in production
 pub mod old_code;
 

@@ -620,21 +620,18 @@ struct ModulusParams {
 var<workgroup> shared_lo: array<u32, 8192>;
 var<workgroup> shared_hi: array<u32, 8192>;
 
-// Barrett modular multiplication for Goldilocks (64-bit modulus)
+// Goldilocks modular multiplication using fixed Goldilocks-specific reduction
+// (uses the special structure of p = 2^64 - 2^32 + 1 for efficient reduction)
 fn mulmod_goldilocks(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
-    let q = vec2<u32>(mod_params.modulus_lo, mod_params.modulus_hi);
-    let prod = math::mul64(a, b);
-    return math::barrett_reduce_64bit(prod, q, mod_params.mu0, mod_params.mu1, mod_params.mu2, mod_params.mu3);
+    return math::goldilocks_mul(a, b);
 }
 
 fn addmod_goldilocks(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
-    let q = vec2<u32>(mod_params.modulus_lo, mod_params.modulus_hi);
-    return math::addmod(a, b, q);
+    return math::goldilocks_add(a, b);
 }
 
 fn submod_goldilocks(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
-    let q = vec2<u32>(mod_params.modulus_lo, mod_params.modulus_hi);
-    return math::submod(a, b, q);
+    return math::goldilocks_sub(a, b);
 }
 
 @compute @workgroup_size(256, 1, 1)
@@ -646,6 +643,9 @@ fn forward_ntt_goldilocks(
     let batch_idx = wg_id.x;
     let n = params.n;
     let log_n = params.log_n;
+
+    // Keep mod_params binding alive (shared bind group layout with inverse NTT)
+    let _keep = mod_params.modulus_lo * 0u;
 
     if batch_idx >= params.num_batches { return; }
 
@@ -740,21 +740,17 @@ struct ModulusParams {
 var<workgroup> shared_lo: array<u32, 8192>;
 var<workgroup> shared_hi: array<u32, 8192>;
 
-// Barrett modular multiplication for Goldilocks (64-bit modulus)
+// Goldilocks modular multiplication using fixed Goldilocks-specific reduction
 fn mulmod_goldilocks(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
-    let q = vec2<u32>(mod_params.modulus_lo, mod_params.modulus_hi);
-    let prod = math::mul64(a, b);
-    return math::barrett_reduce_64bit(prod, q, mod_params.mu0, mod_params.mu1, mod_params.mu2, mod_params.mu3);
+    return math::goldilocks_mul(a, b);
 }
 
 fn addmod_goldilocks(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
-    let q = vec2<u32>(mod_params.modulus_lo, mod_params.modulus_hi);
-    return math::addmod(a, b, q);
+    return math::goldilocks_add(a, b);
 }
 
 fn submod_goldilocks(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
-    let q = vec2<u32>(mod_params.modulus_lo, mod_params.modulus_hi);
-    return math::submod(a, b, q);
+    return math::goldilocks_sub(a, b);
 }
 
 @compute @workgroup_size(256, 1, 1)

@@ -525,6 +525,181 @@ fn bit_reverse(x: u32, bits: u32) -> u32 {
     }
     return r;
 }
+
+// ============================================================================
+// Goldilocks-specific arithmetic (p = 2^64 - 2^32 + 1)
+// Based on recmo/goldilocks with bug fixes for overflow/underflow handling.
+// Attribution: Original WGSL implementation from https://github.com/recmo/goldilocks
+// ============================================================================
+
+// Goldilocks prime constants
+const GOLDILOCKS_P_LO: u32 = 0x00000001u;  // Low 32 bits of p
+const GOLDILOCKS_P_HI: u32 = 0xFFFFFFFFu;  // High 32 bits of p
+const GOLDILOCKS_EPSILON: u32 = 0xFFFFFFFFu;  // 2^64 mod p = 2^32 - 1
+
+// Goldilocks addition: (a + b) mod p
+fn goldilocks_add(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    var r = a + b;
+    var carry = u32(r.x < a.x);
+    r.y = r.y + carry;
+
+    // Check for overflow past 2^64
+    if (r.y < a.y) {
+        // Add (2^64 mod p) = EPSILON = 2^32 - 1
+        let old_x = r.x;
+        r.x = r.x + GOLDILOCKS_EPSILON;
+        if (r.x < old_x) {
+            r.y = r.y + 1u;
+        }
+    }
+
+    // Reduce if r >= p
+    if (r.y == GOLDILOCKS_P_HI && r.x >= GOLDILOCKS_P_LO) {
+        var borrow = u32(r.x < GOLDILOCKS_P_LO);
+        r.x = r.x - GOLDILOCKS_P_LO;
+        r.y = r.y - GOLDILOCKS_P_HI - borrow;
+    }
+
+    return r;
+}
+
+// Goldilocks subtraction: (a - b) mod p
+fn goldilocks_sub(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    var r = a - b;
+    r.y -= u32(r.x > a.x);
+    if (r.y > a.y) {
+        // Underflow: add p by subtracting (2^64 - p) = 2^32 - 1 = EPSILON
+        // Actually we need to add p = 2^64 - 2^32 + 1
+        // In wrapped arithmetic: result += p means result -= (2^64 - p) = result -= (2^32 - 1)
+        // But since we underflowed, the wrapped value is result + 2^64
+        // We need (result + 2^64) - 2^64 + p = result + p
+        // So add p by: r.x += 1, r.y -= 1 (accounting for carry)
+        r.x += 1u;
+        r.y -= u32(r.x != 0u);
+    }
+    return r;
+}
+
+// Helper: compute (a + b) / 2 without overflow (for carry detection)
+fn goldilocks_hadd(a: u32, b: u32) -> u32 {
+    return (a >> 1u) + (b >> 1u) + ((a & b) & 1u);
+}
+
+// 32x32 -> 64-bit multiplication
+fn goldilocks_mul64(a: u32, b: u32) -> vec2<u32> {
+    var a0 = (a << 16u) >> 16u;
+    var a1 = a >> 16u;
+    var b0 = (b << 16u) >> 16u;
+    var b1 = b >> 16u;
+
+    var a0b0 = a0 * b0;
+    var a0b1 = a0 * b1;
+    var a1b0 = a1 * b0;
+    var a1b1 = a1 * b1;
+
+    var r: vec2<u32>;
+    r.x = a0b0 + (a1b0 << 16u) + (a0b1 << 16u);
+    r.y = a1b1 + (goldilocks_hadd((a0b0 >> 16u) + a0b1, a1b0) >> 15u);
+    return r;
+}
+
+// 64x64 -> 128-bit multiplication
+fn goldilocks_mul128(a: vec2<u32>, b: vec2<u32>) -> vec4<u32> {
+    var a0b0 = goldilocks_mul64(a.x, b.x);
+    var a0b1 = goldilocks_mul64(a.x, b.y);
+    var a1b0 = goldilocks_mul64(a.y, b.x);
+    var a1b1 = goldilocks_mul64(a.y, b.y);
+
+    var r = vec4<u32>(a0b0, a1b1);
+
+    r.y += a0b1.x;
+    if (r.y < a0b1.x) {
+        a0b1.y += 1u;
+    }
+    r.z += a0b1.y;
+    if (r.z < a0b1.y) {
+        r.w += 1u;
+    }
+
+    r.y += a1b0.x;
+    if (r.y < a1b0.x) {
+        a1b0.y += 1u;
+    }
+    r.z += a1b0.y;
+    if (r.z < a1b0.y) {
+        r.w += 1u;
+    }
+
+    return r;
+}
+
+// Goldilocks 128-bit to 64-bit reduction
+// Reduces n = n.x + n.y*2^32 + n.z*2^64 + n.w*2^96 mod p
+// Using: 2^64 ≡ 2^32 - 1 (mod p), 2^96 ≡ -1 (mod p)
+fn goldilocks_reduce(n: vec4<u32>) -> vec2<u32> {
+    var mid = n.y + n.z;
+    var mid_carry = u32(mid < n.y);
+
+    var sub_total = n.z + n.w;
+    var sub_carry = u32(sub_total < n.z);
+
+    var r_lo: u32;
+    var r_hi: u32;
+
+    if (n.x >= sub_total) {
+        r_lo = n.x - sub_total;
+        if (mid >= sub_carry) {
+            r_hi = mid - sub_carry;
+        } else {
+            r_hi = mid - sub_carry;
+            let old_lo = r_lo;
+            r_lo = r_lo + GOLDILOCKS_P_LO;
+            if (r_lo < old_lo) {
+                r_hi = r_hi + 1u;
+            }
+            r_hi = r_hi + GOLDILOCKS_P_HI;
+        }
+    } else {
+        r_lo = n.x - sub_total;
+        var borrow = sub_carry + 1u;
+        if (mid >= borrow) {
+            r_hi = mid - borrow;
+        } else {
+            r_hi = mid - borrow;
+            let old_lo = r_lo;
+            r_lo = r_lo + GOLDILOCKS_P_LO;
+            if (r_lo < old_lo) {
+                r_hi = r_hi + 1u;
+            }
+            r_hi = r_hi + GOLDILOCKS_P_HI;
+        }
+    }
+
+    if (mid_carry > 0u) {
+        let old_lo = r_lo;
+        r_lo = r_lo + GOLDILOCKS_EPSILON;
+        if (r_lo < old_lo) {
+            r_hi = r_hi + 1u;
+        }
+    }
+
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        if (r_hi == GOLDILOCKS_P_HI && r_lo >= GOLDILOCKS_P_LO) {
+            var borrow = u32(r_lo < GOLDILOCKS_P_LO);
+            r_lo = r_lo - GOLDILOCKS_P_LO;
+            r_hi = r_hi - GOLDILOCKS_P_HI - borrow;
+        } else {
+            break;
+        }
+    }
+
+    return vec2<u32>(r_lo, r_hi);
+}
+
+// Goldilocks multiplication: (a * b) mod p
+fn goldilocks_mul(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    return goldilocks_reduce(goldilocks_mul128(a, b));
+}
 "#;
 
 /// Composes a shader with the math module imported.
@@ -612,6 +787,36 @@ fn test_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 println!("Composed shader:\n{}", composed);
             }
             Err(e) => panic!("Failed to compose shader: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_goldilocks_functions_compile() {
+        // Test that Goldilocks-specific functions compile correctly
+        let test_shader = r#"
+#import math
+
+@compute @workgroup_size(64, 1, 1)
+fn test_goldilocks(@builtin(global_invocation_id) id: vec3<u32>) {
+    let a = vec2<u32>(0x12345678u, 0xABCDEF01u);
+    let b = vec2<u32>(0x87654321u, 0x10FEDCBAu);
+
+    // Test Goldilocks add/sub/mul
+    let sum = math::goldilocks_add(a, b);
+    let diff = math::goldilocks_sub(a, b);
+    let prod = math::goldilocks_mul(a, b);
+
+    // Test reduce with 128-bit input
+    let big = vec4<u32>(0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u);
+    let reduced = math::goldilocks_reduce(big);
+}
+"#;
+        let result = compose_shader(test_shader, "test_goldilocks.wgsl");
+        match result {
+            Ok(_composed) => {
+                println!("Goldilocks shader compiled successfully!");
+            }
+            Err(e) => panic!("Failed to compose Goldilocks shader: {}", e),
         }
     }
 }
