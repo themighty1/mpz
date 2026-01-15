@@ -1760,39 +1760,165 @@ impl GoldilocksNttGpu {
         // Max single-pass NTT size
         const MAX_SINGLE_PASS: usize = 1024;
 
-        // For large NTT sizes, use multipass NTT (one polynomial at a time)
+        // For large NTT sizes, use fully batched multipass NTT
+        // All operations chained in single command encoder: 2 uploads + 1 download total
         if ntt_size > MAX_SINGLE_PASS {
             #[cfg(target_arch = "wasm32")]
             web_sys::console::log_1(&format!(
-                "[GPU poly_mul] Using multipass NTT for size {} ({} pairs)",
+                "[GPU poly_mul] Using BATCHED multipass NTT for size {} ({} pairs)",
                 ntt_size, pairs.len()
             ).into());
 
-            let mut results = Vec::with_capacity(pairs.len());
-            for ((a, b), &rlen) in pairs.iter().zip(result_lens.iter()) {
-                if rlen == 0 {
-                    results.push(vec![]);
-                    continue;
-                }
+            // Four-step FFT dimensions
+            let n1 = MAX_SINGLE_PASS.min(ntt_size);
+            let n2 = ntt_size / n1;
 
-                // Pad inputs to ntt_size
-                let mut a_padded = vec![0u64; ntt_size];
-                let mut b_padded = vec![0u64; ntt_size];
-                a_padded[..a.len()].copy_from_slice(a);
-                b_padded[..b.len()].copy_from_slice(b);
+            // Count non-empty pairs
+            let non_empty_indices: Vec<usize> = result_lens.iter()
+                .enumerate()
+                .filter(|(_, &rlen)| rlen > 0)
+                .map(|(i, _)| i)
+                .collect();
+            let num_non_empty = non_empty_indices.len();
 
-                // Forward NTT (multipass) - results stay on GPU
-                let a_eval_buf = self.multipass_forward_ntt_to_buffer_async(&a_padded, ntt_size).await?;
-                let b_eval_buf = self.multipass_forward_ntt_to_buffer_async(&b_padded, ntt_size).await?;
-
-                // GPU pointwise multiplication (buffer to buffer, no CPU round trip)
-                let prod_buf = self.pointwise_mul_buffers(&a_eval_buf, &b_eval_buf, ntt_size)?;
-
-                // Inverse NTT (starts from GPU buffer)
-                let product = self.multipass_inverse_ntt_from_buffer_async(&prod_buf, ntt_size).await?;
-
-                results.push(product[..rlen].to_vec());
+            if num_non_empty == 0 {
+                return Ok(vec![vec![]; pairs.len()]);
             }
+
+            // =====================================================================
+            // STEP 1: Bulk upload all polynomials (2 uploads total)
+            // =====================================================================
+            let mut all_a_data = Vec::with_capacity(num_non_empty * ntt_size * 2);
+            let mut all_b_data = Vec::with_capacity(num_non_empty * ntt_size * 2);
+
+            for &idx in &non_empty_indices {
+                let (a, b) = pairs[idx];
+                // Pad and convert to u32 pairs
+                for i in 0..ntt_size {
+                    let val_a = if i < a.len() { a[i] } else { 0 };
+                    let val_b = if i < b.len() { b[i] } else { 0 };
+                    all_a_data.push(val_a as u32);
+                    all_a_data.push((val_a >> 32) as u32);
+                    all_b_data.push(val_b as u32);
+                    all_b_data.push((val_b >> 32) as u32);
+                }
+            }
+
+            let all_a_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("batch_poly_mul_all_a"),
+                contents: bytemuck::cast_slice(&all_a_data),
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            });
+            let all_b_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("batch_poly_mul_all_b"),
+                contents: bytemuck::cast_slice(&all_b_data),
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            });
+
+            // =====================================================================
+            // STEP 2: Single command encoder for ALL operations
+            // =====================================================================
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("batch_poly_mul_encoder"),
+            });
+
+            // Keep all intermediate buffers alive until submit
+            let mut keep_alive: Vec<Buffer> = Vec::new();
+
+            // Output buffers for final results (one per non-empty pair)
+            let mut result_buffers: Vec<Buffer> = Vec::with_capacity(num_non_empty);
+
+            let bytes_per_poly = ntt_size * 2 * std::mem::size_of::<u32>();
+
+            for (local_idx, &_global_idx) in non_empty_indices.iter().enumerate() {
+                let a_offset = (local_idx * bytes_per_poly) as u64;
+                let b_offset = (local_idx * bytes_per_poly) as u64;
+
+                // Create view buffers for this polynomial pair
+                // We need separate input buffers for each NTT since they expect full buffers
+                let a_input = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("a_input"),
+                    size: bytes_per_poly as u64,
+                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let b_input = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("b_input"),
+                    size: bytes_per_poly as u64,
+                    usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+
+                // Copy from bulk buffer to individual buffers
+                encoder.copy_buffer_to_buffer(&all_a_buffer, a_offset, &a_input, 0, bytes_per_poly as u64);
+                encoder.copy_buffer_to_buffer(&all_b_buffer, b_offset, &b_input, 0, bytes_per_poly as u64);
+
+                // Forward NTT for a: Col NTT -> Twiddle -> Row NTT
+                let (a_col_out, a_col_params) = self.column_ntt_to_buffer(&a_input, n1, n2, ntt_size, &mut encoder)?;
+                keep_alive.push(a_col_params);
+                let a_twiddle_params = self.twiddle_to_buffer(&a_col_out, ntt_size, n1, &mut encoder)?;
+                keep_alive.push(a_twiddle_params);
+                let (a_row_out, a_row_params) = self.row_ntt_to_buffer(&a_col_out, n1, n2, ntt_size, &mut encoder)?;
+                keep_alive.push(a_row_params);
+                keep_alive.push(a_col_out);
+                keep_alive.push(a_input);
+
+                // Forward NTT for b: Col NTT -> Twiddle -> Row NTT
+                let (b_col_out, b_col_params) = self.column_ntt_to_buffer(&b_input, n1, n2, ntt_size, &mut encoder)?;
+                keep_alive.push(b_col_params);
+                let b_twiddle_params = self.twiddle_to_buffer(&b_col_out, ntt_size, n1, &mut encoder)?;
+                keep_alive.push(b_twiddle_params);
+                let (b_row_out, b_row_params) = self.row_ntt_to_buffer(&b_col_out, n1, n2, ntt_size, &mut encoder)?;
+                keep_alive.push(b_row_params);
+                keep_alive.push(b_col_out);
+                keep_alive.push(b_input);
+
+                // Pointwise multiplication
+                let prod_out = self.pointwise_mul_buffers_to_encoder(&a_row_out, &b_row_out, ntt_size, &mut encoder)?;
+                keep_alive.push(a_row_out);
+                keep_alive.push(b_row_out);
+
+                // Inverse NTT: Row INTT -> Inv Twiddle -> Col INTT
+                let (inv_row_out, inv_row_params) = self.inv_row_ntt_to_buffer(&prod_out, n1, n2, ntt_size, &mut encoder)?;
+                keep_alive.push(inv_row_params);
+                let inv_twiddle_params = self.inv_twiddle_to_buffer(&inv_row_out, ntt_size, n1, &mut encoder)?;
+                keep_alive.push(inv_twiddle_params);
+                let (inv_col_out, inv_col_params) = self.inv_column_ntt_to_buffer(&inv_row_out, n1, n2, ntt_size, &mut encoder)?;
+                keep_alive.push(inv_col_params);
+                keep_alive.push(inv_row_out);
+                keep_alive.push(prod_out);
+
+                result_buffers.push(inv_col_out);
+            }
+
+            // Submit all work at once
+            self.queue.submit(Some(encoder.finish()));
+
+            // =====================================================================
+            // STEP 3: Bulk download all results (1 download total)
+            // =====================================================================
+            let mut results = vec![vec![]; pairs.len()];
+            let n_inv = mod_inverse(ntt_size as u64, GOLDILOCKS);
+
+            for (local_idx, &global_idx) in non_empty_indices.iter().enumerate() {
+                let result_data = self.download_from_buffer(&result_buffers[local_idx], ntt_size).await?;
+
+                // Apply n_inv scaling
+                let rlen = result_lens[global_idx];
+                let mut scaled: Vec<u64> = result_data.iter()
+                    .take(rlen)
+                    .map(|&v| mod_mul(v, n_inv, GOLDILOCKS))
+                    .collect();
+                scaled.truncate(rlen);
+                results[global_idx] = scaled;
+            }
+
+            // Clean up
+            drop(keep_alive);
+            drop(result_buffers);
+            drop(all_a_buffer);
+            drop(all_b_buffer);
+
             return Ok(results);
         }
 
@@ -2227,6 +2353,62 @@ impl GoldilocksNttGpu {
 
         self.queue.submit(Some(encoder.finish()));
 
+        Ok(output_buffer)
+    }
+
+    /// Pointwise multiplication added to existing encoder (for batching).
+    /// Returns the output buffer - caller must keep params_buffer alive until submit.
+    fn pointwise_mul_buffers_to_encoder(
+        &self,
+        a_buf: &Buffer,
+        b_buf: &Buffer,
+        num_elements: usize,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<Buffer, GpuError> {
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pointwise_mul_output"),
+            size: (num_elements * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let params = GpuPointwiseMulParams {
+            num_elements: num_elements as u32,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pointwise_mul_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let layout = self.pointwise_mul_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pointwise_mul_bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: a_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: output_buffer.as_entire_binding() },
+            ],
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pointwise_mul_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pointwise_mul_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let num_wg = (num_elements + 255) / 256;
+            pass.dispatch_workgroups(num_wg as u32, 1, 1);
+        }
+
+        // Note: params_buffer is dropped here but bind_group holds a reference
+        // The encoder will keep the bind_group alive until submit
         Ok(output_buffer)
     }
 
