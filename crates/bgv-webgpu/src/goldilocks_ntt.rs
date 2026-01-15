@@ -45,7 +45,7 @@ struct GpuTwiddleParams {
     n: u32,            // Total NTT size (N = N1 * N2)
     n1: u32,           // Row size (number of columns)
     num_elements: u32, // Total elements to process
-    poly_stride: u32,  // Stride between polynomials in u32 units (for batched dispatch via wg_id.y)
+    poly_stride: u32,  // Stride between polynomials in ELEMENT units (for batched dispatch via wg_id.y)
 }
 
 /// Parameters for batched small NTT (Pass 2 of four-step FFT).
@@ -58,7 +58,7 @@ struct GpuBatchedNttParams {
     total_batches: u32,// Total number of NTTs to process
     stride: u32,       // Stride between consecutive elements in global memory
     batch_stride: u32, // Stride between consecutive batches (1 for columns, n1 for rows)
-    poly_stride: u32,  // Stride between polynomials in u32 units (for batched dispatch via wg_id.y)
+    poly_stride: u32,  // Stride between polynomials in ELEMENT units (for batched dispatch via wg_id.y)
     _pad: u32,
 }
 
@@ -67,7 +67,7 @@ struct GpuBatchedNttParams {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuPointwiseMulParams {
     num_elements: u32, // Total number of elements to multiply
-    poly_stride: u32,  // Stride between polynomials in u32 units (for batched dispatch via wg_id.y)
+    poly_stride: u32,  // Stride between polynomials in ELEMENT units (for batched dispatch via wg_id.y)
     _pad1: u32,
     _pad2: u32,
 }
@@ -1821,8 +1821,8 @@ impl GoldilocksNttGpu {
             // =====================================================================
             let bytes_per_poly = ntt_size * 2 * std::mem::size_of::<u32>();
             let total_bytes = (num_non_empty * bytes_per_poly) as u64;
-            // poly_stride in u32 units for shader: each polynomial is ntt_size * 2 u32s apart
-            let poly_stride_u32 = (ntt_size * 2) as u32;
+            // poly_stride in ELEMENT units: each polynomial has ntt_size elements
+            let poly_stride_elements = ntt_size as u32;
 
             let make_bulk_buf = |label| self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -1867,7 +1867,7 @@ impl GoldilocksNttGpu {
                 total_batches: n1 as u32,
                 stride: n1 as u32,
                 batch_stride: 1,
-                poly_stride: poly_stride_u32,
+                poly_stride: poly_stride_elements,
                 _pad: 0,
             };
             let col_ntt_params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1884,7 +1884,7 @@ impl GoldilocksNttGpu {
                 total_batches: n2 as u32,
                 stride: 1,
                 batch_stride: n1 as u32,
-                poly_stride: poly_stride_u32,
+                poly_stride: poly_stride_elements,
                 _pad: 0,
             };
             let row_ntt_params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1898,7 +1898,7 @@ impl GoldilocksNttGpu {
                 n: ntt_size as u32,
                 n1: n1 as u32,
                 num_elements: ntt_size as u32,
-                poly_stride: poly_stride_u32,
+                poly_stride: poly_stride_elements,
             };
             let twiddle_params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("twiddle_params"),
@@ -1916,7 +1916,7 @@ impl GoldilocksNttGpu {
             // Pointwise mul params with poly_stride for batched dispatch
             let mul_params = GpuPointwiseMulParams {
                 num_elements: ntt_size as u32,
-                poly_stride: poly_stride_u32,
+                poly_stride: poly_stride_elements,
                 _pad1: 0, _pad2: 0,
             };
             let mul_params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3557,7 +3557,7 @@ struct BatchedNttParams {
     total_batches: u32,  // Total number of NTTs to process
     stride: u32,         // Stride between consecutive elements of one NTT in global memory
     batch_stride: u32,   // Stride between consecutive batches (1 for columns, n1 for rows)
-    poly_stride: u32,    // Stride between polynomials in u32 units (ntt_size * 2)
+    poly_stride: u32,    // Stride between polynomials in ELEMENT units (ntt_size)
     _pad: u32,
 }
 
@@ -3691,7 +3691,7 @@ struct TwiddleParams {
     n: u32,           // Total NTT size (N = N1 * N2)
     n1: u32,          // Row size (number of columns)
     num_elements: u32, // Total elements to process
-    poly_stride: u32, // Stride between polynomials in u32 units (for batched dispatch via wg_id.y)
+    poly_stride: u32, // Stride between polynomials in ELEMENT units (for batched dispatch via wg_id.y)
 }
 
 @group(0) @binding(0) var<uniform> params: TwiddleParams;
@@ -3708,7 +3708,8 @@ fn apply_twiddle(
 
     let n = params.n;
     let n1 = params.n1;
-    let poly_offset = wg_id.y * params.poly_stride;  // Offset for this polynomial
+    // poly_stride is in element units, multiply by 2 to get u32 offset
+    let poly_offset_u32 = wg_id.y * params.poly_stride * 2u;
 
     // Compute row and column in the conceptual 2D array
     let row = idx / n1;
@@ -3718,7 +3719,7 @@ fn apply_twiddle(
     let twiddle_idx = (row * col) % n;
 
     // Load element (stored as two u32s for u64)
-    let elem_base = poly_offset + idx * 2u;
+    let elem_base = poly_offset_u32 + idx * 2u;
     let elem = vec2<u32>(data[elem_base], data[elem_base + 1u]);
 
     // Load twiddle factor
@@ -3741,7 +3742,7 @@ const GOLDILOCKS_POINTWISE_MUL_SHADER: &str = r#"
 
 struct PointwiseMulParams {
     num_elements: u32,
-    poly_stride: u32, // Stride between polynomials in u32 units (for batched dispatch via wg_id.y)
+    poly_stride: u32, // Stride between polynomials in ELEMENT units (for batched dispatch via wg_id.y)
     _pad1: u32,
     _pad2: u32,
 }
@@ -3759,10 +3760,11 @@ fn pointwise_mul(
     let idx = global_id.x;
     if (idx >= params.num_elements) { return; }
 
-    let poly_offset = wg_id.y * params.poly_stride;  // Offset for this polynomial
+    // poly_stride is in element units, multiply by 2 to get u32 offset
+    let poly_offset_u32 = wg_id.y * params.poly_stride * 2u;
 
     // Load a[i] and b[i] (each stored as two u32s for u64)
-    let base = poly_offset + idx * 2u;
+    let base = poly_offset_u32 + idx * 2u;
     let a_val = vec2<u32>(a[base], a[base + 1u]);
     let b_val = vec2<u32>(b[base], b[base + 1u]);
 
