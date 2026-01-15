@@ -269,10 +269,31 @@ async fn jv_record_verifier_messages(
     assert!(verifier.verify_itpac_opening(&itpac_open_msg), "IT-PAC verification failed");
 
     // P → V: AggregatedLpzkProofMessage
-    web_sys::console::log_1(&"[jv_record] Prover prove multiplications...".into());
-    let lpzk_proof = prover.prove_multiplications_aggregated(gamma).unwrap();
-    web_sys::console::log_1(&"[jv_record] Verifier verify multiplications...".into());
-    let result = verifier.verify_multiplications_aggregated(lpzk_proof, gamma).unwrap();
+    web_sys::console::log_1(&"[jv_record] Prover prove multiplications starting...".into());
+    let lpzk_proof = match prover.prove_multiplications_aggregated(gamma) {
+        Ok(p) => {
+            web_sys::console::log_1(&format!(
+                "[jv_record] LPZK proof success: quotient_len={}, aggregated_check={}",
+                p.quotient_coeffs.len(), p.aggregated_check
+            ).into());
+            p
+        }
+        Err(e) => {
+            web_sys::console::log_1(&format!("[jv_record] LPZK proof FAILED: {:?}", e).into());
+            panic!("prove_multiplications_aggregated failed: {:?}", e);
+        }
+    };
+    web_sys::console::log_1(&"[jv_record] Verifier verify multiplications starting...".into());
+    let result = match verifier.verify_multiplications_aggregated(lpzk_proof, gamma) {
+        Ok(r) => {
+            web_sys::console::log_1(&format!("[jv_record] verify result: {}", r).into());
+            r
+        }
+        Err(e) => {
+            web_sys::console::log_1(&format!("[jv_record] verify FAILED: {:?}", e).into());
+            panic!("verify_multiplications_aggregated failed: {:?}", e);
+        }
+    };
     assert!(result, "JV Protocol verification failed during recording");
 
     web_sys::console::log_1(&"[jv_record] Recording complete!".into());

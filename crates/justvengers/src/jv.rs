@@ -107,6 +107,12 @@ macro_rules! wasm_log {
     };
 }
 
+// No-op for non-WASM builds
+#[cfg(not(target_arch = "wasm32"))]
+macro_rules! wasm_log {
+    ($($arg:tt)*) => {};
+}
+
 // Optional GPU acceleration for slot multiplication and NTT
 #[cfg(feature = "gpu")]
 use bgv_webgpu::{RnsSlotMulGpu, RnsBatchParams, GoldilocksNttGpu};
@@ -3085,15 +3091,25 @@ impl JVProver {
         &mut self,
         gamma: u64,
     ) -> Result<AggregatedLpzkProofMessage, JVProverError> {
+        wasm_log!("[prove_mults] Starting, phase={:?}", self.phase);
+
         if self.phase != JVProverPhase::Opened {
+            wasm_log!("[prove_mults] Invalid phase!");
             return Err(JVProverError::InvalidPhase);
         }
 
         let eval_points = match &self.eval_points {
-            Some(pts) => pts.clone(),
-            None => return Err(JVProverError::MissingSetupData),
+            Some(pts) => {
+                wasm_log!("[prove_mults] eval_points: {} points", pts.len());
+                pts.clone()
+            }
+            None => {
+                wasm_log!("[prove_mults] Missing eval_points!");
+                return Err(JVProverError::MissingSetupData);
+            }
         };
 
+        wasm_log!("[prove_mults] Verifying multiplications...");
         // First verify all multiplications are correct and compute aggregated check
         let mut gamma_power = 1u64;
         let mut aggregated_check = 0u128;
@@ -3118,6 +3134,8 @@ impl JVProver {
             }
         }
 
+        wasm_log!("[prove_mults] All multiplications verified, aggregated_check={}", aggregated_check);
+
         // Now compute the quotient polynomial using the vanishing polynomial technique
         // H(X) = Σᵢ γⁱ·(f_a_i(X)·f_b_i(X) - f_c_i(X))
         // Q(X) = H(X) / Z(X)
@@ -3135,6 +3153,8 @@ impl JVProver {
         // Indices:             [0..n   | n..n+m    | n+m..n+2m  | n+2m..n+3m  ]
         let num_inputs = self.num_inputs;
         let num_mults = self.witnesses[0].num_mults();
+        wasm_log!("[prove_mults] Building h_poly: num_inputs={}, num_mults={}, wire_polys={}",
+            num_inputs, num_mults, self.wire_polynomials.len());
 
         for mult_idx in 0..num_mults {
             // Get polynomial indices for this multiplication gate
@@ -3174,13 +3194,16 @@ impl JVProver {
             self.timing_lpzk_accumulation_ms += web_sys::window().unwrap().performance().unwrap().now() - lpzk_accumulation_timing_start;
         }
 
+        wasm_log!("[prove_mults] h_poly built, len={}", h_poly.len());
         profile_end!(lpzk_poly_start, "[lpzk] poly accumulation ({} mults, h_poly deg={}): {:?}", num_mults, h_poly.len());
 
         // Use cached vanishing polynomial Z(X) = Π(X - αⱼ)
         let z_poly = self.vanishing_poly.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
+        wasm_log!("[prove_mults] z_poly len={}", z_poly.len());
 
         // Compute quotient Q(X) = H(X) / Z(X)
+        wasm_log!("[prove_mults] Starting poly_div...");
         let div_start = profile_start!();
 
         #[cfg(target_arch = "wasm32")]
@@ -3193,9 +3216,11 @@ impl JVProver {
             self.timing_poly_div_ms += web_sys::window().unwrap().performance().unwrap().now() - poly_div_timing_start;
         }
 
+        wasm_log!("[prove_mults] poly_div done, quotient_len={}", quotient_coeffs.len());
         profile_end!(div_start, "[lpzk] poly_div (h_deg={}, z_deg={}): {:?}", h_poly.len(), z_poly.len());
 
         self.phase = JVProverPhase::Done;
+        wasm_log!("[prove_mults] Done, returning proof");
 
         Ok(AggregatedLpzkProofMessage {
             quotient_coeffs,
@@ -4149,13 +4174,20 @@ impl JVVerifier {
         proof: AggregatedLpzkProofMessage,
         _gamma: u64,
     ) -> Result<bool, JVVerifierError> {
+        wasm_log!("[verify_mults] Starting, phase={:?}", self.phase);
+
         if self.phase != JVVerifierPhase::Verifying {
+            wasm_log!("[verify_mults] Invalid phase!");
             return Err(JVVerifierError::InvalidPhase);
         }
+
+        wasm_log!("[verify_mults] quotient_len={}, aggregated_check={}",
+            proof.quotient_coeffs.len(), proof.aggregated_check);
 
         // Check quotient has expected degree (≤ 2R-2 for H of degree 2(R-1), Z of degree R)
         // After division, quotient degree is at most R-2
         let max_quotient_len = 2 * self.r;
+        wasm_log!("[verify_mults] max_quotient_len={}, r={}", max_quotient_len, self.r);
 
         if proof.quotient_coeffs.len() > max_quotient_len {
             self.phase = JVVerifierPhase::Done(false);
