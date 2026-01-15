@@ -2089,15 +2089,88 @@ impl GoldilocksNttGpu {
 
     /// Forward NTT that returns a GPU buffer instead of downloading.
     /// Used for chaining operations without CPU round trips.
+    /// Note: This keeps the result in row-major layout (skips the final transpose)
+    /// which is compatible with multipass_inverse_ntt_from_buffer_direct.
+    pub fn multipass_forward_ntt_to_buffer_direct(
+        &self,
+        data: &[u64],
+        target_n: usize,
+    ) -> Result<Buffer, GpuError> {
+        // Validate target_n
+        if target_n == 0 || (target_n & (target_n - 1)) != 0 {
+            return Err(GpuError::InvalidParams(format!(
+                "target_n={} must be a power of 2", target_n
+            )));
+        }
+
+        // Pad input to target_n
+        let mut work_data: Vec<u64> = data.to_vec();
+        work_data.resize(target_n, 0);
+
+        const MAX_SINGLE_PASS: usize = 1024;
+
+        if target_n <= MAX_SINGLE_PASS {
+            // For small sizes, use single-pass NTT and return buffer
+            let result = pollster::block_on(self.batched_forward_ntt_async(&[work_data]))?;
+            return Ok(self.upload_to_buffer(&result[0]));
+        }
+
+        // Four-step FFT dimensions
+        let n1 = MAX_SINGLE_PASS.min(target_n);
+        let n2 = target_n / n1;
+
+        if n1 > MAX_SINGLE_PASS || n2 > MAX_SINGLE_PASS {
+            return Err(GpuError::InvalidParams(format!(
+                "NTT size {} too large, N1={} or N2={} exceeds max {}",
+                target_n, n1, n2, MAX_SINGLE_PASS
+            )));
+        }
+
+        // Upload input data once
+        let input_buffer = self.upload_to_buffer(&work_data);
+
+        // Create command encoder for all passes
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("multipass_forward_ntt_to_buffer_encoder"),
+        });
+
+        // Keep buffers alive until submit
+        let mut keep_alive: Vec<Buffer> = Vec::new();
+
+        // Pass 1: Column NTTs
+        let (col_output, col_params) = self.column_ntt_to_buffer(&input_buffer, n1, n2, target_n, &mut encoder)?;
+        keep_alive.push(col_params);
+
+        // Pass 2: Twiddle multiplication (in-place on col_output)
+        let twiddle_params = self.twiddle_to_buffer(&col_output, target_n, n1, &mut encoder)?;
+        keep_alive.push(twiddle_params);
+
+        // Pass 3: Row NTTs (now chained using batch_stride parameter)
+        let (row_output, row_params) = self.row_ntt_to_buffer(&col_output, n1, n2, target_n, &mut encoder)?;
+        keep_alive.push(row_params);
+
+        // Submit all passes at once
+        self.queue.submit(Some(encoder.finish()));
+
+        // Wait for GPU to complete
+        self.device.poll(wgpu::Maintain::Wait);
+
+        // Return the final buffer directly (row-major layout, no transpose)
+        // The intermediate buffers will be cleaned up when dropped
+        drop(keep_alive);
+        drop(col_output);
+        drop(input_buffer);
+
+        Ok(row_output)
+    }
+
+    /// Legacy wrapper for async compatibility
     pub async fn multipass_forward_ntt_to_buffer_async(
         &self,
         data: &[u64],
         target_n: usize,
     ) -> Result<Buffer, GpuError> {
-        // Run the normal forward NTT
-        let result = self.multipass_forward_ntt_async(data, target_n).await?;
-        // Upload result to GPU buffer and return it
-        Ok(self.upload_to_buffer(&result))
+        self.multipass_forward_ntt_to_buffer_direct(data, target_n)
     }
 
     /// Pointwise multiplication on GPU buffers (no CPU round trip).
@@ -2159,17 +2232,89 @@ impl GoldilocksNttGpu {
         Ok(output_buffer)
     }
 
-    /// Inverse NTT starting from a GPU buffer.
-    /// Downloads the buffer content and runs inverse NTT.
+    /// Inverse NTT starting from a GPU buffer (row-major layout).
+    /// Used for chaining after multipass_forward_ntt_to_buffer_direct.
+    /// Note: Input should be in row-major layout (from forward NTT buffer output).
+    pub async fn multipass_inverse_ntt_from_buffer_direct(
+        &self,
+        buffer: &Buffer,
+        target_n: usize,
+    ) -> Result<Vec<u64>, GpuError> {
+        if target_n == 0 || (target_n & (target_n - 1)) != 0 {
+            return Err(GpuError::InvalidParams(format!(
+                "target_n={} must be a power of 2", target_n
+            )));
+        }
+
+        const MAX_SINGLE_PASS: usize = 1024;
+
+        if target_n <= MAX_SINGLE_PASS {
+            // For small sizes, download and use single-pass NTT
+            let data = self.download_from_buffer(buffer, target_n).await?;
+            return self.multipass_inverse_ntt_async(&data, target_n).await;
+        }
+
+        // Four-step FFT dimensions
+        let n1 = MAX_SINGLE_PASS.min(target_n);
+        let n2 = target_n / n1;
+
+        if n1 > MAX_SINGLE_PASS || n2 > MAX_SINGLE_PASS {
+            return Err(GpuError::InvalidParams(format!(
+                "INTT size {} too large, N1={} or N2={} exceeds max {}",
+                target_n, n1, n2, MAX_SINGLE_PASS
+            )));
+        }
+
+        // Input buffer is already in row-major layout (no transpose needed)
+        // This matches the output layout from multipass_forward_ntt_to_buffer_direct
+
+        // Create command encoder for all passes
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("multipass_inverse_ntt_from_buffer_encoder"),
+        });
+
+        // Keep buffers alive until submit
+        let mut keep_alive: Vec<Buffer> = Vec::new();
+
+        // Pass 1: Inverse row NTTs (buffer is already in row-major layout)
+        let (row_output, row_params) = self.inv_row_ntt_to_buffer(buffer, n1, n2, target_n, &mut encoder)?;
+        keep_alive.push(row_params);
+
+        // Pass 2: Inverse twiddle (in-place on row_output)
+        let twiddle_params = self.inv_twiddle_to_buffer(&row_output, target_n, n1, &mut encoder)?;
+        keep_alive.push(twiddle_params);
+
+        // Pass 3: Inverse column NTTs of size N2 (strided columns)
+        let (col_output, col_params) = self.inv_column_ntt_to_buffer(&row_output, n1, n2, target_n, &mut encoder)?;
+        keep_alive.push(col_params);
+
+        // Submit all passes at once
+        self.queue.submit(Some(encoder.finish()));
+
+        // Download final result
+        let mut result = self.download_from_buffer(&col_output, target_n).await?;
+
+        // Drop all buffers
+        drop(keep_alive);
+        drop(col_output);
+        drop(row_output);
+
+        // Scale by n_inv for the full INTT
+        let n_inv = mod_inverse(target_n as u64, GOLDILOCKS);
+        for val in result.iter_mut() {
+            *val = mod_mul(*val, n_inv, GOLDILOCKS);
+        }
+
+        Ok(result)
+    }
+
+    /// Legacy wrapper for async compatibility
     pub async fn multipass_inverse_ntt_from_buffer_async(
         &self,
         buffer: &Buffer,
         target_n: usize,
     ) -> Result<Vec<u64>, GpuError> {
-        // Download buffer content
-        let data = self.download_from_buffer(buffer, target_n).await?;
-        // Run normal inverse NTT
-        self.multipass_inverse_ntt_async(&data, target_n).await
+        self.multipass_inverse_ntt_from_buffer_direct(buffer, target_n).await
     }
 
     /// Apply batched column NTTs using the batched_ntt_pipeline.
