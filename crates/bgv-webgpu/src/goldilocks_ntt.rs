@@ -45,7 +45,7 @@ struct GpuTwiddleParams {
     n: u32,            // Total NTT size (N = N1 * N2)
     n1: u32,           // Row size (number of columns)
     num_elements: u32, // Total elements to process
-    _pad: u32,
+    poly_stride: u32,  // Stride between polynomials in u32 units (for batched dispatch via wg_id.y)
 }
 
 /// Parameters for batched small NTT (Pass 2 of four-step FFT).
@@ -391,7 +391,7 @@ impl GoldilocksNttGpu {
             n: n as u32,
             n1: n1 as u32,
             num_elements: n as u32,
-            _pad: 0,
+            poly_stride: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twiddle_params"),
@@ -505,7 +505,7 @@ impl GoldilocksNttGpu {
             n: n as u32,
             n1: n1 as u32,
             num_elements: n as u32,
-            _pad: 0,
+            poly_stride: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("inv_twiddle_params"),
@@ -1908,7 +1908,7 @@ impl GoldilocksNttGpu {
                 n: ntt_size as u32,
                 n1: n1 as u32,
                 num_elements: ntt_size as u32,
-                _pad: 0,
+                poly_stride: 0,
             };
             let twiddle_params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("twiddle_params"),
@@ -2341,7 +2341,7 @@ impl GoldilocksNttGpu {
             n: n as u32,
             n1: n1 as u32,
             num_elements: n as u32,
-            _pad: 0,
+            poly_stride: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("twiddle_params"),
@@ -3113,7 +3113,7 @@ impl GoldilocksNttGpu {
             n: n as u32,
             n1: n1 as u32,
             num_elements: n as u32,
-            _pad: 0,
+            poly_stride: 0,
         };
 
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3734,7 +3734,7 @@ struct TwiddleParams {
     n: u32,           // Total NTT size (N = N1 * N2)
     n1: u32,          // Row size (number of columns)
     num_elements: u32, // Total elements to process
-    _pad: u32,
+    poly_stride: u32, // Stride between polynomials in u32 units (for batched dispatch via wg_id.y)
 }
 
 @group(0) @binding(0) var<uniform> params: TwiddleParams;
@@ -3743,13 +3743,15 @@ struct TwiddleParams {
 
 @compute @workgroup_size(256, 1, 1)
 fn apply_twiddle(
-    @builtin(global_invocation_id) global_id: vec3<u32>
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(workgroup_id) wg_id: vec3<u32>
 ) {
     let idx = global_id.x;
     if (idx >= params.num_elements) { return; }
 
     let n = params.n;
     let n1 = params.n1;
+    let poly_offset = wg_id.y * params.poly_stride;  // Offset for this polynomial
 
     // Compute row and column in the conceptual 2D array
     let row = idx / n1;
@@ -3759,7 +3761,7 @@ fn apply_twiddle(
     let twiddle_idx = (row * col) % n;
 
     // Load element (stored as two u32s for u64)
-    let elem_base = idx * 2u;
+    let elem_base = poly_offset + idx * 2u;
     let elem = vec2<u32>(data[elem_base], data[elem_base + 1u]);
 
     // Load twiddle factor
@@ -4099,7 +4101,7 @@ mod tests {
             n: n as u32,
             n1: n1 as u32,
             num_elements: n as u32,
-            _pad: 0,
+            poly_stride: 0,
         };
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("params"),
