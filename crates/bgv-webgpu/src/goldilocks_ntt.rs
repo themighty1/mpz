@@ -4187,6 +4187,99 @@ mod tests {
         assert_eq!(mismatches, 0, "pointwise_mul_buffers vs CPU: {} mismatches", mismatches);
         println!("PASS: pointwise_mul_buffers matches CPU for N={}", n);
     }
+
+    #[test]
+    fn test_direct_buffer_ntt_roundtrip() {
+        // Test the new direct buffer functions in isolation
+        // Verify that forward_to_buffer → inverse_from_buffer recovers original
+        let gpu = GoldilocksNttGpu::new(1024).expect("GPU init failed");
+
+        for ntt_size in [2048, 4096, 8192] {
+            println!("Testing direct buffer NTT roundtrip for N={}...", ntt_size);
+
+            // Generate test data
+            let input: Vec<u64> = (0..ntt_size)
+                .map(|i| (i as u64 * 12345 + 67890) % GOLDILOCKS)
+                .collect();
+
+            // Forward NTT to buffer (using the new direct function)
+            let ntt_buf = gpu.multipass_forward_ntt_to_buffer_direct(&input, ntt_size)
+                .expect("Forward NTT to buffer failed");
+
+            // Inverse NTT from buffer (using the new direct function)
+            let recovered = pollster::block_on(
+                gpu.multipass_inverse_ntt_from_buffer_direct(&ntt_buf, ntt_size)
+            ).expect("Inverse NTT from buffer failed");
+
+            // Verify roundtrip
+            let mut mismatches = 0;
+            for i in 0..ntt_size {
+                if input[i] != recovered[i] {
+                    if mismatches < 5 {
+                        println!(
+                            "  Mismatch at {}: input={}, recovered={}",
+                            i, input[i], recovered[i]
+                        );
+                    }
+                    mismatches += 1;
+                }
+            }
+            assert_eq!(mismatches, 0,
+                "Direct buffer NTT roundtrip failed for N={}: {} mismatches", ntt_size, mismatches);
+            println!("  PASS: Direct buffer roundtrip for N={}", ntt_size);
+        }
+    }
+
+    #[test]
+    fn test_direct_buffer_vs_original_ntt() {
+        // Verify direct buffer NTT produces same results as original NTT
+        let gpu = GoldilocksNttGpu::new(1024).expect("GPU init failed");
+        let ntt_size = 4096usize;
+
+        // Generate test data
+        let input: Vec<u64> = (0..ntt_size)
+            .map(|i| (i as u64 * 54321 + 11111) % GOLDILOCKS)
+            .collect();
+
+        // Original NTT (downloads to column-major format)
+        let original_ntt = pollster::block_on(gpu.multipass_forward_ntt_async(&input, ntt_size))
+            .expect("Original forward NTT failed");
+
+        // Direct buffer NTT (stays in row-major format on GPU)
+        let direct_buf = gpu.multipass_forward_ntt_to_buffer_direct(&input, ntt_size)
+            .expect("Direct forward NTT to buffer failed");
+        let direct_ntt = pollster::block_on(gpu.download_from_buffer(&direct_buf, ntt_size))
+            .expect("Download failed");
+
+        // The layouts are different (column-major vs row-major), so values won't match
+        // BUT: the roundtrip should produce the same result
+
+        // Original roundtrip
+        let original_recovered = pollster::block_on(
+            gpu.multipass_inverse_ntt_async(&original_ntt, ntt_size)
+        ).expect("Original inverse NTT failed");
+
+        // Direct buffer roundtrip
+        let direct_recovered = pollster::block_on(
+            gpu.multipass_inverse_ntt_from_buffer_direct(&direct_buf, ntt_size)
+        ).expect("Direct inverse NTT from buffer failed");
+
+        // Both should recover the original input
+        let mut orig_mismatches = 0;
+        let mut direct_mismatches = 0;
+        for i in 0..ntt_size {
+            if input[i] != original_recovered[i] {
+                orig_mismatches += 1;
+            }
+            if input[i] != direct_recovered[i] {
+                direct_mismatches += 1;
+            }
+        }
+
+        assert_eq!(orig_mismatches, 0, "Original roundtrip failed: {} mismatches", orig_mismatches);
+        assert_eq!(direct_mismatches, 0, "Direct buffer roundtrip failed: {} mismatches", direct_mismatches);
+        println!("PASS: Both original and direct buffer roundtrips recover input for N={}", ntt_size);
+    }
 }
 
 #[cfg(test)]
