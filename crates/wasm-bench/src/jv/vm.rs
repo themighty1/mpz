@@ -204,7 +204,7 @@ async fn jv_record_verifier_messages(
 
     // Pre-initialize NTT GPU context for polynomial multiplication
     web_sys::console::log_1(&"[jv_record] Preparing NTT GPU context...".into());
-    let ntt_size = (2 * r).next_power_of_two().max(1024).min(2048);
+    let ntt_size = 1024; // Max single-pass NTT; batched_poly_mul uses multipass for larger sizes
     let ntt_gpu = bgv_webgpu::GoldilocksNttGpu::new_async(ntt_size).await
         .expect("[jv_record] NTT GPU init failed");
     prover.set_ntt_gpu_context(std::sync::Arc::new(ntt_gpu));
@@ -561,7 +561,7 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
             let ntt_gpu_ctx = {
                 web_sys::console::log_1(&"[jv_vm] Pre-initializing NTT GPU context...".into());
                 let ntt_start = performance.now();
-                let ntt_size = (2 * R).next_power_of_two().max(1024).min(2048);
+                let ntt_size = 1024; // Max single-pass NTT; batched_poly_mul uses multipass for larger sizes
                 let ctx = bgv_webgpu::GoldilocksNttGpu::new_async(ntt_size).await
                     .expect("[jv_vm] NTT GPU context creation failed");
                 let elapsed = performance.now() - ntt_start;
@@ -741,11 +741,11 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
         65536 => run_bench!(65536),
         131072 => run_bench!(131072),
         _ => {
-            // Validate reps <= 1024 (GPU NTT capped at 2048 due to shared memory limits)
-            // Polynomial multiplication needs 2*R coefficients, so max R = 1024
-            if reps > 1024 {
+            // Validate reps <= 32768 (GPU multipass NTT supports up to 1M elements)
+            // Polynomial multiplication needs 2*R coefficients, so max R = 32768 for NTT size 65536
+            if reps > 32768 {
                 return Err(format!(
-                    "reps={} exceeds max 1024 (GPU NTT limited to 2048 elements due to 32KB shared memory limit, need 2*R for poly mul). Use multi-pass NTT for larger R.",
+                    "reps={} exceeds max 32768 (GPU multipass NTT limited to ~1M elements)",
                     reps
                 ));
             }
@@ -800,7 +800,7 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
             let ntt_gpu_ctx = {
                 web_sys::console::log_1(&"[jv_vm] Pre-initializing NTT GPU context...".into());
                 let ntt_start = performance.now();
-                let ntt_size = (2 * reps).next_power_of_two().max(1024).min(2048);
+                let ntt_size = 1024; // Max single-pass NTT; batched_poly_mul uses multipass for larger sizes
                 let ctx = bgv_webgpu::GoldilocksNttGpu::new_async(ntt_size).await
                     .expect("[jv_vm] NTT GPU context creation failed");
                 let elapsed = performance.now() - ntt_start;
@@ -1027,7 +1027,7 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
             let ntt_gpu_ctx = {
                 web_sys::console::log_1(&"[jv_vm] Pre-initializing NTT GPU context (new device)...".into());
                 let ntt_start = performance.now();
-                let ntt_size = (2 * R).next_power_of_two().max(1024).min(2048);
+                let ntt_size = 1024; // Max single-pass NTT; batched_poly_mul uses multipass for larger sizes
                 let ctx = bgv_webgpu::GoldilocksNttGpu::new_async(ntt_size).await
                     .expect("[jv_vm] NTT GPU context creation failed");
                 let elapsed = performance.now() - ntt_start;
@@ -1207,11 +1207,11 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
         65536 => run_bench!(65536),
         131072 => run_bench!(131072),
         _ => {
-            // Validate reps <= 1024 (GPU NTT capped at 2048 due to shared memory limits)
-            // Polynomial multiplication needs 2*R coefficients, so max R = 1024
-            if reps > 1024 {
+            // Validate reps <= 32768 (GPU multipass NTT supports up to 1M elements)
+            // Polynomial multiplication needs 2*R coefficients, so max R = 32768 for NTT size 65536
+            if reps > 32768 {
                 return Err(format!(
-                    "reps={} exceeds max 1024 (GPU NTT limited to 2048 elements due to 32KB shared memory limit, need 2*R for poly mul). Use multi-pass NTT for larger R.",
+                    "reps={} exceeds max 32768 (GPU multipass NTT limited to ~1M elements)",
                     reps
                 ));
             }
@@ -1242,7 +1242,7 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
             let ntt_gpu_ctx = {
                 web_sys::console::log_1(&"[jv_vm] Pre-initializing NTT GPU context (new device)...".into());
                 let ntt_start = performance.now();
-                let ntt_size = (2 * reps).next_power_of_two().max(1024).min(2048);
+                let ntt_size = 1024; // Max single-pass NTT; batched_poly_mul uses multipass for larger sizes
                 let ctx = bgv_webgpu::GoldilocksNttGpu::new_async(ntt_size).await
                     .expect("[jv_vm] NTT GPU context creation failed");
                 let elapsed = performance.now() - ntt_start;
