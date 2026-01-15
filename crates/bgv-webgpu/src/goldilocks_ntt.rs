@@ -1891,27 +1891,66 @@ impl GoldilocksNttGpu {
                 result_buffers.push(inv_col_out);
             }
 
-            // Submit all work at once
-            self.queue.submit(Some(encoder.finish()));
-
             // =====================================================================
             // STEP 3: Bulk download all results (1 download total)
             // =====================================================================
-            let mut results = vec![vec![]; pairs.len()];
+            // Create a single staging buffer to hold ALL results
+            let total_result_bytes = (num_non_empty * bytes_per_poly) as u64;
+            let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("bulk_download_staging"),
+                size: total_result_bytes,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            // Copy all result buffers to the staging buffer in one batch
+            for (local_idx, _) in non_empty_indices.iter().enumerate() {
+                let dst_offset = (local_idx * bytes_per_poly) as u64;
+                encoder.copy_buffer_to_buffer(
+                    &result_buffers[local_idx],
+                    0,
+                    &staging_buffer,
+                    dst_offset,
+                    bytes_per_poly as u64,
+                );
+            }
+
+            // Submit all work at once (including the copy-to-staging commands)
+            self.queue.submit(Some(encoder.finish()));
+
+            // Map the single staging buffer
+            let slice = staging_buffer.slice(..);
+            let (tx, rx) = futures::channel::oneshot::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+
+            #[cfg(not(target_arch = "wasm32"))]
+            self.device.poll(wgpu::Maintain::Wait);
+
+            rx.await
+                .map_err(|_| GpuError::ExecutionFailed("Channel cancelled".into()))?
+                .map_err(GpuError::BufferMapping)?;
+
+            // Read all results from the mapped staging buffer
+            let mapped = slice.get_mapped_range();
+            let all_data_u32: &[u32] = bytemuck::cast_slice(&mapped);
             let n_inv = mod_inverse(ntt_size as u64, GOLDILOCKS);
+            let mut results = vec![vec![]; pairs.len()];
 
             for (local_idx, &global_idx) in non_empty_indices.iter().enumerate() {
-                let result_data = self.download_from_buffer(&result_buffers[local_idx], ntt_size).await?;
-
-                // Apply n_inv scaling
+                let offset = local_idx * ntt_size * 2; // in u32 units
                 let rlen = result_lens[global_idx];
-                let mut scaled: Vec<u64> = result_data.iter()
-                    .take(rlen)
-                    .map(|&v| mod_mul(v, n_inv, GOLDILOCKS))
-                    .collect();
-                scaled.truncate(rlen);
+
+                let mut scaled = Vec::with_capacity(rlen);
+                for i in 0..rlen {
+                    let val = all_data_u32[offset + i * 2] as u64
+                            | ((all_data_u32[offset + i * 2 + 1] as u64) << 32);
+                    scaled.push(mod_mul(val, n_inv, GOLDILOCKS));
+                }
                 results[global_idx] = scaled;
             }
+
+            drop(mapped);
+            staging_buffer.unmap();
 
             // Clean up
             drop(keep_alive);
