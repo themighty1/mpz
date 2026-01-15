@@ -57,9 +57,9 @@ struct GpuBatchedNttParams {
     batch_per_wg: u32, // How many NTTs per workgroup
     total_batches: u32,// Total number of NTTs to process
     stride: u32,       // Stride between consecutive elements in global memory
+    batch_stride: u32, // Stride between consecutive batches (1 for columns, n1 for rows)
     _pad1: u32,
     _pad2: u32,
-    _pad3: u32,
 }
 
 /// Parameters for pointwise multiplication.
@@ -340,7 +340,8 @@ impl GoldilocksNttGpu {
             batch_per_wg: batch_per_wg as u32,
             total_batches: n1 as u32,
             stride: n1 as u32,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            batch_stride: 1, // Columns: batch i starts at index i
+            _pad1: 0, _pad2: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("col_ntt_params"),
@@ -454,7 +455,8 @@ impl GoldilocksNttGpu {
             batch_per_wg: batch_per_wg as u32,
             total_batches: n2 as u32,
             stride: 1, // Rows are contiguous
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            batch_stride: n1 as u32, // Rows: batch i starts at index i*n1
+            _pad1: 0, _pad2: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("row_ntt_params"),
@@ -562,7 +564,8 @@ impl GoldilocksNttGpu {
             batch_per_wg,
             total_batches: n1 as u32,
             stride: n1 as u32,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            batch_stride: 1, // Columns: batch i starts at index i
+            _pad1: 0, _pad2: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("inv_col_ntt_params"),
@@ -623,7 +626,8 @@ impl GoldilocksNttGpu {
             batch_per_wg: batch_per_wg as u32,
             total_batches: n2 as u32,
             stride: 1,
-            _pad1: 0, _pad2: 0, _pad3: 0,
+            batch_stride: n1 as u32, // Rows: batch i starts at index i*n1
+            _pad1: 0, _pad2: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("inv_row_ntt_params"),
@@ -2029,18 +2033,16 @@ impl GoldilocksNttGpu {
         }
 
         // =====================================================================
-        // PARTIALLY CHAINED GPU OPERATIONS
-        // Column NTT + Twiddle are chained (1 round trip)
-        // Row NTT uses original batched approach (1 round trip)
-        // Total: 2 round trips instead of 3
+        // FULLY CHAINED GPU OPERATIONS
+        // Column NTT + Twiddle + Row NTT all chained (1 round trip total)
         // =====================================================================
 
         // Upload input data once
         let input_buffer = self.upload_to_buffer(&work_data);
 
-        // Create command encoder for column NTT + twiddle
+        // Create command encoder for all passes
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("multipass_col_twiddle_encoder"),
+            label: Some("multipass_forward_ntt_encoder"),
         });
 
         // Keep buffers alive until submit
@@ -2054,37 +2056,21 @@ impl GoldilocksNttGpu {
         let twiddle_params = self.twiddle_to_buffer(&col_output, target_n, n1, &mut encoder)?;
         keep_alive.push(twiddle_params);
 
-        // Submit column NTT + twiddle
+        // Pass 3: Row NTTs (now chained using batch_stride parameter)
+        let (row_output, row_params) = self.row_ntt_to_buffer(&col_output, n1, n2, target_n, &mut encoder)?;
+        keep_alive.push(row_params);
+
+        // Submit all passes at once
         self.queue.submit(Some(encoder.finish()));
 
-        // Download intermediate result (round trip 1)
-        let mut work_data = self.download_from_buffer(&col_output, target_n).await?;
+        // Download final result (only 1 round trip!)
+        let work_data = self.download_from_buffer(&row_output, target_n).await?;
 
-        // Drop chained buffers
+        // Drop all buffers
         drop(keep_alive);
+        drop(row_output);
         drop(col_output);
         drop(input_buffer);
-
-        // =====================================================================
-        // Pass 3: Row NTTs using original batched approach (round trip 2)
-        // The batched_ntt_pipeline doesn't support contiguous row layout
-        // =====================================================================
-        let rows: Vec<Vec<u64>> = (0..n2)
-            .map(|row| work_data[row * n1..(row + 1) * n1].to_vec())
-            .collect();
-
-        let row_ntt_results = if n1 == self.n {
-            self.batched_forward_ntt_async(&rows).await?
-        } else {
-            let temp_gpu = GoldilocksNttGpu::new_async(n1).await?;
-            temp_gpu.batched_forward_ntt_async(&rows).await?
-        };
-
-        for (row, row_data) in row_ntt_results.iter().enumerate() {
-            for (col, &val) in row_data.iter().enumerate() {
-                work_data[row * n1 + col] = val;
-            }
-        }
 
         // =====================================================================
         // Read output column-major: X[col * N2 + row] = D[row][col]
@@ -2239,9 +2225,9 @@ impl GoldilocksNttGpu {
             batch_per_wg: batch_per_wg as u32,
             total_batches: n1 as u32,
             stride: n1 as u32,
+            batch_stride: 1, // Columns: batch i starts at index i
             _pad1: 0,
             _pad2: 0,
-            _pad3: 0,
         };
 
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2384,13 +2370,13 @@ impl GoldilocksNttGpu {
         }
 
         // =====================================================================
-        // PARTIALLY CHAINED GPU OPERATIONS
+        // FULLY CHAINED GPU OPERATIONS
         // Bailey's Four-Step IFFT (inverse of forward):
         // 1. Transpose (CPU)
-        // 2. Inverse row NTTs - original batched approach (round trip 1)
-        // 3. Inverse twiddle + Inverse column NTTs chained (round trip 2)
+        // 2. Upload once
+        // 3. Inverse row NTTs + Inverse twiddle + Inverse column NTTs all chained
         // 4. Scale by n_inv (CPU)
-        // Total: 2 round trips instead of 3
+        // Total: 1 round trip
         // =====================================================================
 
         // Step 1: Transpose (column-major input -> row-major) - done on CPU
@@ -2403,59 +2389,47 @@ impl GoldilocksNttGpu {
             }
         }
 
-        // Step 2: Inverse row NTTs using original batched approach (round trip 1)
-        let rows: Vec<Vec<u64>> = (0..n2)
-            .map(|row| work_data[row * n1..(row + 1) * n1].to_vec())
-            .collect();
-
-        let row_intt_results = if n1 == self.n {
-            self.batched_inverse_ntt_async(&rows).await?
-        } else {
-            let temp_gpu = GoldilocksNttGpu::new_async(n1).await?;
-            temp_gpu.batched_inverse_ntt_async(&rows).await?
-        };
-
-        for (row, row_data) in row_intt_results.iter().enumerate() {
-            for (col, &val) in row_data.iter().enumerate() {
-                work_data[row * n1 + col] = val;
-            }
-        }
-
-        // Upload for chained twiddle + column NTT
+        // Upload transposed data once
         let input_buffer = self.upload_to_buffer(&work_data);
 
-        // Create command encoder for twiddle + column NTT
+        // Create command encoder for all passes
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("multipass_inv_twiddle_col_encoder"),
+            label: Some("multipass_inverse_ntt_encoder"),
         });
 
         // Keep buffers alive until submit
         let mut keep_alive: Vec<Buffer> = Vec::new();
 
-        // Step 3: Inverse twiddle (in-place on input_buffer)
-        let twiddle_params = self.inv_twiddle_to_buffer(&input_buffer, target_n, n1, &mut encoder)?;
+        // Step 2: Inverse row NTTs (now chained using batch_stride parameter)
+        let (row_output, row_params) = self.inv_row_ntt_to_buffer(&input_buffer, n1, n2, target_n, &mut encoder)?;
+        keep_alive.push(row_params);
+
+        // Step 3: Inverse twiddle (in-place on row_output)
+        let twiddle_params = self.inv_twiddle_to_buffer(&row_output, target_n, n1, &mut encoder)?;
         keep_alive.push(twiddle_params);
 
         // Step 4: Inverse column NTTs of size N2 (strided columns)
-        let (col_output, col_params) = self.inv_column_ntt_to_buffer(&input_buffer, n1, n2, target_n, &mut encoder)?;
+        let (col_output, col_params) = self.inv_column_ntt_to_buffer(&row_output, n1, n2, target_n, &mut encoder)?;
         keep_alive.push(col_params);
 
-        // Submit twiddle + column NTT
+        // Submit all passes at once
         self.queue.submit(Some(encoder.finish()));
 
-        // Download result (round trip 2)
+        // Download final result (only 1 round trip!)
         let mut result = self.download_from_buffer(&col_output, target_n).await?;
 
-        // Drop chained buffers
+        // Drop all buffers
         drop(keep_alive);
         drop(col_output);
+        drop(row_output);
         drop(input_buffer);
 
-        // Step 5: Scale by n2_inv for the column INTT
-        // Note: batched_inverse_ntt_async already applied n1_inv for row INTT
-        let n2_inv = mod_inverse(n2 as u64, GOLDILOCKS);
+        // Step 5: Scale by n_inv for the full INTT
+        // The batched inverse NTT doesn't apply n_inv automatically anymore since
+        // we're using the strided row layout, so we need to apply full n_inv here
+        let n_inv = mod_inverse(target_n as u64, GOLDILOCKS);
         for val in result.iter_mut() {
-            *val = mod_mul(*val, n2_inv, GOLDILOCKS);
+            *val = mod_mul(*val, n_inv, GOLDILOCKS);
         }
 
         Ok(result)
@@ -2626,9 +2600,9 @@ impl GoldilocksNttGpu {
             batch_per_wg,
             total_batches,
             stride: n1 as u32, // Elements are n1 apart
+            batch_stride: 1, // Columns: batch i starts at index i
             _pad1: 0,
             _pad2: 0,
-            _pad3: 0,
         };
 
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2980,9 +2954,9 @@ struct BatchedNttParams {
     batch_per_wg: u32,   // How many NTTs per workgroup
     total_batches: u32,  // Total number of NTTs to process
     stride: u32,         // Stride between consecutive elements of one NTT in global memory
+    batch_stride: u32,   // Stride between consecutive batches (1 for columns, n1 for rows)
     _pad1: u32,
     _pad2: u32,
-    _pad3: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: BatchedNttParams;
@@ -3014,6 +2988,7 @@ fn batched_forward_ntt(
     let log_n = params.log_n;
     let batch_per_wg = params.batch_per_wg;
     let stride = params.stride;
+    let batch_stride = params.batch_stride;
 
     let wg_batch_start = wg_id.x * batch_per_wg;
     let total_elements = n * batch_per_wg;
@@ -3027,8 +3002,10 @@ fn batched_forward_ntt(
         let global_batch = wg_batch_start + batch_in_wg;
 
         if (global_batch < params.total_batches) {
-            // For column NTTs in four-step: element j of NTT i is at position i + j * stride
-            let global_idx = global_batch + pos_in_ntt * stride;
+            // global_idx = batch_base + element_offset
+            // For columns: batch_stride=1, stride=n1 -> batch i starts at i, elements at i, i+n1, i+2*n1...
+            // For rows: batch_stride=n1, stride=1 -> batch i starts at i*n1, elements at i*n1, i*n1+1, i*n1+2...
+            let global_idx = global_batch * batch_stride + pos_in_ntt * stride;
             let val_lo = input[global_idx * 2u];
             let val_hi = input[global_idx * 2u + 1u];
 
@@ -3092,7 +3069,7 @@ fn batched_forward_ntt(
         let global_batch = wg_batch_start + batch_in_wg;
 
         if (global_batch < params.total_batches) {
-            let global_idx = global_batch + pos_in_ntt * stride;
+            let global_idx = global_batch * batch_stride + pos_in_ntt * stride;
             let shared_idx = batch_in_wg * n + pos_in_ntt;
             output[global_idx * 2u] = shared_lo[shared_idx];
             output[global_idx * 2u + 1u] = shared_hi[shared_idx];
@@ -3649,9 +3626,9 @@ mod tests {
             batch_per_wg: batch_per_wg as u32,
             total_batches: total_batches as u32,
             stride: stride as u32,
+            batch_stride: 1, // Column layout: batch i starts at index i
             _pad1: 0,
             _pad2: 0,
-            _pad3: 0,
         };
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("params"),
