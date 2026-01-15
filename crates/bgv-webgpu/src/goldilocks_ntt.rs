@@ -1942,7 +1942,128 @@ impl GoldilocksNttGpu {
             let mul_wg = ((ntt_size + 255) / 256) as u32;
 
             // =====================================================================
-            // STEP 3: Single command encoder for ALL operations
+            // STEP 3: Pre-allocate all bind groups (10 per pair × 60 = 600)
+            // =====================================================================
+            let mut a_col_binds = Vec::with_capacity(num_non_empty);
+            let mut a_tw_binds = Vec::with_capacity(num_non_empty);
+            let mut a_row_binds = Vec::with_capacity(num_non_empty);
+            let mut b_col_binds = Vec::with_capacity(num_non_empty);
+            let mut b_tw_binds = Vec::with_capacity(num_non_empty);
+            let mut b_row_binds = Vec::with_capacity(num_non_empty);
+            let mut mul_binds = Vec::with_capacity(num_non_empty);
+            let mut inv_row_binds = Vec::with_capacity(num_non_empty);
+            let mut inv_tw_binds = Vec::with_capacity(num_non_empty);
+            let mut inv_col_binds = Vec::with_capacity(num_non_empty);
+
+            for i in 0..num_non_empty {
+                // Forward NTT for a
+                a_col_binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &ntt_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: col_ntt_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: a_inputs[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: a_cols[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n2.as_entire_binding() },
+                    ],
+                }));
+                a_tw_binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &twiddle_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: twiddle_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: a_cols[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: fwd_twiddles_n.as_entire_binding() },
+                    ],
+                }));
+                a_row_binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &ntt_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: row_ntt_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: a_cols[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: a_rows[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n1.as_entire_binding() },
+                    ],
+                }));
+
+                // Forward NTT for b
+                b_col_binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &ntt_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: col_ntt_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: b_inputs[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: b_cols[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n2.as_entire_binding() },
+                    ],
+                }));
+                b_tw_binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &twiddle_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: twiddle_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: b_cols[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: fwd_twiddles_n.as_entire_binding() },
+                    ],
+                }));
+                b_row_binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &ntt_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: row_ntt_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: b_cols[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: b_rows[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n1.as_entire_binding() },
+                    ],
+                }));
+
+                // Pointwise multiplication
+                mul_binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &mul_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: mul_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: a_rows[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: b_rows[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: prods[i].as_entire_binding() },
+                    ],
+                }));
+
+                // Inverse NTT
+                inv_row_binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &ntt_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: row_ntt_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: prods[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: inv_rows[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: inv_twiddles_n1.as_entire_binding() },
+                    ],
+                }));
+                inv_tw_binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &twiddle_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: inv_twiddle_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: inv_rows[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: inv_twiddles_n.as_entire_binding() },
+                    ],
+                }));
+                inv_col_binds.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &ntt_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: col_ntt_params_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: inv_rows[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: inv_cols[i].as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: inv_twiddles_n2.as_entire_binding() },
+                    ],
+                }));
+            }
+
+            // =====================================================================
+            // STEP 4: Single command encoder - just dispatches, no allocations
             // =====================================================================
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("batch_poly_mul_encoder"),
@@ -1957,171 +2078,70 @@ impl GoldilocksNttGpu {
                 encoder.copy_buffer_to_buffer(&all_b_buffer, b_offset, &b_inputs[local_idx], 0, bytes_per_poly as u64);
 
                 // Forward NTT for a: Col NTT -> Twiddle -> Row NTT
-                // Col NTT
-                let a_col_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &ntt_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: col_ntt_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: a_inputs[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: a_cols[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n2.as_entire_binding() },
-                    ],
-                });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.batched_ntt_pipeline);
-                    pass.set_bind_group(0, &a_col_bind, &[]);
+                    pass.set_bind_group(0, &a_col_binds[local_idx], &[]);
                     pass.dispatch_workgroups(col_wg, 1, 1);
                 }
-                // Twiddle (in-place on a_cols)
-                let a_tw_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &twiddle_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: twiddle_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: a_cols[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: fwd_twiddles_n.as_entire_binding() },
-                    ],
-                });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.twiddle_pipeline);
-                    pass.set_bind_group(0, &a_tw_bind, &[]);
+                    pass.set_bind_group(0, &a_tw_binds[local_idx], &[]);
                     pass.dispatch_workgroups(twiddle_wg, 1, 1);
                 }
-                // Row NTT
-                let a_row_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &ntt_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: row_ntt_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: a_cols[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: a_rows[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n1.as_entire_binding() },
-                    ],
-                });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.batched_ntt_pipeline);
-                    pass.set_bind_group(0, &a_row_bind, &[]);
+                    pass.set_bind_group(0, &a_row_binds[local_idx], &[]);
                     pass.dispatch_workgroups(row_wg, 1, 1);
                 }
 
                 // Forward NTT for b: Col NTT -> Twiddle -> Row NTT
-                let b_col_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &ntt_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: col_ntt_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: b_inputs[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: b_cols[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n2.as_entire_binding() },
-                    ],
-                });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.batched_ntt_pipeline);
-                    pass.set_bind_group(0, &b_col_bind, &[]);
+                    pass.set_bind_group(0, &b_col_binds[local_idx], &[]);
                     pass.dispatch_workgroups(col_wg, 1, 1);
                 }
-                let b_tw_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &twiddle_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: twiddle_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: b_cols[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: fwd_twiddles_n.as_entire_binding() },
-                    ],
-                });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.twiddle_pipeline);
-                    pass.set_bind_group(0, &b_tw_bind, &[]);
+                    pass.set_bind_group(0, &b_tw_binds[local_idx], &[]);
                     pass.dispatch_workgroups(twiddle_wg, 1, 1);
                 }
-                let b_row_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &ntt_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: row_ntt_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: b_cols[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: b_rows[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n1.as_entire_binding() },
-                    ],
-                });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.batched_ntt_pipeline);
-                    pass.set_bind_group(0, &b_row_bind, &[]);
+                    pass.set_bind_group(0, &b_row_binds[local_idx], &[]);
                     pass.dispatch_workgroups(row_wg, 1, 1);
                 }
 
                 // Pointwise multiplication
-                let mul_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &mul_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: mul_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: a_rows[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: b_rows[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: prods[local_idx].as_entire_binding() },
-                    ],
-                });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.pointwise_mul_pipeline);
-                    pass.set_bind_group(0, &mul_bind, &[]);
+                    pass.set_bind_group(0, &mul_binds[local_idx], &[]);
                     pass.dispatch_workgroups(mul_wg, 1, 1);
                 }
 
                 // Inverse NTT: Row INTT -> Inv Twiddle -> Col INTT
-                // (Same pipeline as forward, just uses inverse twiddles)
-                let inv_row_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &ntt_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: row_ntt_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: prods[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: inv_rows[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: inv_twiddles_n1.as_entire_binding() },
-                    ],
-                });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.batched_ntt_pipeline);
-                    pass.set_bind_group(0, &inv_row_bind, &[]);
+                    pass.set_bind_group(0, &inv_row_binds[local_idx], &[]);
                     pass.dispatch_workgroups(row_wg, 1, 1);
                 }
-                let inv_tw_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &twiddle_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: inv_twiddle_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: inv_rows[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: inv_twiddles_n.as_entire_binding() },
-                    ],
-                });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.twiddle_pipeline);
-                    pass.set_bind_group(0, &inv_tw_bind, &[]);
+                    pass.set_bind_group(0, &inv_tw_binds[local_idx], &[]);
                     pass.dispatch_workgroups(twiddle_wg, 1, 1);
                 }
-                let inv_col_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &ntt_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: col_ntt_params_buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: inv_rows[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 2, resource: inv_cols[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: inv_twiddles_n2.as_entire_binding() },
-                    ],
-                });
                 {
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
                     pass.set_pipeline(&self.batched_ntt_pipeline);
-                    pass.set_bind_group(0, &inv_col_bind, &[]);
+                    pass.set_bind_group(0, &inv_col_binds[local_idx], &[]);
                     pass.dispatch_workgroups(col_wg, 1, 1);
                 }
             }
@@ -2130,7 +2150,7 @@ impl GoldilocksNttGpu {
             let result_buffers = &inv_cols;
 
             // =====================================================================
-            // STEP 4: Bulk download all results (1 download total)
+            // STEP 5: Bulk download all results (1 download total)
             // =====================================================================
             // Create a single staging buffer to hold ALL results
             let total_result_bytes = (num_non_empty * bytes_per_poly) as u64;
