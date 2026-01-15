@@ -58,8 +58,8 @@ struct GpuBatchedNttParams {
     total_batches: u32,// Total number of NTTs to process
     stride: u32,       // Stride between consecutive elements in global memory
     batch_stride: u32, // Stride between consecutive batches (1 for columns, n1 for rows)
-    _pad1: u32,
-    _pad2: u32,
+    poly_stride: u32,  // Stride between polynomials in u32 units (for batched dispatch via wg_id.y)
+    _pad: u32,
 }
 
 /// Parameters for pointwise multiplication.
@@ -341,7 +341,7 @@ impl GoldilocksNttGpu {
             total_batches: n1 as u32,
             stride: n1 as u32,
             batch_stride: 1, // Columns: batch i starts at index i
-            _pad1: 0, _pad2: 0,
+            poly_stride: 0, _pad: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("col_ntt_params"),
@@ -456,7 +456,7 @@ impl GoldilocksNttGpu {
             total_batches: n2 as u32,
             stride: 1, // Rows are contiguous
             batch_stride: n1 as u32, // Rows: batch i starts at index i*n1
-            _pad1: 0, _pad2: 0,
+            poly_stride: 0, _pad: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("row_ntt_params"),
@@ -565,7 +565,7 @@ impl GoldilocksNttGpu {
             total_batches: n1 as u32,
             stride: n1 as u32,
             batch_stride: 1, // Columns: batch i starts at index i
-            _pad1: 0, _pad2: 0,
+            poly_stride: 0, _pad: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("inv_col_ntt_params"),
@@ -627,7 +627,7 @@ impl GoldilocksNttGpu {
             total_batches: n2 as u32,
             stride: 1,
             batch_stride: n1 as u32, // Rows: batch i starts at index i*n1
-            _pad1: 0, _pad2: 0,
+            poly_stride: 0, _pad: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("inv_row_ntt_params"),
@@ -1879,7 +1879,7 @@ impl GoldilocksNttGpu {
                 total_batches: n1 as u32,
                 stride: n1 as u32,
                 batch_stride: 1,
-                _pad1: 0, _pad2: 0,
+                poly_stride: 0, _pad: 0,
             };
             let col_ntt_params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("col_ntt_params"),
@@ -1895,7 +1895,7 @@ impl GoldilocksNttGpu {
                 total_batches: n2 as u32,
                 stride: 1,
                 batch_stride: n1 as u32,
-                _pad1: 0, _pad2: 0,
+                poly_stride: 0, _pad: 0,
             };
             let row_ntt_params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("row_ntt_params"),
@@ -2871,8 +2871,8 @@ impl GoldilocksNttGpu {
             total_batches: n1 as u32,
             stride: n1 as u32,
             batch_stride: 1, // Columns: batch i starts at index i
-            _pad1: 0,
-            _pad2: 0,
+            poly_stride: 0,
+            _pad: 0,
         };
 
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3246,8 +3246,8 @@ impl GoldilocksNttGpu {
             total_batches,
             stride: n1 as u32, // Elements are n1 apart
             batch_stride: 1, // Columns: batch i starts at index i
-            _pad1: 0,
-            _pad2: 0,
+            poly_stride: 0,
+            _pad: 0,
         };
 
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3600,8 +3600,8 @@ struct BatchedNttParams {
     total_batches: u32,  // Total number of NTTs to process
     stride: u32,         // Stride between consecutive elements of one NTT in global memory
     batch_stride: u32,   // Stride between consecutive batches (1 for columns, n1 for rows)
-    _pad1: u32,
-    _pad2: u32,
+    poly_stride: u32,    // Stride between polynomials in u32 units (ntt_size * 2)
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: BatchedNttParams;
@@ -3634,6 +3634,7 @@ fn batched_forward_ntt(
     let batch_per_wg = params.batch_per_wg;
     let stride = params.stride;
     let batch_stride = params.batch_stride;
+    let poly_offset = wg_id.y * params.poly_stride;  // Offset for this polynomial
 
     let wg_batch_start = wg_id.x * batch_per_wg;
     let total_elements = n * batch_per_wg;
@@ -3650,7 +3651,7 @@ fn batched_forward_ntt(
             // global_idx = batch_base + element_offset
             // For columns: batch_stride=1, stride=n1 -> batch i starts at i, elements at i, i+n1, i+2*n1...
             // For rows: batch_stride=n1, stride=1 -> batch i starts at i*n1, elements at i*n1, i*n1+1, i*n1+2...
-            let global_idx = global_batch * batch_stride + pos_in_ntt * stride;
+            let global_idx = poly_offset + global_batch * batch_stride + pos_in_ntt * stride;
             let val_lo = input[global_idx * 2u];
             let val_hi = input[global_idx * 2u + 1u];
 
@@ -3714,7 +3715,7 @@ fn batched_forward_ntt(
         let global_batch = wg_batch_start + batch_in_wg;
 
         if (global_batch < params.total_batches) {
-            let global_idx = global_batch * batch_stride + pos_in_ntt * stride;
+            let global_idx = poly_offset + global_batch * batch_stride + pos_in_ntt * stride;
             let shared_idx = batch_in_wg * n + pos_in_ntt;
             output[global_idx * 2u] = shared_lo[shared_idx];
             output[global_idx * 2u + 1u] = shared_hi[shared_idx];
@@ -4272,8 +4273,8 @@ mod tests {
             total_batches: total_batches as u32,
             stride: stride as u32,
             batch_stride: 1, // Column layout: batch i starts at index i
-            _pad1: 0,
-            _pad2: 0,
+            poly_stride: 0,
+            _pad: 0,
         };
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("params"),
