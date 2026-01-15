@@ -1788,30 +1788,27 @@ impl GoldilocksNttGpu {
             // =====================================================================
             // STEP 1: Bulk upload all polynomials (2 uploads total)
             // =====================================================================
-            let mut all_a_data = Vec::with_capacity(num_non_empty * ntt_size * 2);
-            let mut all_b_data = Vec::with_capacity(num_non_empty * ntt_size * 2);
+            // LE optimization: u64 memory layout is [low_u32, high_u32] on little-endian,
+            // so we can bytemuck::cast_slice directly instead of manual conversion loops.
+            let mut all_a_u64 = vec![0u64; num_non_empty * ntt_size];
+            let mut all_b_u64 = vec![0u64; num_non_empty * ntt_size];
 
-            for &idx in &non_empty_indices {
+            for (local_idx, &idx) in non_empty_indices.iter().enumerate() {
                 let (a, b) = pairs[idx];
-                // Pad and convert to u32 pairs
-                for i in 0..ntt_size {
-                    let val_a = if i < a.len() { a[i] } else { 0 };
-                    let val_b = if i < b.len() { b[i] } else { 0 };
-                    all_a_data.push(val_a as u32);
-                    all_a_data.push((val_a >> 32) as u32);
-                    all_b_data.push(val_b as u32);
-                    all_b_data.push((val_b >> 32) as u32);
-                }
+                let start = local_idx * ntt_size;
+                all_a_u64[start..start + a.len()].copy_from_slice(a);
+                all_b_u64[start..start + b.len()].copy_from_slice(b);
+                // rest stays 0 (padding)
             }
 
             let all_a_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("batch_poly_mul_all_a"),
-                contents: bytemuck::cast_slice(&all_a_data),
+                contents: bytemuck::cast_slice(&all_a_u64),
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             });
             let all_b_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("batch_poly_mul_all_b"),
-                contents: bytemuck::cast_slice(&all_b_data),
+                contents: bytemuck::cast_slice(&all_b_u64),
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             });
 
@@ -1931,21 +1928,20 @@ impl GoldilocksNttGpu {
                 .map_err(GpuError::BufferMapping)?;
 
             // Read all results from the mapped staging buffer
+            // LE optimization: cast directly to &[u64] since memory layout matches
             let mapped = slice.get_mapped_range();
-            let all_data_u32: &[u32] = bytemuck::cast_slice(&mapped);
+            let all_data_u64: &[u64] = bytemuck::cast_slice(&mapped);
             let n_inv = mod_inverse(ntt_size as u64, GOLDILOCKS);
             let mut results = vec![vec![]; pairs.len()];
 
             for (local_idx, &global_idx) in non_empty_indices.iter().enumerate() {
-                let offset = local_idx * ntt_size * 2; // in u32 units
+                let offset = local_idx * ntt_size;
                 let rlen = result_lens[global_idx];
 
-                let mut scaled = Vec::with_capacity(rlen);
-                for i in 0..rlen {
-                    let val = all_data_u32[offset + i * 2] as u64
-                            | ((all_data_u32[offset + i * 2 + 1] as u64) << 32);
-                    scaled.push(mod_mul(val, n_inv, GOLDILOCKS));
-                }
+                let scaled: Vec<u64> = all_data_u64[offset..offset + rlen]
+                    .iter()
+                    .map(|&val| mod_mul(val, n_inv, GOLDILOCKS))
+                    .collect();
                 results[global_idx] = scaled;
             }
 
