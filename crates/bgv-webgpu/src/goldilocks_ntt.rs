@@ -1769,6 +1769,10 @@ impl GoldilocksNttGpu {
                 ntt_size, pairs.len()
             ).into());
 
+            // Start timing CPU prep phase
+            #[cfg(target_arch = "wasm32")]
+            let cpu_prep_start = web_sys::window().unwrap().performance().unwrap().now();
+
             // Four-step FFT dimensions
             let n1 = MAX_SINGLE_PASS.min(ntt_size);
             let n2 = ntt_size / n1;
@@ -2173,6 +2177,12 @@ impl GoldilocksNttGpu {
                 );
             }
 
+            // End CPU prep timing, start GPU timing
+            #[cfg(target_arch = "wasm32")]
+            let cpu_prep_time = web_sys::window().unwrap().performance().unwrap().now() - cpu_prep_start;
+            #[cfg(target_arch = "wasm32")]
+            let gpu_start = web_sys::window().unwrap().performance().unwrap().now();
+
             // Submit all work at once (including the copy-to-staging commands)
             self.queue.submit(Some(encoder.finish()));
 
@@ -2184,9 +2194,25 @@ impl GoldilocksNttGpu {
             #[cfg(not(target_arch = "wasm32"))]
             self.device.poll(wgpu::Maintain::Wait);
 
+            // Start wait timing
+            #[cfg(target_arch = "wasm32")]
+            let wait_start = web_sys::window().unwrap().performance().unwrap().now();
+
             rx.await
                 .map_err(|_| GpuError::ExecutionFailed("Channel cancelled".into()))?
                 .map_err(GpuError::BufferMapping)?;
+
+            // Log timing
+            #[cfg(target_arch = "wasm32")]
+            {
+                let wait_time = web_sys::window().unwrap().performance().unwrap().now() - wait_start;
+                let total_gpu_time = web_sys::window().unwrap().performance().unwrap().now() - gpu_start;
+                let overlap = cpu_prep_time.min(total_gpu_time - wait_time).max(0.0);
+                web_sys::console::log_1(&format!(
+                    "[GPU poly_mul] Timing: GPU={:.2}ms, CPU_prep={:.2}ms, Wait={:.2}ms, Overlap={:.2}ms",
+                    total_gpu_time, cpu_prep_time, wait_time, overlap
+                ).into());
+            }
 
             // Read all results from the mapped staging buffer
             // LE optimization: cast directly to &[u64] since memory layout matches
