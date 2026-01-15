@@ -629,9 +629,12 @@ pub struct JVProver {
     mk_ciphertext_commitments: Vec<[u8; 32]>,
     /// RNS ciphertexts for MK polynomial evaluations (batched).
     mk_rns_ciphertexts: Vec<RnsCiphertext>,
-    /// Cached vanishing polynomial Z(X) = Π(X - αⱼ) for eval_points.
-    /// Computed once and reused to avoid O(R²) recomputation.
+    /// Cached vanishing polynomial Z(X) = Π(X - αⱼ) for ALL eval_points (n points).
+    /// Used for binary/multiplication constraints that vanish at padded points too.
     vanishing_poly: Option<Vec<u64>>,
+    /// Cached vanishing polynomial Z_r(X) = Π(X - αⱼ) for first r eval_points only.
+    /// Used for sum constraint that only vanishes at actual (non-padded) points.
+    vanishing_poly_r: Option<Vec<u64>>,
 
     // ==========================================================================
     // Packed evaluation fields (rotation-free)
@@ -723,8 +726,9 @@ impl JVProver {
             mk_itpac_commitments: Vec::new(),
             mk_ciphertext_commitments: Vec::new(),
             mk_rns_ciphertexts: Vec::new(),
-            // Cached vanishing polynomial
+            // Cached vanishing polynomials
             vanishing_poly: None,
+            vanishing_poly_r: None,
             // Packed evaluation fields
             packed_powers_chunks: None,
             rns_public_key: None,
@@ -1165,12 +1169,14 @@ impl JVProver {
         }
 
         self.eval_points = Some(eval_points.to_vec());
-        // Compute and cache vanishing polynomial Z(X) = Π(X - αⱼ) over actual R points
-        // (not NTT-padded points which may extend beyond R)
+        // Compute and cache vanishing polynomials:
+        // - Full (n points): for binary/multiplication constraints that vanish at padded points
+        // - R points only: for sum constraint that only vanishes at actual points
         let vanish_start = profile_start!();
+        self.vanishing_poly = Some(compute_vanishing_poly(eval_points, self.modulus));
         let actual_eval_points = &eval_points[..self.r.min(eval_points.len())];
-        self.vanishing_poly = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
-        profile_end!(vanish_start, "[commit] vanishing_poly ({} points): {:?}", actual_eval_points.len());
+        self.vanishing_poly_r = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
+        profile_end!(vanish_start, "[commit] vanishing_polys ({} and {} points): {:?}", eval_points.len(), actual_eval_points.len());
 
         self.vole_pool = Some(vole_pool);
         // Store seed commitment and public key for later verification
@@ -1352,10 +1358,12 @@ impl JVProver {
         }
 
         self.eval_points = Some(eval_points.to_vec());
+        // Compute and cache vanishing polynomials (same as non-async version)
         let vanish_start = profile_start!();
+        self.vanishing_poly = Some(compute_vanishing_poly(eval_points, self.modulus));
         let actual_eval_points = &eval_points[..self.r.min(eval_points.len())];
-        self.vanishing_poly = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
-        profile_end!(vanish_start, "[commit] vanishing_poly ({} points): {:?}", actual_eval_points.len());
+        self.vanishing_poly_r = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
+        profile_end!(vanish_start, "[commit] vanishing_polys ({} and {} points): {:?}", eval_points.len(), actual_eval_points.len());
 
         self.vole_pool = Some(vole_pool);
         self.ahe_seed_commitment = Some(setup_msg.ahe_seed_commitment);
@@ -2618,12 +2626,13 @@ impl JVProver {
             };
         }
 
-        // Use cached vanishing polynomial Z(X) = Π(X - αⱼ)
-        let z_poly = self.vanishing_poly.as_ref()
+        // Use r-point vanishing polynomial Z_r(X) = Π(X - αⱼ) for j < r
+        // Sum constraint only vanishes at first r points (not padded ones where sum = 0 ≠ 1)
+        let z_poly = self.vanishing_poly_r.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
 
-        // Compute quotient Q_sum(X) = H_sum(X) / Z(X)
-        // For correct execution, H_sum should be zero polynomial, so quotient is empty
+        // Compute quotient Q_sum(X) = H_sum(X) / Z_r(X)
+        // For correct execution, H_sum should be zero at first r points
         let (quotient_coeffs, _remainder) = poly_div(&h_sum, z_poly, self.modulus);
 
         Ok(MKSumProofMessage { quotient_coeffs })
@@ -3156,6 +3165,14 @@ impl JVProver {
         wasm_log!("[prove_mults] Building h_poly: num_inputs={}, num_mults={}, wire_polys={}",
             num_inputs, num_mults, self.wire_polynomials.len());
 
+        // Debug: check wire polynomial sizes
+        if !self.wire_polynomials.is_empty() {
+            let first_len = self.wire_polynomials[0].len();
+            let all_same = self.wire_polynomials.iter().all(|p| p.len() == first_len);
+            wasm_log!("[prove_mults] Wire poly sizes: first={}, all_same={}, r={}",
+                first_len, all_same, self.r);
+        }
+
         for mult_idx in 0..num_mults {
             // Get polynomial indices for this multiplication gate
             let a_idx = num_inputs + mult_idx;           // mult_left
@@ -3366,6 +3383,8 @@ impl JVProver {
             let mut padded: Vec<Goldilocks> = values.iter().map(|&v| Goldilocks::new(v)).collect();
             padded.resize(n, Goldilocks::zero());
             ctx.intt_fused(&mut padded);
+            // Keep full NTT-size polynomial - truncation would break interpolation
+            // at roots of unity evaluation points
             return padded.iter().map(|g| g.inner()).collect();
         }
 
@@ -4184,10 +4203,17 @@ impl JVVerifier {
         wasm_log!("[verify_mults] quotient_len={}, aggregated_check={}",
             proof.quotient_coeffs.len(), proof.aggregated_check);
 
-        // Check quotient has expected degree (≤ 2R-2 for H of degree 2(R-1), Z of degree R)
-        // After division, quotient degree is at most R-2
-        let max_quotient_len = 2 * self.r;
-        wasm_log!("[verify_mults] max_quotient_len={}, r={}", max_quotient_len, self.r);
+        // Wire polynomials have n = next_power_of_two(r) coefficients for GOLDILOCKS
+        // h = f_a * f_b - f_c has degree 2(n-1)
+        // z_n (vanishing poly over n points) has degree n
+        // quotient has degree n-2, so max n-1 coefficients
+        let n = if self.modulus == GOLDILOCKS {
+            self.r.next_power_of_two()
+        } else {
+            self.r
+        };
+        let max_quotient_len = n; // quotient degree ≤ n-2 means at most n-1 coefficients
+        wasm_log!("[verify_mults] max_quotient_len={}, r={}, n={}", max_quotient_len, self.r, n);
 
         if proof.quotient_coeffs.len() > max_quotient_len {
             self.phase = JVVerifierPhase::Done(false);
@@ -4471,11 +4497,11 @@ impl JVVerifier {
             gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
         }
 
-        // Compute Z(Λ) = Π(Λ - αⱼ) over actual R points
-        // (MK constraints only hold at first R points, not NTT-padded ones)
-        let actual_eval_points = &eval_points[..self.r.min(eval_points.len())];
+        // Compute Z(Λ) = Π(Λ - αⱼ) over ALL eval points
+        // MK polynomials are padded with zeros, so MK_i(α_j) = 0 for j >= r
+        // Thus MK_i * (MK_i - 1) = 0 at all points (binary or zero)
         let mut z_lambda = 1u128;
-        for &alpha in actual_eval_points {
+        for &alpha in eval_points {
             let diff = if self.lambda >= alpha {
                 self.lambda - alpha
             } else {

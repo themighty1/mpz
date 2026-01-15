@@ -167,7 +167,10 @@ async fn jv_record_verifier_messages(
     soldering_constraints: &[SolderingConstraint],
 ) -> JVRecordedMessages {
     let r = active_branches.len();
-    web_sys::console::log_1(&"[jv_record] Starting verifier message recording...".into());
+    web_sys::console::log_1(&format!(
+        "[jv_record] Starting verifier message recording... r={}, inputs_per_rep.len()={}",
+        r, inputs_per_rep.len()
+    ).into());
     let mut rng = Prg::from_seed(Block::ZERO);
 
     // Use JVProver with IT-PAC
