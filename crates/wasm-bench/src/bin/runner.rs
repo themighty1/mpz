@@ -84,9 +84,11 @@ const ALL_BENCHMARKS: &[&str] = &[
     "jv_vm_prover/32k",
     "jv_vm_prover/64k",
     "jv_vm_prover/128k",
+    "jv_vm_prover_main_thread/100",
     "jv_vm_prover_main_thread/1k",
     "jv_vm_prover_main_thread/2k",
     "jv_vm_prover_main_thread/3k",
+    "jv_vm_prover_main_thread/4k",
     "jv_vm_prover_main_thread/8k",
     "jv_vm_prover_main_thread/16k",
     "jv_vm_prover_main_thread/32k",
@@ -231,9 +233,13 @@ async fn run_benchmarks_with_concurrency(
     let concurrency_param = concurrency
         .map(|c| format!("&concurrency={}", c))
         .unwrap_or_default();
+    let reps_param = std::env::var("REPS")
+        .ok()
+        .map(|r| format!("&reps={}", r))
+        .unwrap_or_default();
     let url = format!(
-        "http://{}/?autorun=true&iterations={}&samples={}&benchmarks={}{}",
-        server_addr, iterations, samples, benchmarks_param, concurrency_param
+        "http://{}/?autorun=true&iterations={}&samples={}&benchmarks={}{}{}",
+        server_addr, iterations, samples, benchmarks_param, concurrency_param, reps_param
     );
 
     if let Some(c) = concurrency {
@@ -464,6 +470,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            "--reps" | "-r" => {
+                // Custom reps: add a custom benchmark and set REPS env var
+                i += 1;
+                if let Some(reps) = args.get(i) {
+                    // SAFETY: We're single-threaded at this point and only setting once
+                    unsafe { std::env::set_var("REPS", reps); }
+                    let custom_name = format!("jv_vm_prover_main_thread/custom_{}", reps);
+                    selected_benchmarks.push(custom_name);
+                }
+            }
             "--help" | "-h" => {
                 println!("WASM Benchmark Runner");
                 println!();
@@ -478,6 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  --sweep              Run MT benchmarks with 2,3,4,6,8,12,16 threads");
                 println!("  --group, -g <GROUP>  Run all benchmarks in a group (can be repeated)");
                 println!("  --bench, -b <NAME>   Run specific benchmark (can be repeated)");
+                println!("  --reps, -r <N>       Run jv_vm_prover_main_thread with custom reps value");
                 println!("  --list, -l           List available groups and benchmarks");
                 println!("  --verbose, -v        Print browser console logs to terminal");
                 println!("  --help, -h           Show this help");

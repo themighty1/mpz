@@ -144,7 +144,7 @@ fn run_prover_only<const R: usize>(
 
     for i in 0..iters {
         // Fresh prover with fresh witness each iteration
-        let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+        let mut prover = JVProver::new(active_branches.to_vec(), MODULUS);
         prover.setup(circuits, inputs_per_rep).unwrap();
         prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 

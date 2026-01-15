@@ -139,11 +139,11 @@ fn record_verifier_messages<const R: usize>(
 ) -> RecordedVerifierMessages {
     let mut rng = Prg::from_seed(Block::ZERO);
 
-    let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    let mut prover = JVProver::new(active_branches.to_vec(), MODULUS);
     prover.setup(circuits, inputs_per_rep).unwrap();
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
-    let mut verifier = JVVerifier::<R>::new(MODULUS, &mut rng);
+    let mut verifier = JVVerifier::new(R, MODULUS, &mut rng);
     let setup_msg = verifier.setup(circuits, &mut rng).unwrap();
     verifier.setup_soldering(soldering_constraints.to_vec()).unwrap();
 
@@ -205,7 +205,7 @@ fn run_prover_with_replay<const R: usize>(
 ) {
     let mut rng = Prg::from_seed(Block::ZERO);
 
-    let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    let mut prover = JVProver::new(active_branches.to_vec(), MODULUS);
     prover.setup(circuits, inputs_per_rep).unwrap();
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
@@ -248,7 +248,7 @@ fn run_protocol_only<const R: usize>(
 
     for i in 0..iters {
         // Fresh prover with fresh witness each iteration
-        let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+        let mut prover = JVProver::new(active_branches.to_vec(), MODULUS);
         prover.setup(circuits, inputs_per_rep).unwrap();
         prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
@@ -294,7 +294,7 @@ fn run_prover_with_timing<const R: usize>(
     let mut rng = Prg::from_seed(Block::ZERO);
 
     let t0 = Instant::now();
-    let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    let mut prover = JVProver::new(active_branches.to_vec(), MODULUS);
     let t_new = t0.elapsed();
 
     let t1 = Instant::now();

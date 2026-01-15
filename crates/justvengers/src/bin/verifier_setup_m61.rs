@@ -133,11 +133,11 @@ fn generate_verifier_messages<const R: usize>(
 ) -> VerifierMessages {
     let mut rng = Prg::from_seed(Block::ZERO);
 
-    let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    let mut prover = JVProver::new(active_branches.to_vec(), MODULUS);
     prover.setup(circuits, inputs_per_rep).unwrap();
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
-    let mut verifier = JVVerifier::<R>::new(MODULUS, &mut rng);
+    let mut verifier = JVVerifier::new(R, MODULUS, &mut rng);
     let setup_msg = verifier.setup(circuits, &mut rng).unwrap();
     verifier.setup_soldering(soldering_constraints.to_vec()).unwrap();
 

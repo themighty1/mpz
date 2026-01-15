@@ -107,9 +107,9 @@ macro_rules! wasm_log {
     };
 }
 
-// Optional GPU acceleration for slot multiplication
+// Optional GPU acceleration for slot multiplication and NTT
 #[cfg(feature = "gpu")]
-use bgv_webgpu::{RnsSlotMulGpu, RnsBatchParams};
+use bgv_webgpu::{RnsSlotMulGpu, RnsBatchParams, GoldilocksNttGpu};
 
 // ============================================================================
 // Goldilocks IT-MAC Field
@@ -569,7 +569,9 @@ pub struct JVOpenMessage {
 
 /// Optimized JustVengers prover with O(R+B+C) communication.
 #[derive(Clone, Debug)]
-pub struct JVProver<const R: usize> {
+pub struct JVProver {
+    /// Number of repetitions (runtime value, was const generic R).
+    r: usize,
     /// Active branch indices, one per repetition.
     active_branches: Vec<usize>,
     /// Extended witnesses for all R repetitions.
@@ -640,6 +642,9 @@ pub struct JVProver<const R: usize> {
     /// Wrapped in Arc for Clone support (GPU handles can't be cloned).
     #[cfg(feature = "gpu")]
     gpu_context: Option<std::sync::Arc<RnsSlotMulGpu>>,
+    /// GPU context for Goldilocks NTT (polynomial multiplication).
+    #[cfg(feature = "gpu")]
+    ntt_gpu: Option<std::sync::Arc<GoldilocksNttGpu>>,
     /// Total GPU time in milliseconds (accumulated across all GPU operations).
     #[cfg(feature = "gpu")]
     total_gpu_time_ms: f64,
@@ -680,17 +685,16 @@ pub enum JVProverPhase {
     Done,
 }
 
-impl<const R: usize> JVProver<R> {
+impl JVProver {
     /// Creates a new optimized prover with per-repetition active branches.
     pub fn new(active_branches: Vec<usize>, modulus: u64) -> Self {
-        assert_eq!(
-            active_branches.len(),
-            R,
-            "active_branches must have length R={}, got {}",
-            R,
-            active_branches.len()
+        let r = active_branches.len();
+        assert!(
+            r > 0,
+            "active_branches must not be empty"
         );
         Self {
+            r,
             active_branches,
             witnesses: Vec::new(),
             modulus,
@@ -723,6 +727,8 @@ impl<const R: usize> JVProver<R> {
             #[cfg(feature = "gpu")]
             gpu_context: None,
             #[cfg(feature = "gpu")]
+            ntt_gpu: None,
+            #[cfg(feature = "gpu")]
             total_gpu_time_ms: 0.0,
             // Timing fields
             timing_intt_ms: 0.0,
@@ -746,8 +752,8 @@ impl<const R: usize> JVProver<R> {
     }
 
     /// Creates a prover where all repetitions use the same branch.
-    pub fn new_single_branch(active_branch: usize, modulus: u64) -> Self {
-        Self::new(vec![active_branch; R], modulus)
+    pub fn new_single_branch(r: usize, active_branch: usize, modulus: u64) -> Self {
+        Self::new(vec![active_branch; r], modulus)
     }
 
     /// Returns the current phase.
@@ -821,13 +827,27 @@ impl<const R: usize> JVProver<R> {
         match RnsSlotMulGpu::new_async(gpu_params).await {
             Ok(ctx) => {
                 self.gpu_context = Some(std::sync::Arc::new(ctx));
-                Ok(())
             }
             Err(e) => {
-                eprintln!("[prepare_gpu_async] GPU init failed: {}", e);
-                Err(JVProverError::GpuInitFailed)
+                eprintln!("[prepare_gpu_async] RnsSlotMulGpu init failed: {}", e);
+                return Err(JVProverError::GpuInitFailed);
             }
         }
+
+        // Initialize NTT GPU for polynomial multiplication
+        // NTT size should be >= 2*R for polynomial products (degree R-1 * degree R-1 = degree 2R-2)
+        let ntt_size = (2 * self.r).next_power_of_two().max(1024);
+        match GoldilocksNttGpu::new_async(ntt_size).await {
+            Ok(ctx) => {
+                self.ntt_gpu = Some(std::sync::Arc::new(ctx));
+            }
+            Err(e) => {
+                eprintln!("[prepare_gpu_async] GoldilocksNttGpu init failed: {}", e);
+                // Non-fatal: fall back to CPU NTT
+            }
+        }
+
+        Ok(())
     }
 
     /// Prepares GPU context synchronously from setup message (native only).
@@ -855,19 +875,38 @@ impl<const R: usize> JVProver<R> {
         match RnsSlotMulGpu::new(gpu_params) {
             Ok(ctx) => {
                 self.gpu_context = Some(std::sync::Arc::new(ctx));
-                Ok(())
             }
             Err(e) => {
-                eprintln!("[prepare_gpu] GPU init failed: {}", e);
-                Err(JVProverError::GpuInitFailed)
+                eprintln!("[prepare_gpu] RnsSlotMulGpu init failed: {}", e);
+                return Err(JVProverError::GpuInitFailed);
             }
         }
+
+        // Initialize NTT GPU for polynomial multiplication
+        let ntt_size = (2 * self.r).next_power_of_two().max(1024);
+        match GoldilocksNttGpu::new(ntt_size) {
+            Ok(ctx) => {
+                self.ntt_gpu = Some(std::sync::Arc::new(ctx));
+            }
+            Err(e) => {
+                eprintln!("[prepare_gpu] GoldilocksNttGpu init failed: {}", e);
+                // Non-fatal: fall back to CPU NTT
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns whether GPU context is initialized.
     #[cfg(feature = "gpu")]
     pub fn has_gpu(&self) -> bool {
         self.gpu_context.is_some()
+    }
+
+    /// Returns whether NTT GPU context is initialized.
+    #[cfg(feature = "gpu")]
+    pub fn has_ntt_gpu(&self) -> bool {
+        self.ntt_gpu.is_some()
     }
 
     /// Prepares GPU context with hardcoded Goldilocks parameters.
@@ -933,6 +972,12 @@ impl<const R: usize> JVProver<R> {
         self.gpu_context = Some(ctx);
     }
 
+    /// Sets a pre-initialized NTT GPU context (for sharing across iterations).
+    #[cfg(feature = "gpu")]
+    pub fn set_ntt_gpu_context(&mut self, ctx: std::sync::Arc<GoldilocksNttGpu>) {
+        self.ntt_gpu = Some(ctx);
+    }
+
     /// Initializes the prover with per-repetition circuits.
     pub fn setup(
         &mut self,
@@ -946,7 +991,7 @@ impl<const R: usize> JVProver<R> {
             return Err(JVProverError::InvalidPhase);
         }
 
-        if inputs_per_rep.len() != R {
+        if inputs_per_rep.len() != self.r {
             return Err(JVProverError::WrongRepetitionCount);
         }
 
@@ -1055,7 +1100,7 @@ impl<const R: usize> JVProver<R> {
         }
 
         let mut soldering = SolderingProver::new(self.modulus);
-        soldering.setup(constraints, input_polys, output_polys, eval_points, R, rng);
+        soldering.setup(constraints, input_polys, output_polys, eval_points, self.r, rng);
 
         self.soldering_prover = Some(soldering);
         Ok(())
@@ -1104,9 +1149,9 @@ impl<const R: usize> JVProver<R> {
 
         // Validate eval_points length
         let expected_len = if self.modulus == GOLDILOCKS {
-            R.next_power_of_two()
+            self.r.next_power_of_two()
         } else {
-            R
+            self.r
         };
 
         if eval_points.len() != expected_len {
@@ -1117,7 +1162,7 @@ impl<const R: usize> JVProver<R> {
         // Compute and cache vanishing polynomial Z(X) = Π(X - αⱼ) over actual R points
         // (not NTT-padded points which may extend beyond R)
         let vanish_start = profile_start!();
-        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
+        let actual_eval_points = &eval_points[..self.r.min(eval_points.len())];
         self.vanishing_poly = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
         profile_end!(vanish_start, "[commit] vanishing_poly ({} points): {:?}", actual_eval_points.len());
 
@@ -1291,9 +1336,9 @@ impl<const R: usize> JVProver<R> {
 
         // Validate eval_points length
         let expected_len = if self.modulus == GOLDILOCKS {
-            R.next_power_of_two()
+            self.r.next_power_of_two()
         } else {
-            R
+            self.r
         };
 
         if eval_points.len() != expected_len {
@@ -1302,7 +1347,7 @@ impl<const R: usize> JVProver<R> {
 
         self.eval_points = Some(eval_points.to_vec());
         let vanish_start = profile_start!();
-        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
+        let actual_eval_points = &eval_points[..self.r.min(eval_points.len())];
         self.vanishing_poly = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
         profile_end!(vanish_start, "[commit] vanishing_poly ({} points): {:?}", actual_eval_points.len());
 
@@ -2091,7 +2136,7 @@ impl<const R: usize> JVProver<R> {
 
         // Step 1: Construct B×R matrix MK
         // MK_{i,j} = 1 if branch i is active in repetition j, 0 otherwise
-        let mut mk_matrix: Vec<Vec<u64>> = vec![vec![0u64; R]; num_branches];
+        let mut mk_matrix: Vec<Vec<u64>> = vec![vec![0u64; self.r]; num_branches];
         for (j, &active_branch) in self.active_branches.iter().enumerate() {
             mk_matrix[active_branch][j] = 1;
         }
@@ -2201,7 +2246,7 @@ impl<const R: usize> JVProver<R> {
             return Err(JVProverError::MissingSetupData);
         }
 
-        let mut mk_matrix: Vec<Vec<u64>> = vec![vec![0u64; R]; num_branches];
+        let mut mk_matrix: Vec<Vec<u64>> = vec![vec![0u64; self.r]; num_branches];
         for (j, &active_branch) in self.active_branches.iter().enumerate() {
             mk_matrix[active_branch][j] = 1;
         }
@@ -2311,19 +2356,15 @@ impl<const R: usize> JVProver<R> {
     /// # Arguments
     /// * `gamma` - Random challenge for aggregating binary constraints across branches
     pub fn prove_mk_binary(&self, gamma: u64) -> Result<MKBinaryProofMessage, JVProverError> {
-        let eval_points = self.eval_points.as_ref()
+        let _eval_points = self.eval_points.as_ref()
             .ok_or(JVProverError::MissingSetupData)?;
 
         if self.mk_polynomials.is_empty() {
             return Err(JVProverError::MissingSetupData);
         }
 
-        // Compute H_bin(X) = Σᵢ γⁱ · MK_i(X) · (MK_i(X) - 1)
-        let mut h_bin = vec![0u64];
-        let mut gamma_power = 1u64;
-
-        for mk_poly in &self.mk_polynomials {
-            // MK_i(X) - 1: subtract 1 from constant term
+        // Prepare MK_i(X) - 1 polynomials
+        let mk_minus_ones: Vec<Vec<u64>> = self.mk_polynomials.iter().map(|mk_poly| {
             let mut mk_minus_one = mk_poly.clone();
             if mk_minus_one.is_empty() {
                 mk_minus_one.push(self.modulus - 1);
@@ -2334,12 +2375,45 @@ impl<const R: usize> JVProver<R> {
                     mk_minus_one[0] - 1
                 };
             }
+            mk_minus_one
+        }).collect();
 
-            // MK_i(X) · (MK_i(X) - 1)
-            let constraint_poly = poly_mul(mk_poly, &mk_minus_one, self.modulus);
+        // Compute all constraint polynomials: MK_i(X) · (MK_i(X) - 1)
+        #[cfg(feature = "gpu")]
+        let constraint_polys: Vec<Vec<u64>> = if let Some(ntt_gpu) = &self.ntt_gpu {
+            // GPU batched polynomial multiplication
+            let pairs: Vec<(&[u64], &[u64])> = self.mk_polynomials.iter()
+                .zip(mk_minus_ones.iter())
+                .map(|(a, b)| (a.as_slice(), b.as_slice()))
+                .collect();
+            ntt_gpu.batched_poly_mul(&pairs).unwrap_or_else(|e| {
+                eprintln!("[prove_mk_binary] GPU poly_mul failed: {}, falling back to CPU", e);
+                self.mk_polynomials.iter()
+                    .zip(mk_minus_ones.iter())
+                    .map(|(mk_poly, mk_minus_one)| poly_mul(mk_poly, mk_minus_one, self.modulus))
+                    .collect()
+            })
+        } else {
+            // CPU fallback
+            self.mk_polynomials.iter()
+                .zip(mk_minus_ones.iter())
+                .map(|(mk_poly, mk_minus_one)| poly_mul(mk_poly, mk_minus_one, self.modulus))
+                .collect()
+        };
 
+        #[cfg(not(feature = "gpu"))]
+        let constraint_polys: Vec<Vec<u64>> = self.mk_polynomials.iter()
+            .zip(mk_minus_ones.iter())
+            .map(|(mk_poly, mk_minus_one)| poly_mul(mk_poly, mk_minus_one, self.modulus))
+            .collect();
+
+        // Compute H_bin(X) = Σᵢ γⁱ · MK_i(X) · (MK_i(X) - 1)
+        let mut h_bin = vec![0u64];
+        let mut gamma_power = 1u64;
+
+        for constraint_poly in &constraint_polys {
             // Scale by γⁱ
-            let scaled = poly_scale(&constraint_poly, gamma_power, self.modulus);
+            let scaled = poly_scale(constraint_poly, gamma_power, self.modulus);
 
             // Add to H_bin
             h_bin = poly_add(&h_bin, &scaled, self.modulus);
@@ -2353,6 +2427,150 @@ impl<const R: usize> JVProver<R> {
 
         // Compute quotient Q_bin(X) = H_bin(X) / Z(X)
         let (quotient_coeffs, _remainder) = poly_div(&h_bin, z_poly, self.modulus);
+
+        Ok(MKBinaryProofMessage { quotient_coeffs })
+    }
+
+    /// Async version of prove_mk_binary for WASM (uses non-blocking GPU operations).
+    #[cfg(feature = "gpu")]
+    pub async fn prove_mk_binary_async(&self, gamma: u64) -> Result<MKBinaryProofMessage, JVProverError> {
+        let _eval_points = self.eval_points.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        if self.mk_polynomials.is_empty() {
+            return Err(JVProverError::MissingSetupData);
+        }
+
+        // Prepare MK_i(X) - 1 polynomials
+        let mk_minus_ones: Vec<Vec<u64>> = self.mk_polynomials.iter().map(|mk_poly| {
+            let mut mk_minus_one = mk_poly.clone();
+            if mk_minus_one.is_empty() {
+                mk_minus_one.push(self.modulus - 1);
+            } else {
+                mk_minus_one[0] = if mk_minus_one[0] == 0 {
+                    self.modulus - 1
+                } else {
+                    mk_minus_one[0] - 1
+                };
+            }
+            mk_minus_one
+        }).collect();
+
+        // Compute all constraint polynomials: MK_i(X) · (MK_i(X) - 1)
+        // Always use GPU path
+        let ntt_gpu = self.ntt_gpu.as_ref()
+            .expect("[prove_mk_binary_async] NTT GPU context not set!");
+
+        let pairs: Vec<(&[u64], &[u64])> = self.mk_polynomials.iter()
+            .zip(mk_minus_ones.iter())
+            .map(|(a, b)| (a.as_slice(), b.as_slice()))
+            .collect();
+
+        // DEBUG: Check input polynomials and compare GPU vs CPU for a nonzero pair
+        #[cfg(target_arch = "wasm32")]
+        {
+            // Find first nonzero MK polynomial
+            let mut first_nonzero_idx = None;
+            for (i, mk) in self.mk_polynomials.iter().enumerate() {
+                let nz = mk.iter().filter(|&&x| x != 0).count();
+                if nz > 0 {
+                    first_nonzero_idx = Some(i);
+                    web_sys::console::log_1(&format!(
+                        "[prove_mk_binary] First nonzero MK at index {}, {} nonzero coeffs",
+                        i, nz
+                    ).into());
+                    break;
+                }
+            }
+            if let Some(idx) = first_nonzero_idx {
+                let (a, b) = pairs[idx];
+                let cpu_result = poly_mul(a, b, self.modulus);
+                let cpu_nz = cpu_result.iter().filter(|&&x| x != 0).count();
+                web_sys::console::log_1(&format!(
+                    "[prove_mk_binary] For idx {}: a.len={}, b.len={}, CPU result has {} nonzero coeffs",
+                    idx, a.len(), b.len(), cpu_nz
+                ).into());
+            }
+        }
+
+        let constraint_polys: Vec<Vec<u64>> = ntt_gpu.batched_poly_mul_async(&pairs).await
+            .expect("[prove_mk_binary_async] GPU poly_mul FAILED");
+
+        // DEBUG: Compare GPU vs CPU for the first nonzero pair
+        #[cfg(target_arch = "wasm32")]
+        {
+            for (i, mk) in self.mk_polynomials.iter().enumerate() {
+                let nz = mk.iter().filter(|&&x| x != 0).count();
+                if nz > 0 {
+                    let (a, b) = pairs[i];
+                    let cpu_result = poly_mul(a, b, self.modulus);
+                    let gpu_result = &constraint_polys[i];
+                    let cpu_nz = cpu_result.iter().filter(|&&x| x != 0).count();
+                    let gpu_nz = gpu_result.iter().filter(|&&x| x != 0).count();
+                    web_sys::console::log_1(&format!(
+                        "[prove_mk_binary] idx {} GPU vs CPU: cpu_nz={}, gpu_nz={}, match={}",
+                        i, cpu_nz, gpu_nz,
+                        cpu_result == *gpu_result
+                    ).into());
+                    break;
+                }
+            }
+        }
+
+        // DEBUG: Check if constraint_polys are all zeros
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut all_zero_count = 0;
+            let mut nonzero_count = 0;
+            for (i, cpoly) in constraint_polys.iter().enumerate() {
+                let nonzero = cpoly.iter().filter(|&&x| x != 0).count();
+                if nonzero == 0 {
+                    all_zero_count += 1;
+                } else {
+                    nonzero_count += 1;
+                    if nonzero_count <= 3 {
+                        web_sys::console::log_1(&format!(
+                            "[prove_mk_binary] constraint_poly[{}] has {} nonzero coeffs, first few: {:?}",
+                            i, nonzero, &cpoly[..5.min(cpoly.len())]
+                        ).into());
+                    }
+                }
+            }
+            web_sys::console::log_1(&format!(
+                "[prove_mk_binary] {} constraint polys are all-zero, {} have nonzero coeffs",
+                all_zero_count, nonzero_count
+            ).into());
+        }
+
+        // Compute H_bin(X) = Σᵢ γⁱ · MK_i(X) · (MK_i(X) - 1)
+        let mut h_bin = vec![0u64];
+        let mut gamma_power = 1u64;
+
+        for constraint_poly in &constraint_polys {
+            let scaled = poly_scale(constraint_poly, gamma_power, self.modulus);
+            h_bin = poly_add(&h_bin, &scaled, self.modulus);
+            gamma_power = ((gamma_power as u128 * gamma as u128) % self.modulus as u128) as u64;
+        }
+
+        let z_poly = self.vanishing_poly.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        let (quotient_coeffs, remainder) = poly_div(&h_bin, z_poly, self.modulus);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let h_bin_nonzero: Vec<_> = h_bin.iter().filter(|&&x| x != 0).collect();
+            let remainder_nonzero: Vec<_> = remainder.iter().filter(|&&x| x != 0).collect();
+            web_sys::console::log_1(&format!(
+                "[prove_mk_binary] h_bin.len={}, h_bin nonzero={}, z_poly.len={}, quotient.len={}, remainder nonzero={}",
+                h_bin.len(), h_bin_nonzero.len(), z_poly.len(), quotient_coeffs.len(), remainder_nonzero.len()
+            ).into());
+            if !quotient_coeffs.is_empty() {
+                web_sys::console::log_1(&format!(
+                    "[prove_mk_binary] quotient[0]={}", quotient_coeffs[0]
+                ).into());
+            }
+        }
 
         Ok(MKBinaryProofMessage { quotient_coeffs })
     }
@@ -2520,6 +2738,105 @@ impl<const R: usize> JVProver<R> {
         })
     }
 
+    /// Async version of open for WASM (uses non-blocking GPU operations).
+    #[cfg(feature = "gpu")]
+    pub async fn open_async(
+        &mut self,
+        rho: u64,
+        gamma: u64,
+        topology_vectors: &[TopologyVector],
+    ) -> Result<JVOpenMessage, JVProverError> {
+        #[cfg(target_arch = "wasm32")]
+        let perf = web_sys::window().unwrap().performance().unwrap();
+
+        if self.phase != JVProverPhase::Disclosed {
+            return Err(JVProverError::InvalidPhase);
+        }
+
+        let _eval_points = self.eval_points.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        if self.mk_polynomials.is_empty() || topology_vectors.is_empty() {
+            return Err(JVProverError::MissingSetupData);
+        }
+
+        // Generate MK binary proof using async GPU
+        #[cfg(target_arch = "wasm32")]
+        let mk_binary_start = perf.now();
+        let mk_binary_proof = self.prove_mk_binary_async(gamma).await?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_mk_binary_ms += perf.now() - mk_binary_start;
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        let mk_sum_start = perf.now();
+        let mk_sum_proof = self.prove_mk_sum()?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_mk_sum_ms += perf.now() - mk_sum_start;
+        }
+
+        // Compute universal hashes h_i for each topology vector
+        let universal_hashes: Vec<u64> = topology_vectors
+            .iter()
+            .map(|tv| {
+                let tv_values = tv.coeffs();
+                let mut rho_power = 1u128;
+                let mut hash = 0u128;
+                for &val in tv_values {
+                    hash = (hash + rho_power * val as u128) % self.modulus as u128;
+                    rho_power = (rho_power * rho as u128) % self.modulus as u128;
+                }
+                hash as u64
+            })
+            .collect();
+
+        #[cfg(target_arch = "wasm32")]
+        let open_poly_start = perf.now();
+
+        let mut h_hash = vec![0u64];
+
+        for (i, mk_poly) in self.mk_polynomials.iter().enumerate() {
+            if i < universal_hashes.len() {
+                let scaled = poly_scale(mk_poly, universal_hashes[i], self.modulus);
+                h_hash = poly_add(&h_hash, &scaled, self.modulus);
+            }
+        }
+
+        let z_poly = self.vanishing_poly.as_ref()
+            .ok_or(JVProverError::MissingSetupData)?;
+
+        let (quotient_coeffs, _remainder) = poly_div(&h_hash, z_poly, self.modulus);
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_open_polynomial_ms += perf.now() - open_poly_start;
+        }
+
+        let mut mk_mac_values = Vec::with_capacity(self.mk_itpac_commitments.len());
+        let mut mk_mac_tags = Vec::with_capacity(self.mk_itpac_commitments.len());
+
+        for itpac in &self.mk_itpac_commitments {
+            let mac_value: u64 = itpac.mac().prover_share().value().into();
+            mk_mac_values.push(mac_value);
+            mk_mac_tags.push(itpac.mac().prover_share().mac());
+        }
+
+        self.phase = JVProverPhase::Opened;
+
+        Ok(JVOpenMessage {
+            mk_binary_proof,
+            mk_sum_proof,
+            mk_hash_proof: MKHashProofMessage {
+                quotient_coeffs,
+                mk_mac_values,
+                mk_mac_tags,
+            },
+            mk_polynomials: self.mk_polynomials.clone(),
+        })
+    }
+
     /// Computes F_Com commitment (hash) of a ciphertext using blake3.
     ///
     /// F_Com is a binding commitment scheme - given a commitment c, it is
@@ -2599,7 +2916,7 @@ impl<const R: usize> JVProver<R> {
         }
 
         // Compute topology products: O(R) values instead of O(RC)
-        let mut topology_products = Vec::with_capacity(R);
+        let mut topology_products = Vec::with_capacity(self.r);
         for (j, witness) in self.witnesses.iter().enumerate() {
             let active_tv = &topology_vectors[self.active_branches[j]];
             let w = witness.to_vec();
@@ -3003,7 +3320,7 @@ impl<const R: usize> JVProver<R> {
         }
 
         if self.modulus == GOLDILOCKS {
-            let n = R.next_power_of_two();
+            let n = self.r.next_power_of_two();
             let log_n = n.trailing_zeros();
             let omega = Goldilocks::primitive_root_of_unity(log_n).expect("R too large for NTT");
             let mut points = Vec::with_capacity(n);
@@ -3015,7 +3332,7 @@ impl<const R: usize> JVProver<R> {
             return points;
         }
 
-        (1..=R as u64).collect()
+        (1..=self.r as u64).collect()
     }
 
     fn interpolate_values(&self, values: &[u64], eval_points: &[u64]) -> Vec<u64> {
@@ -3056,7 +3373,9 @@ impl<const R: usize> JVProver<R> {
 
 /// Optimized JustVengers verifier.
 #[derive(Clone, Debug)]
-pub struct JVVerifier<const R: usize> {
+pub struct JVVerifier {
+    /// Number of repetitions (runtime value, was const generic R).
+    r: usize,
     /// Secret evaluation point Λ.
     lambda: u64,
     /// IT-MAC global key Δ.
@@ -3145,9 +3464,9 @@ pub enum JVVerifierPhase {
     Done(bool),
 }
 
-impl<const R: usize> JVVerifier<R> {
+impl JVVerifier {
     /// Creates a new verifier with random secrets.
-    pub fn new<Rn: Rng>(modulus: u64, rng: &mut Rn) -> Self {
+    pub fn new<Rn: Rng>(r: usize, modulus: u64, rng: &mut Rn) -> Self {
         // Generate random AHE seed
         let mut ahe_seed = [0u8; 32];
         rng.fill(&mut ahe_seed);
@@ -3162,6 +3481,7 @@ impl<const R: usize> JVVerifier<R> {
         let ahe_keypair = KeyPair::generate(&ahe_params, &mut ahe_rng);
 
         Self {
+            r,
             lambda: rng.random_range(1..modulus),
             global_key: GlobalKey::generate(rng),
             ahe_keypair: Some(ahe_keypair),
@@ -3253,7 +3573,7 @@ impl<const R: usize> JVVerifier<R> {
 
         // Generate evaluation points
         let eval_points: Vec<u64> = if self.modulus == GOLDILOCKS {
-            let n = R.next_power_of_two();
+            let n = self.r.next_power_of_two();
             let log_n = n.trailing_zeros();
             let omega = Goldilocks::primitive_root_of_unity(log_n).expect("R too large for NTT");
             let mut points = Vec::with_capacity(n);
@@ -3264,7 +3584,7 @@ impl<const R: usize> JVVerifier<R> {
             }
             points
         } else {
-            (1..=R as u64).collect()
+            (1..=self.r as u64).collect()
         };
 
         self.eval_points = Some(eval_points.clone());
@@ -3272,9 +3592,9 @@ impl<const R: usize> JVVerifier<R> {
         // max_degree for polynomial evaluation
         // With NTT, polynomials are padded to next_power_of_two(R) coefficients
         let max_degree = if self.modulus == GOLDILOCKS {
-            R.next_power_of_two() - 1
+            self.r.next_power_of_two() - 1
         } else {
-            R - 1
+            self.r - 1
         };
 
         let ahe_keypair = self.ahe_keypair.as_ref().expect("AHE keypair should be initialized");
@@ -3294,9 +3614,9 @@ impl<const R: usize> JVVerifier<R> {
         // For R ≤ slot_count: single chunk with [Λ^0, ..., Λ^{n-1}]
         // For R > slot_count: multiple chunks covering all needed powers
         let total_powers = if self.modulus == GOLDILOCKS {
-            R.next_power_of_two()
+            self.r.next_power_of_two()
         } else {
-            R
+            self.r
         };
         let packed_powers_chunks = PackedEncryptedPowers::generate_chunks(
             &rns_keypair.pk,
@@ -3342,10 +3662,10 @@ impl<const R: usize> JVVerifier<R> {
         }
 
         // Use the same eval_points as the main protocol (NTT roots for Goldilocks)
-        let eval_points = self.eval_points.clone().unwrap_or_else(|| (1..=R as u64).collect());
+        let eval_points = self.eval_points.clone().unwrap_or_else(|| (1..=self.r as u64).collect());
 
         let mut soldering = SolderingVerifier::new(self.modulus);
-        soldering.setup(constraints, eval_points, R);
+        soldering.setup(constraints, eval_points, self.r);
         self.soldering_verifier = Some(soldering);
 
         Ok(())
@@ -3398,7 +3718,7 @@ impl<const R: usize> JVVerifier<R> {
         }
 
         // Verify disclosure has correct number of topology products
-        if disclosure.topology_products.len() != R {
+        if disclosure.topology_products.len() != self.r {
             return Err(JVVerifierError::InvalidDisclosure);
         }
 
@@ -3461,17 +3781,26 @@ impl<const R: usize> JVVerifier<R> {
         let mk_polynomials = &open_msg.mk_polynomials;
 
         // Verify MK binary constraint: all MK_i values are 0 or 1
-        if !self.verify_mk_binary_proof(&open_msg.mk_binary_proof, gamma, mk_polynomials) {
+        let binary_ok = self.verify_mk_binary_proof(&open_msg.mk_binary_proof, gamma, mk_polynomials);
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&format!("[receive_open] verify_mk_binary_proof: {}", binary_ok).into());
+        if !binary_ok {
             return Ok(false);
         }
 
         // Verify MK sum constraint: exactly one MK_i = 1 per evaluation point
-        if !self.verify_mk_sum_proof(&open_msg.mk_sum_proof, mk_polynomials) {
+        let sum_ok = self.verify_mk_sum_proof(&open_msg.mk_sum_proof, mk_polynomials);
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&format!("[receive_open] verify_mk_sum_proof: {}", sum_ok).into());
+        if !sum_ok {
             return Ok(false);
         }
 
         // Verify MK IT-MAC consistency
-        if !self.verify_mk_itpac_opening(&open_msg.mk_hash_proof, mk_polynomials) {
+        let itpac_ok = self.verify_mk_itpac_opening(&open_msg.mk_hash_proof, mk_polynomials);
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&format!("[receive_open] verify_mk_itpac_opening: {}", itpac_ok).into());
+        if !itpac_ok {
             return Ok(false);
         }
 
@@ -3826,7 +4155,8 @@ impl<const R: usize> JVVerifier<R> {
 
         // Check quotient has expected degree (≤ 2R-2 for H of degree 2(R-1), Z of degree R)
         // After division, quotient degree is at most R-2
-        let max_quotient_len = 2 * R;
+        let max_quotient_len = 2 * self.r;
+
         if proof.quotient_coeffs.len() > max_quotient_len {
             self.phase = JVVerifierPhase::Done(false);
             return Ok(false);
@@ -4111,7 +4441,7 @@ impl<const R: usize> JVVerifier<R> {
 
         // Compute Z(Λ) = Π(Λ - αⱼ) over actual R points
         // (MK constraints only hold at first R points, not NTT-padded ones)
-        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
+        let actual_eval_points = &eval_points[..self.r.min(eval_points.len())];
         let mut z_lambda = 1u128;
         for &alpha in actual_eval_points {
             let diff = if self.lambda >= alpha {
@@ -4127,6 +4457,19 @@ impl<const R: usize> JVVerifier<R> {
 
         // Verify H_bin(Λ) = Z(Λ) · Q_bin(Λ)
         let z_times_q = (z_lambda * q_lambda as u128) % self.modulus as u128;
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::console::log_1(&format!(
+                "[verify_mk_binary] h_bin_lambda={}, z_lambda={}, q_lambda={}, z*q={}",
+                h_bin_lambda, z_lambda, q_lambda, z_times_q
+            ).into());
+            web_sys::console::log_1(&format!(
+                "[verify_mk_binary] quotient_coeffs.len={}, R={}, eval_points.len={}",
+                proof.quotient_coeffs.len(), self.r, eval_points.len()
+            ).into());
+        }
+
         h_bin_lambda == z_times_q
     }
 
@@ -4165,7 +4508,7 @@ impl<const R: usize> JVVerifier<R> {
 
         // Compute Z(Λ) = Π(Λ - αⱼ) over actual R points
         // (MK constraints only hold at first R points, not NTT-padded ones)
-        let actual_eval_points = &eval_points[..R.min(eval_points.len())];
+        let actual_eval_points = &eval_points[..self.r.min(eval_points.len())];
         let mut z_lambda = 1u128;
         for &alpha in actual_eval_points {
             let diff = if self.lambda >= alpha {
@@ -4471,12 +4814,12 @@ pub(crate) fn poly_scale(a: &[u64], scalar: u64, modulus: u64) -> Vec<u64> {
 pub(crate) fn compute_vanishing_poly(eval_points: &[u64], modulus: u64) -> Vec<u64> {
     let r = eval_points.len();
 
-    // Fast path for Goldilocks NTT roots: Z(X) = X^R - 1
+    // Fast path for Goldilocks NTT roots: Z(X) = X^self.r - 1
     // This works when eval_points are ω^0, ω^1, ..., ω^{R-1} (roots of unity)
     if modulus == GOLDILOCKS && r.is_power_of_two() {
         // Check if these are NTT roots (first point should be 1 = ω^0)
         if eval_points.first() == Some(&1) {
-            // Z(X) = X^R - 1 = -1 + 0*X + 0*X² + ... + 1*X^R
+            // Z(X) = X^self.r - 1 = -1 + 0*X + 0*X² + ... + 1*X^R
             let mut z = vec![0u64; r + 1];
             z[0] = modulus - 1; // -1 mod p
             z[r] = 1;           // X^R coefficient
@@ -4703,7 +5046,7 @@ pub fn extract_verifier_shares_from_pool(
 ///
 /// This achieves O(R+B+C) communication instead of O(RC).
 #[cfg(not(target_arch = "wasm32"))]
-pub fn run_jv_protocol<const R: usize>(
+pub fn run_jv_protocol(
     circuits: &CircuitBatch,
     active_branches: &[usize],
     inputs_per_rep: &[Vec<u64>],
@@ -4713,18 +5056,19 @@ pub fn run_jv_protocol<const R: usize>(
     use rand::SeedableRng;
     let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
 
-    if inputs_per_rep.len() != R || active_branches.len() != R {
+    let r = active_branches.len();
+    if inputs_per_rep.len() != r {
         return Err(JVProtocolError::InvalidInputs);
     }
 
     // Initialize prover
-    let mut prover = JVProver::<R>::new(active_branches.to_vec(), modulus);
+    let mut prover = JVProver::new(active_branches.to_vec(), modulus);
     prover.setup(circuits, inputs_per_rep).map_err(|_| JVProtocolError::ProverError)?;
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng)
         .map_err(|_| JVProtocolError::SolderingError)?;
 
     // Initialize verifier
-    let mut verifier = JVVerifier::<R>::new(modulus, &mut rng);
+    let mut verifier = JVVerifier::new(r, modulus, &mut rng);
     let setup_msg = verifier.setup(circuits, &mut rng).map_err(|_| JVProtocolError::VerifierError)?;
     verifier.setup_soldering(soldering_constraints.to_vec())
         .map_err(|_| JVProtocolError::VerifierError)?;
@@ -4839,7 +5183,7 @@ pub fn run_jv_protocol<const R: usize>(
 
 /// WASM async version (same logic but awaits GPU calls)
 #[cfg(target_arch = "wasm32")]
-pub async fn run_jv_protocol<const R: usize>(
+pub async fn run_jv_protocol(
     circuits: &CircuitBatch,
     active_branches: &[usize],
     inputs_per_rep: &[Vec<u64>],
@@ -4849,15 +5193,16 @@ pub async fn run_jv_protocol<const R: usize>(
     use rand::SeedableRng;
     let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
 
-    if inputs_per_rep.len() != R || active_branches.len() != R {
+    let r = active_branches.len();
+    if inputs_per_rep.len() != r {
         return Err(JVProtocolError::InvalidInputs);
     }
 
-    let mut prover = JVProver::<R>::new(active_branches.to_vec(), modulus);
+    let mut prover = JVProver::new(active_branches.to_vec(), modulus);
     prover.setup(circuits, inputs_per_rep).map_err(|_| JVProtocolError::ProverError)?;
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).map_err(|_| JVProtocolError::ProverError)?;
 
-    let mut verifier = JVVerifier::<R>::new(modulus, &mut rng);
+    let mut verifier = JVVerifier::new(r, modulus, &mut rng);
     let setup_msg = verifier.setup(circuits, &mut rng).map_err(|_| JVProtocolError::VerifierError)?;
     verifier.setup_soldering(soldering_constraints.to_vec()).map_err(|_| JVProtocolError::VerifierError)?;
 
@@ -4947,7 +5292,8 @@ pub enum JVProtocolError {
 // ============================================================================
 
 /// Estimates communication size for Batchman (O(RC)) vs JustVengers (O(R+B+C)).
-pub fn estimate_communication<const R: usize>(
+pub fn estimate_communication(
+    r: usize,
     circuit_size: usize,
     num_branches: usize,
     num_mults: usize,
@@ -4955,19 +5301,19 @@ pub fn estimate_communication<const R: usize>(
     let field_element_bytes = 8; // u64
 
     // Batchman: O(RC) in disclosure
-    let batchman_disclosure = R * circuit_size * field_element_bytes;
-    let batchman_total = R * field_element_bytes  // setup
+    let batchman_disclosure = r * circuit_size * field_element_bytes;
+    let batchman_total = r * field_element_bytes  // setup
         + circuit_size * field_element_bytes      // commitment
         + batchman_disclosure                      // disclosure (O(RC))
-        + (R + num_branches) * field_element_bytes // open
+        + (r + num_branches) * field_element_bytes // open
         + num_mults * 2 * field_element_bytes;     // LPZK
 
     // JustVengers: O(R+C) in disclosure
-    let jv_disclosure = R * field_element_bytes + field_element_bytes; // topology_products + aggregated
-    let jv_total = R * field_element_bytes        // setup
+    let jv_disclosure = r * field_element_bytes + field_element_bytes; // topology_products + aggregated
+    let jv_total = r * field_element_bytes        // setup
         + circuit_size * field_element_bytes      // commitment (same)
         + jv_disclosure                           // disclosure (O(R) instead of O(RC)!)
-        + (R + num_branches + R) * field_element_bytes // open (+ VP coeffs)
+        + (r + num_branches + r) * field_element_bytes // open (+ VP coeffs)
         + num_mults * 2 * field_element_bytes;     // LPZK
 
     CommunicationEstimate {

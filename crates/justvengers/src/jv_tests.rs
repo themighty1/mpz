@@ -18,7 +18,7 @@ fn test_jv_prover_setup() {
 
     let batch = CircuitBatch::new(vec![circuit]);
 
-    let mut prover = JVProver::<2>::new(vec![0, 0], TEST_MODULUS);
+    let mut prover = JVProver::new(vec![0, 0], TEST_MODULUS);
     let inputs = vec![vec![3, 4], vec![5, 6]];
 
     prover.setup(&batch, &inputs).unwrap();
@@ -115,11 +115,11 @@ fn test_itmac_opening_verification() {
     let batch = CircuitBatch::new(vec![circuit]);
 
     // Setup prover and verifier
-    let mut prover = JVProver::<2>::new(vec![0, 0], GOLDILOCKS);
+    let mut prover = JVProver::new(vec![0, 0], GOLDILOCKS);
     prover.setup(&batch, &[vec![3, 4], vec![5, 6]]).unwrap();
     prover.setup_soldering(vec![], &mut rng).unwrap();
 
-    let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
+    let mut verifier = JVVerifier::new(2, GOLDILOCKS, &mut rng);
     let setup_msg = verifier.setup(&batch, &mut rng).unwrap();
 
     // Create VOLE pool
@@ -164,11 +164,11 @@ fn test_itmac_verification_fails_on_tampered_tag() {
     let batch = CircuitBatch::new(vec![circuit]);
 
     // Setup
-    let mut prover = JVProver::<2>::new(vec![0, 0], GOLDILOCKS);
+    let mut prover = JVProver::new(vec![0, 0], GOLDILOCKS);
     prover.setup(&batch, &[vec![3, 4], vec![5, 6]]).unwrap();
     prover.setup_soldering(vec![], &mut rng).unwrap();
 
-    let mut verifier = JVVerifier::<2>::new(GOLDILOCKS, &mut rng);
+    let mut verifier = JVVerifier::new(2, GOLDILOCKS, &mut rng);
     let setup_msg = verifier.setup(&batch, &mut rng).unwrap();
 
     // Create VOLE pool and extract shares
@@ -340,14 +340,14 @@ fn test_jv_protocol_with_disk_keys() {
     println!("\n[P] Initializing prover...");
     let mut rng = mpz_core::prg::Prg::from_seed(mpz_core::Block::ZERO);
 
-    let mut prover = JVProver::<R>::new(branches.clone(), GOLDILOCKS);
+    let mut prover = JVProver::new(branches.clone(), GOLDILOCKS);
     prover.setup(&batch, &inputs).expect("Prover setup failed");
     prover.setup_soldering(vec![constraint.clone()], &mut rng).expect("Soldering setup failed");
 
     // ========== Initialize Verifier ==========
     println!("[V] Initializing verifier...");
 
-    let mut verifier = JVVerifier::<R>::new(GOLDILOCKS, &mut rng);
+    let mut verifier = JVVerifier::new(R, GOLDILOCKS, &mut rng);
     let setup_msg = verifier.setup(&batch, &mut rng)
         .expect("Verifier setup failed");
     verifier.setup_soldering(vec![constraint]).expect("Verifier soldering setup failed");

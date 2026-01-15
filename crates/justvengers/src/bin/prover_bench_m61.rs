@@ -141,7 +141,7 @@ fn run_prover_only<const R: usize>(
     // Setup prover once
     eprintln!("Setting up prover...");
     let setup_start = Instant::now();
-    let mut base_prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    let mut base_prover = JVProver::new(active_branches.to_vec(), MODULUS);
     base_prover.setup(circuits, inputs_per_rep).unwrap();
     base_prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
     eprintln!("Setup done in {:.2} ms", setup_start.elapsed().as_secs_f64() * 1000.0);

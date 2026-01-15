@@ -160,25 +160,26 @@ fn generate_vm_inputs_per_rep(num_repetitions: usize) -> (Vec<Vec<u64>>, Vec<usi
 
 /// Records JV verifier messages for replay benchmarking with IT-PAC.
 #[cfg(target_arch = "wasm32")]
-async fn jv_record_verifier_messages<const R: usize>(
+async fn jv_record_verifier_messages(
     circuits: &CircuitBatch,
     active_branches: &[usize],
     inputs_per_rep: &[Vec<u64>],
     soldering_constraints: &[SolderingConstraint],
 ) -> JVRecordedMessages {
+    let r = active_branches.len();
     web_sys::console::log_1(&"[jv_record] Starting verifier message recording...".into());
     let mut rng = Prg::from_seed(Block::ZERO);
 
     // Use JVProver with IT-PAC
     web_sys::console::log_1(&"[jv_record] Creating prover...".into());
-    let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    let mut prover = JVProver::new(active_branches.to_vec(), MODULUS);
     web_sys::console::log_1(&"[jv_record] Setting up prover...".into());
     prover.setup(circuits, inputs_per_rep).unwrap();
     web_sys::console::log_1(&"[jv_record] Setting up soldering...".into());
     prover.setup_soldering(soldering_constraints.to_vec(), &mut rng).unwrap();
 
     web_sys::console::log_1(&"[jv_record] Creating verifier...".into());
-    let mut verifier = JVVerifier::<R>::new(MODULUS, &mut rng);
+    let mut verifier = JVVerifier::new(r, MODULUS, &mut rng);
     web_sys::console::log_1(&"[jv_record] Verifier setup...".into());
     let setup_msg = verifier.setup(circuits, &mut rng).unwrap();
     web_sys::console::log_1(&"[jv_record] Verifier setup soldering...".into());
@@ -196,10 +197,18 @@ async fn jv_record_verifier_messages<const R: usize>(
     let verifier_shares = extract_verifier_shares_from_pool(&vole_pool, circuit_size * 2);
     verifier.set_verifier_local_keys(verifier_shares);
 
-    // Pre-initialize GPU context (async in WASM) - MUST succeed (GPU is only path)
+    // Pre-initialize GPU context for slot operations (async in WASM)
     web_sys::console::log_1(&"[jv_record] Preparing GPU context...".into());
     prover.prepare_gpu_async(&setup_msg).await.expect("[jv_vm] GPU init failed - GPU is the only supported path");
     web_sys::console::log_1(&"[jv_record] GPU context ready".into());
+
+    // Pre-initialize NTT GPU context for polynomial multiplication
+    web_sys::console::log_1(&"[jv_record] Preparing NTT GPU context...".into());
+    let ntt_size = (2 * r).next_power_of_two().max(1024).min(2048);
+    let ntt_gpu = bgv_webgpu::GoldilocksNttGpu::new_async(ntt_size).await
+        .expect("[jv_record] NTT GPU init failed");
+    prover.set_ntt_gpu_context(std::sync::Arc::new(ntt_gpu));
+    web_sys::console::log_1(&"[jv_record] NTT GPU context ready".into());
 
     // P → V: CommitmentMessage (IT-PAC ciphertexts)
     web_sys::console::log_1(&"[jv_record] Prover commit (IT-PAC)...".into());
@@ -245,11 +254,13 @@ async fn jv_record_verifier_messages<const R: usize>(
     let rho = verifier.receive_disclosure(disclosure, &mut rng).unwrap();
     let gamma = verifier.generate_lpzk_challenge(&mut rng);
 
-    // P → V: OpenMessage
-    web_sys::console::log_1(&"[jv_record] Prover open...".into());
-    let open_msg = prover.open(rho, gamma, verifier.topology_vectors()).unwrap();
+    // P → V: OpenMessage (GPU async path)
+    web_sys::console::log_1(&"[jv_record] Prover open (GPU)...".into());
+    let open_msg = prover.open_async(rho, gamma, verifier.topology_vectors()).await.unwrap();
     web_sys::console::log_1(&"[jv_record] Verifier receive open...".into());
-    verifier.receive_open(open_msg, gamma).unwrap();
+    let receive_open_result = verifier.receive_open(open_msg, gamma).unwrap();
+    web_sys::console::log_1(&format!("[jv_record] receive_open result: {}", receive_open_result).into());
+    assert!(receive_open_result, "receive_open failed - MK proof verification failed (GPU poly_mul may be incorrect)");
 
     // P → V: IT-PAC Opening
     web_sys::console::log_1(&"[jv_record] Prover open IT-PAC...".into());
@@ -345,20 +356,21 @@ impl TimingBreakdown {
 /// Runs a single prover iteration with fresh witness setup.
 /// Returns (gpu_time_ms, TimingBreakdown with all timing fields)
 #[cfg(target_arch = "wasm32")]
-async fn run_prover_iteration<const R: usize>(
+async fn run_prover_iteration(
     circuits: &CircuitBatch,
     active_branches: &[usize],
     inputs_per_rep: &[Vec<u64>],
     soldering_constraints: &[SolderingConstraint],
     recorded: &JVRecordedMessages,
     gpu_ctx: &std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>,
+    ntt_gpu_ctx: &std::sync::Arc<bgv_webgpu::GoldilocksNttGpu>,
 ) -> (f64, TimingBreakdown) {
     let performance = web_sys::window().unwrap().performance().unwrap();
     let mut rng = Prg::from_seed(Block::ZERO);
 
     // Fresh prover with fresh witness setup each iteration
     let prover_new_start = performance.now();
-    let mut prover = JVProver::<R>::new(active_branches.to_vec(), MODULUS);
+    let mut prover = JVProver::new(active_branches.to_vec(), MODULUS);
     let prover_new_ms = performance.now() - prover_new_start;
 
     let prover_setup_start = performance.now();
@@ -374,8 +386,9 @@ async fn run_prover_iteration<const R: usize>(
     let vole_pool = VolePool::generate(&recorded.global_key, recorded.circuit_size * 2, &mut rng);
     let vole_pool_ms = performance.now() - vole_start;
 
-    // Set pre-initialized GPU context (always present - GPU is only path)
+    // Set pre-initialized GPU contexts (always present - GPU is only path)
     prover.set_gpu_context(gpu_ctx.clone());
+    prover.set_ntt_gpu_context(ntt_gpu_ctx.clone());
 
     // P → V: CommitmentMessage (IT-PAC ciphertexts)
     let commit_start = performance.now();
@@ -403,7 +416,7 @@ async fn run_prover_iteration<const R: usize>(
     let reveal_soldering_call_ms = performance.now() - reveal_soldering_start;
 
     let open_start = performance.now();
-    let _open_msg = prover.open(recorded.rho, recorded.gamma, &recorded.topology_vectors).unwrap();
+    let _open_msg = prover.open_async(recorded.rho, recorded.gamma, &recorded.topology_vectors).await.unwrap();
     let open_call_ms = performance.now() - open_start;
 
     // IT-PAC opening
@@ -501,7 +514,7 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
             let (inputs, branches, _final_acc) = generate_vm_inputs_per_rep(R);
 
             // Record verifier messages (not timed) - async for GPU init
-            let recorded = jv_record_verifier_messages::<R>(
+            let recorded = jv_record_verifier_messages(
                 &circuits,
                 &branches,
                 &inputs,
@@ -512,11 +525,49 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
             let gpu_ctx = {
                 web_sys::console::log_1(&"[jv_vm] Pre-initializing GPU context...".into());
                 let gpu_start = performance.now();
-                let ctx = mpz_justvengers::JVProver::<1>::create_gpu_context_goldilocks(8192).await
+                let ctx = mpz_justvengers::JVProver::create_gpu_context_goldilocks(8192).await
                     .expect("[jv_vm] GPU context creation failed - GPU is the only supported path");
                 let elapsed = performance.now() - gpu_start;
                 web_sys::console::log_1(&format!("[jv_vm] GPU context created in {:.2}ms", elapsed).into());
                 ctx
+            };
+
+            // Test: create a dummy second GPU device to verify multiple devices work
+            {
+                web_sys::console::log_1(&"[jv_vm] Testing second GPU device creation...".into());
+                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::all(),
+                    ..Default::default()
+                });
+                let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                }).await.expect("Failed to get adapter");
+                let (_device2, _queue2) = adapter.request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: Some("test-device-2"),
+                        required_features: wgpu::Features::empty(),
+                        required_limits: wgpu::Limits::default(),
+                        memory_hints: wgpu::MemoryHints::Performance,
+                    },
+                    None,
+                ).await.expect("Failed to create second device");
+                web_sys::console::log_1(&"[jv_vm] Second GPU device created successfully!".into());
+            }
+
+            // Pre-initialize NTT GPU context for polynomial multiplication
+            // NTT is capped at 2048 due to GPU shared memory limits (16KB safe for browser WebGPU)
+            let ntt_gpu_ctx = {
+                web_sys::console::log_1(&"[jv_vm] Pre-initializing NTT GPU context...".into());
+                let ntt_start = performance.now();
+                let ntt_size = (2 * R).next_power_of_two().max(1024).min(2048);
+                let ctx = bgv_webgpu::GoldilocksNttGpu::new_async(ntt_size).await
+                    .expect("[jv_vm] NTT GPU context creation failed");
+                let elapsed = performance.now() - ntt_start;
+                let note = if (2 * R).next_power_of_two() > 2048 { " (capped)" } else { "" };
+                web_sys::console::log_1(&format!("[jv_vm] NTT GPU context (n={}) created in {:.2}ms{}", ntt_size, elapsed, note).into());
+                std::sync::Arc::new(ctx)
             };
 
             web_sys::console::log_1(
@@ -535,13 +586,14 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
                 let start = performance.now();
 
                 // Fresh prover with fresh witness each iteration
-                let (gpu_time, timing) = run_prover_iteration::<R>(
+                let (gpu_time, timing) = run_prover_iteration(
                     &circuits,
                     &branches,
                     &inputs,
                     &soldering,
                     &recorded,
                     &gpu_ctx,
+                    &ntt_gpu_ctx,
                 ).await;
 
                 total_elapsed_ms += performance.now() - start;
@@ -677,18 +729,234 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
     }
 
     match reps {
+        100 => run_bench!(100),
         1000 => run_bench!(1000),
         2000 => run_bench!(2000),
+        2048 => run_bench!(2048),
         3000 => run_bench!(3000),
+        4096 => run_bench!(4096),
         8192 => run_bench!(8192),
         16384 => run_bench!(16384),
         32768 => run_bench!(32768),
         65536 => run_bench!(65536),
         131072 => run_bench!(131072),
-        _ => Err(format!(
-            "Unsupported reps value: {}. Supported: 1000, 2000, 3000, 8192, 16384, 32768, 65536, 131072",
-            reps
-        )),
+        _ => {
+            // Validate reps <= 1024 (GPU NTT capped at 2048 due to shared memory limits)
+            // Polynomial multiplication needs 2*R coefficients, so max R = 1024
+            if reps > 1024 {
+                return Err(format!(
+                    "reps={} exceeds max 1024 (GPU NTT limited to 2048 elements due to 32KB shared memory limit, need 2*R for poly mul). Use multi-pass NTT for larger R.",
+                    reps
+                ));
+            }
+
+            // Runtime reps value (no const generic needed anymore)
+            let (inputs, branches, _final_acc) = generate_vm_inputs_per_rep(reps);
+
+            // Record verifier messages (not timed) - async for GPU init
+            let recorded = jv_record_verifier_messages(
+                &circuits,
+                &branches,
+                &inputs,
+                &soldering,
+            ).await;
+
+            // Pre-initialize GPU context once (not timed) - MUST succeed (GPU is only path)
+            let gpu_ctx = {
+                web_sys::console::log_1(&"[jv_vm] Pre-initializing GPU context...".into());
+                let gpu_start = performance.now();
+                let ctx = mpz_justvengers::JVProver::create_gpu_context_goldilocks(8192).await
+                    .expect("[jv_vm] GPU context creation failed - GPU is the only supported path");
+                let elapsed = performance.now() - gpu_start;
+                web_sys::console::log_1(&format!("[jv_vm] GPU context created in {:.2}ms", elapsed).into());
+                ctx
+            };
+
+            // Test: create a dummy second GPU device to verify multiple devices work
+            {
+                web_sys::console::log_1(&"[jv_vm] Testing second GPU device creation...".into());
+                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::all(),
+                    ..Default::default()
+                });
+                let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                }).await.expect("Failed to get adapter");
+                let (_device2, _queue2) = adapter.request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: Some("test-device-2"),
+                        required_features: wgpu::Features::empty(),
+                        required_limits: wgpu::Limits::default(),
+                        memory_hints: wgpu::MemoryHints::Performance,
+                    },
+                    None,
+                ).await.expect("Failed to create second device");
+                web_sys::console::log_1(&"[jv_vm] Second GPU device created successfully!".into());
+            }
+
+            // Pre-initialize NTT GPU context for polynomial multiplication
+            let ntt_gpu_ctx = {
+                web_sys::console::log_1(&"[jv_vm] Pre-initializing NTT GPU context...".into());
+                let ntt_start = performance.now();
+                let ntt_size = (2 * reps).next_power_of_two().max(1024).min(2048);
+                let ctx = bgv_webgpu::GoldilocksNttGpu::new_async(ntt_size).await
+                    .expect("[jv_vm] NTT GPU context creation failed");
+                let elapsed = performance.now() - ntt_start;
+                let note = if (2 * reps).next_power_of_two() > 2048 { " (capped)" } else { "" };
+                web_sys::console::log_1(&format!("[jv_vm] NTT GPU context (n={}) created in {:.2}ms{}", ntt_size, elapsed, note).into());
+                std::sync::Arc::new(ctx)
+            };
+
+            web_sys::console::log_1(
+                &format!(
+                    "[jv_vm] R={}, mults/circuit={}, starting {} iterations",
+                    reps, num_mults, n
+                )
+                .into(),
+            );
+
+            let mut total_elapsed_ms = 0.0;
+            let mut total_gpu_time_ms = 0.0;
+            let mut total_timing = TimingBreakdown::default();
+
+            for i in 0..n {
+                let start = performance.now();
+
+                let (gpu_time, timing) = run_prover_iteration(
+                    &circuits,
+                    &branches,
+                    &inputs,
+                    &soldering,
+                    &recorded,
+                    &gpu_ctx,
+                    &ntt_gpu_ctx,
+                ).await;
+
+                total_elapsed_ms += performance.now() - start;
+                total_gpu_time_ms += gpu_time;
+                total_timing.intt_ms += timing.intt_ms;
+                total_timing.collapse_ms += timing.collapse_ms;
+                total_timing.poly_div_ms += timing.poly_div_ms;
+                total_timing.open_ms += timing.open_ms;
+                total_timing.mk_poly_ms += timing.mk_poly_ms;
+                total_timing.itpac_ms += timing.itpac_ms;
+                total_timing.packing_ms += timing.packing_ms;
+                total_timing.setup_ms += timing.setup_ms;
+                total_timing.disclose_ms += timing.disclose_ms;
+                total_timing.commit_soldering_ms += timing.commit_soldering_ms;
+                total_timing.lpzk_accumulation_ms += timing.lpzk_accumulation_ms;
+                total_timing.reveal_soldering_ms += timing.reveal_soldering_ms;
+                total_timing.mk_binary_ms += timing.mk_binary_ms;
+                total_timing.mk_sum_ms += timing.mk_sum_ms;
+                total_timing.open_polynomial_ms += timing.open_polynomial_ms;
+                total_timing.mk_commit_vole_ms += timing.mk_commit_vole_ms;
+                total_timing.mk_commit_packing_ms += timing.mk_commit_packing_ms;
+                total_timing.vole_pool_ms += timing.vole_pool_ms;
+                total_timing.prover_new_ms += timing.prover_new_ms;
+                total_timing.prover_setup_ms += timing.prover_setup_ms;
+                total_timing.prover_setup_soldering_ms += timing.prover_setup_soldering_ms;
+                total_timing.commit_ms += timing.commit_ms;
+                total_timing.commit_mk_poly_ms += timing.commit_mk_poly_ms;
+                total_timing.commit_soldering_call_ms += timing.commit_soldering_call_ms;
+                total_timing.disclose_call_ms += timing.disclose_call_ms;
+                total_timing.reveal_soldering_call_ms += timing.reveal_soldering_call_ms;
+                total_timing.open_call_ms += timing.open_call_ms;
+                total_timing.open_itpac_ms += timing.open_itpac_ms;
+                total_timing.prove_mults_ms += timing.prove_mults_ms;
+
+                if (i + 1) % 10 == 0 {
+                    web_sys::console::log_1(
+                        &format!("[jv_vm] {} iterations done", i + 1).into(),
+                    );
+                }
+            }
+
+            let total_mults = n as u64 * reps as u64 * NUM_BRANCHES as u64 * num_mults as u64;
+
+            macro_rules! print_timing {
+                ($name:expr, $value:expr) => {
+                    web_sys::console::log_1(
+                        &format!(
+                            "[jv_vm]   {}: {:.2}ms ({:.1}%)",
+                            $name,
+                            $value,
+                            ($value / total_elapsed_ms) * 100.0
+                        )
+                        .into(),
+                    );
+                };
+            }
+
+            web_sys::console::log_1(
+                &format!(
+                    "[jv_vm] Done: {:.2}ms total, {:.2}ms/iter, {} total mults",
+                    total_elapsed_ms,
+                    total_elapsed_ms / n as f64,
+                    total_mults
+                )
+                .into(),
+            );
+            web_sys::console::log_1(
+                &format!(
+                    "[jv_vm] Total GPU time: {:.2}ms ({:.1}% of total time)",
+                    total_gpu_time_ms,
+                    (total_gpu_time_ms / total_elapsed_ms) * 100.0
+                )
+                .into(),
+            );
+
+            web_sys::console::log_1(&"[jv_vm] === Prover Internal Timing ===".into());
+            print_timing!("INTT (interpolation)", total_timing.intt_ms);
+            print_timing!("Collapse (CT addition)", total_timing.collapse_ms);
+            print_timing!("Poly division (LPZK)", total_timing.poly_div_ms);
+            print_timing!("Open (IT-PAC eval)", total_timing.open_ms);
+            print_timing!("MK poly (interpolation)", total_timing.mk_poly_ms);
+            print_timing!("IT-PAC creation", total_timing.itpac_ms);
+            print_timing!("Packing (2-way)", total_timing.packing_ms);
+            print_timing!("Setup (circuit eval)", total_timing.setup_ms);
+            print_timing!("Disclose (topology)", total_timing.disclose_ms);
+            print_timing!("Commit soldering", total_timing.commit_soldering_ms);
+            print_timing!("LPZK poly accumulation", total_timing.lpzk_accumulation_ms);
+            print_timing!("Reveal soldering", total_timing.reveal_soldering_ms);
+            print_timing!("MK binary eval", total_timing.mk_binary_ms);
+            print_timing!("MK sum", total_timing.mk_sum_ms);
+            print_timing!("Open polynomial", total_timing.open_polynomial_ms);
+            print_timing!("MK commit VOLE", total_timing.mk_commit_vole_ms);
+            print_timing!("MK commit packing", total_timing.mk_commit_packing_ms);
+
+            web_sys::console::log_1(&"[jv_vm] === Call-Level Timing (should sum to ~100%) ===".into());
+            print_timing!("VOLE pool generation", total_timing.vole_pool_ms);
+            print_timing!("Prover::new", total_timing.prover_new_ms);
+            print_timing!("Prover::setup", total_timing.prover_setup_ms);
+            print_timing!("Prover::setup_soldering", total_timing.prover_setup_soldering_ms);
+            print_timing!("Prover::commit", total_timing.commit_ms);
+            print_timing!("Prover::commit_mk_polynomials", total_timing.commit_mk_poly_ms);
+            print_timing!("Prover::commit_soldering", total_timing.commit_soldering_call_ms);
+            print_timing!("Prover::disclose", total_timing.disclose_call_ms);
+            print_timing!("Prover::reveal_soldering", total_timing.reveal_soldering_call_ms);
+            print_timing!("Prover::open", total_timing.open_call_ms);
+            print_timing!("Prover::open_itpac", total_timing.open_itpac_ms);
+            print_timing!("Prover::prove_multiplications", total_timing.prove_mults_ms);
+
+            let total_call_time = total_timing.vole_pool_ms + total_timing.prover_new_ms +
+                                  total_timing.prover_setup_ms + total_timing.prover_setup_soldering_ms +
+                                  total_timing.commit_ms + total_timing.commit_mk_poly_ms +
+                                  total_timing.commit_soldering_call_ms + total_timing.disclose_call_ms +
+                                  total_timing.reveal_soldering_call_ms + total_timing.open_call_ms +
+                                  total_timing.open_itpac_ms + total_timing.prove_mults_ms;
+            let loop_overhead = total_elapsed_ms - total_call_time;
+
+            web_sys::console::log_1(&"[jv_vm] === Summary ===".into());
+            print_timing!("Total call time", total_call_time);
+            print_timing!("Loop/other overhead", loop_overhead);
+
+            Ok(BenchResult {
+                elapsed_ms: total_elapsed_ms,
+                and_gates: total_mults,
+            })
+        },
     }
 }
 
@@ -735,7 +1003,7 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
             let (inputs, branches, _final_acc) = generate_vm_inputs_per_rep(R);
 
             // Record verifier messages (not timed) - WITH GPU async init
-            let recorded = jv_record_verifier_messages::<R>(
+            let recorded = jv_record_verifier_messages(
                 &circuits,
                 &branches,
                 &inputs,
@@ -746,11 +1014,26 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
             let gpu_ctx = {
                 web_sys::console::log_1(&"[jv_vm] Pre-initializing GPU context...".into());
                 let gpu_start = performance.now();
-                let ctx = mpz_justvengers::JVProver::<1>::create_gpu_context_goldilocks(8192).await
+                let ctx = mpz_justvengers::JVProver::create_gpu_context_goldilocks(8192).await
                     .expect("[jv_vm] GPU context creation failed - GPU is the only supported path");
                 let elapsed = performance.now() - gpu_start;
                 web_sys::console::log_1(&format!("[jv_vm] GPU context created in {:.2}ms", elapsed).into());
                 ctx
+            };
+
+            // Pre-initialize NTT GPU context for polynomial multiplication
+            // Uses a separate device (wgpu Device/Queue don't impl Clone, so can't share)
+            // NTT is capped at 2048 due to GPU shared memory limits (16KB safe for browser WebGPU)
+            let ntt_gpu_ctx = {
+                web_sys::console::log_1(&"[jv_vm] Pre-initializing NTT GPU context (new device)...".into());
+                let ntt_start = performance.now();
+                let ntt_size = (2 * R).next_power_of_two().max(1024).min(2048);
+                let ctx = bgv_webgpu::GoldilocksNttGpu::new_async(ntt_size).await
+                    .expect("[jv_vm] NTT GPU context creation failed");
+                let elapsed = performance.now() - ntt_start;
+                let note = if (2 * R).next_power_of_two() > 2048 { " (capped)" } else { "" };
+                web_sys::console::log_1(&format!("[jv_vm] NTT GPU context (n={}) created in {:.2}ms{}", ntt_size, elapsed, note).into());
+                std::sync::Arc::new(ctx)
             };
 
             web_sys::console::log_1(
@@ -769,13 +1052,14 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
                 let start = performance.now();
 
                 // Fresh prover with fresh witness each iteration - WITH GPU
-                let (gpu_time, timing) = run_prover_iteration::<R>(
+                let (gpu_time, timing) = run_prover_iteration(
                     &circuits,
                     &branches,
                     &inputs,
                     &soldering,
                     &recorded,
                     &gpu_ctx,
+                    &ntt_gpu_ctx,
                 ).await;
 
                 total_elapsed_ms += performance.now() - start;
@@ -911,18 +1195,210 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
     }
 
     match reps {
+        100 => run_bench!(100),
         1000 => run_bench!(1000),
         2000 => run_bench!(2000),
+        2048 => run_bench!(2048),
         3000 => run_bench!(3000),
+        4096 => run_bench!(4096),
         8192 => run_bench!(8192),
         16384 => run_bench!(16384),
         32768 => run_bench!(32768),
         65536 => run_bench!(65536),
         131072 => run_bench!(131072),
-        _ => Err(format!(
-            "Unsupported reps value: {}. Supported: 1000, 2000, 3000, 8192, 16384, 32768, 65536, 131072",
-            reps
-        )),
+        _ => {
+            // Validate reps <= 1024 (GPU NTT capped at 2048 due to shared memory limits)
+            // Polynomial multiplication needs 2*R coefficients, so max R = 1024
+            if reps > 1024 {
+                return Err(format!(
+                    "reps={} exceeds max 1024 (GPU NTT limited to 2048 elements due to 32KB shared memory limit, need 2*R for poly mul). Use multi-pass NTT for larger R.",
+                    reps
+                ));
+            }
+
+            // Runtime reps value (no const generic needed anymore)
+            let (inputs, branches, _final_acc) = generate_vm_inputs_per_rep(reps);
+
+            // Record verifier messages (not timed) - WITH GPU async init
+            let recorded = jv_record_verifier_messages(
+                &circuits,
+                &branches,
+                &inputs,
+                &soldering,
+            ).await;
+
+            // Pre-initialize GPU context once (not timed) - MUST succeed (GPU is only path)
+            let gpu_ctx = {
+                web_sys::console::log_1(&"[jv_vm] Pre-initializing GPU context...".into());
+                let gpu_start = performance.now();
+                let ctx = mpz_justvengers::JVProver::create_gpu_context_goldilocks(8192).await
+                    .expect("[jv_vm] GPU context creation failed - GPU is the only supported path");
+                let elapsed = performance.now() - gpu_start;
+                web_sys::console::log_1(&format!("[jv_vm] GPU context created in {:.2}ms", elapsed).into());
+                ctx
+            };
+
+            // Pre-initialize NTT GPU context for polynomial multiplication
+            let ntt_gpu_ctx = {
+                web_sys::console::log_1(&"[jv_vm] Pre-initializing NTT GPU context (new device)...".into());
+                let ntt_start = performance.now();
+                let ntt_size = (2 * reps).next_power_of_two().max(1024).min(2048);
+                let ctx = bgv_webgpu::GoldilocksNttGpu::new_async(ntt_size).await
+                    .expect("[jv_vm] NTT GPU context creation failed");
+                let elapsed = performance.now() - ntt_start;
+                let note = if (2 * reps).next_power_of_two() > 2048 { " (capped)" } else { "" };
+                web_sys::console::log_1(&format!("[jv_vm] NTT GPU context (n={}) created in {:.2}ms{}", ntt_size, elapsed, note).into());
+                std::sync::Arc::new(ctx)
+            };
+
+            web_sys::console::log_1(
+                &format!(
+                    "[jv_vm] R={}, mults/circuit={}, starting {} iterations (main thread with GPU)",
+                    reps, num_mults, n
+                )
+                .into(),
+            );
+
+            let mut total_elapsed_ms = 0.0;
+            let mut total_gpu_time_ms = 0.0;
+            let mut total_timing = TimingBreakdown::default();
+
+            for i in 0..n {
+                let start = performance.now();
+
+                let (gpu_time, timing) = run_prover_iteration(
+                    &circuits,
+                    &branches,
+                    &inputs,
+                    &soldering,
+                    &recorded,
+                    &gpu_ctx,
+                    &ntt_gpu_ctx,
+                ).await;
+
+                total_elapsed_ms += performance.now() - start;
+                total_gpu_time_ms += gpu_time;
+                total_timing.intt_ms += timing.intt_ms;
+                total_timing.collapse_ms += timing.collapse_ms;
+                total_timing.poly_div_ms += timing.poly_div_ms;
+                total_timing.open_ms += timing.open_ms;
+                total_timing.mk_poly_ms += timing.mk_poly_ms;
+                total_timing.itpac_ms += timing.itpac_ms;
+                total_timing.packing_ms += timing.packing_ms;
+                total_timing.setup_ms += timing.setup_ms;
+                total_timing.disclose_ms += timing.disclose_ms;
+                total_timing.commit_soldering_ms += timing.commit_soldering_ms;
+                total_timing.lpzk_accumulation_ms += timing.lpzk_accumulation_ms;
+                total_timing.reveal_soldering_ms += timing.reveal_soldering_ms;
+                total_timing.mk_binary_ms += timing.mk_binary_ms;
+                total_timing.mk_sum_ms += timing.mk_sum_ms;
+                total_timing.open_polynomial_ms += timing.open_polynomial_ms;
+                total_timing.mk_commit_vole_ms += timing.mk_commit_vole_ms;
+                total_timing.mk_commit_packing_ms += timing.mk_commit_packing_ms;
+                total_timing.vole_pool_ms += timing.vole_pool_ms;
+                total_timing.prover_new_ms += timing.prover_new_ms;
+                total_timing.prover_setup_ms += timing.prover_setup_ms;
+                total_timing.prover_setup_soldering_ms += timing.prover_setup_soldering_ms;
+                total_timing.commit_ms += timing.commit_ms;
+                total_timing.commit_mk_poly_ms += timing.commit_mk_poly_ms;
+                total_timing.commit_soldering_call_ms += timing.commit_soldering_call_ms;
+                total_timing.disclose_call_ms += timing.disclose_call_ms;
+                total_timing.reveal_soldering_call_ms += timing.reveal_soldering_call_ms;
+                total_timing.open_call_ms += timing.open_call_ms;
+                total_timing.open_itpac_ms += timing.open_itpac_ms;
+                total_timing.prove_mults_ms += timing.prove_mults_ms;
+
+                if (i + 1) % 10 == 0 {
+                    web_sys::console::log_1(
+                        &format!("[jv_vm] {} iterations done", i + 1).into(),
+                    );
+                }
+            }
+
+            let total_mults = n as u64 * reps as u64 * NUM_BRANCHES as u64 * num_mults as u64;
+
+            macro_rules! print_timing {
+                ($name:expr, $value:expr) => {
+                    web_sys::console::log_1(
+                        &format!(
+                            "[jv_vm]   {}: {:.2}ms ({:.1}%)",
+                            $name,
+                            $value,
+                            ($value / total_elapsed_ms) * 100.0
+                        )
+                        .into(),
+                    );
+                };
+            }
+
+            web_sys::console::log_1(
+                &format!(
+                    "[jv_vm] Done: {:.2}ms total, {:.2}ms/iter, {} total mults",
+                    total_elapsed_ms,
+                    total_elapsed_ms / n as f64,
+                    total_mults
+                )
+                .into(),
+            );
+            web_sys::console::log_1(
+                &format!(
+                    "[jv_vm] Total GPU time: {:.2}ms ({:.1}% of total time)",
+                    total_gpu_time_ms,
+                    (total_gpu_time_ms / total_elapsed_ms) * 100.0
+                )
+                .into(),
+            );
+
+            web_sys::console::log_1(&"[jv_vm] === Prover Internal Timing ===".into());
+            print_timing!("INTT (interpolation)", total_timing.intt_ms);
+            print_timing!("Collapse (CT addition)", total_timing.collapse_ms);
+            print_timing!("Poly division (LPZK)", total_timing.poly_div_ms);
+            print_timing!("Open (IT-PAC eval)", total_timing.open_ms);
+            print_timing!("MK poly (interpolation)", total_timing.mk_poly_ms);
+            print_timing!("IT-PAC creation", total_timing.itpac_ms);
+            print_timing!("Packing (2-way)", total_timing.packing_ms);
+            print_timing!("Setup (circuit eval)", total_timing.setup_ms);
+            print_timing!("Disclose (topology)", total_timing.disclose_ms);
+            print_timing!("Commit soldering", total_timing.commit_soldering_ms);
+            print_timing!("LPZK poly accumulation", total_timing.lpzk_accumulation_ms);
+            print_timing!("Reveal soldering", total_timing.reveal_soldering_ms);
+            print_timing!("MK binary eval", total_timing.mk_binary_ms);
+            print_timing!("MK sum", total_timing.mk_sum_ms);
+            print_timing!("Open polynomial", total_timing.open_polynomial_ms);
+            print_timing!("MK commit VOLE", total_timing.mk_commit_vole_ms);
+            print_timing!("MK commit packing", total_timing.mk_commit_packing_ms);
+
+            web_sys::console::log_1(&"[jv_vm] === Call-Level Timing (should sum to ~100%) ===".into());
+            print_timing!("VOLE pool generation", total_timing.vole_pool_ms);
+            print_timing!("Prover::new", total_timing.prover_new_ms);
+            print_timing!("Prover::setup", total_timing.prover_setup_ms);
+            print_timing!("Prover::setup_soldering", total_timing.prover_setup_soldering_ms);
+            print_timing!("Prover::commit", total_timing.commit_ms);
+            print_timing!("Prover::commit_mk_polynomials", total_timing.commit_mk_poly_ms);
+            print_timing!("Prover::commit_soldering", total_timing.commit_soldering_call_ms);
+            print_timing!("Prover::disclose", total_timing.disclose_call_ms);
+            print_timing!("Prover::reveal_soldering", total_timing.reveal_soldering_call_ms);
+            print_timing!("Prover::open", total_timing.open_call_ms);
+            print_timing!("Prover::open_itpac", total_timing.open_itpac_ms);
+            print_timing!("Prover::prove_multiplications", total_timing.prove_mults_ms);
+
+            let total_call_time = total_timing.vole_pool_ms + total_timing.prover_new_ms +
+                                  total_timing.prover_setup_ms + total_timing.prover_setup_soldering_ms +
+                                  total_timing.commit_ms + total_timing.commit_mk_poly_ms +
+                                  total_timing.commit_soldering_call_ms + total_timing.disclose_call_ms +
+                                  total_timing.reveal_soldering_call_ms + total_timing.open_call_ms +
+                                  total_timing.open_itpac_ms + total_timing.prove_mults_ms;
+            let loop_overhead = total_elapsed_ms - total_call_time;
+
+            web_sys::console::log_1(&"[jv_vm] === Summary ===".into());
+            print_timing!("Total call time", total_call_time);
+            print_timing!("Loop/other overhead", loop_overhead);
+
+            Ok(BenchResult {
+                elapsed_ms: total_elapsed_ms,
+                and_gates: total_mults,
+            })
+        },
     }
 }
 

@@ -258,6 +258,18 @@ impl std::fmt::Debug for RnsSlotMulGpu {
 }
 
 impl RnsSlotMulGpu {
+    /// Returns a reference to the GPU device (for sharing with other GPU contexts).
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Returns a reference to the GPU queue (for sharing with other GPU contexts).
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+}
+
+impl RnsSlotMulGpu {
     /// Creates a new GPU context for RNS batched slot multiplication.
     pub fn new(params: RnsBatchParams) -> Result<Self, GpuError> {
         pollster::block_on(Self::new_async(params))

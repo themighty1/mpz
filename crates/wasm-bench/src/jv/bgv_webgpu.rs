@@ -19,7 +19,8 @@ use mpz_justvengers_core::{
 #[cfg(target_arch = "wasm32")]
 use bgv_webgpu::{
     GpuRotationContext, GpuRnsParams, GpuRnsCiphertext, GpuGaloisKeys, GpuGaloisKey,
-    gpu_sum_slots_batched, SumSlotsWorkspace, rotation_exponent,
+    rotation_exponent,
+    old_code::{gpu_sum_slots_batched, SumSlotsWorkspace},
 };
 
 #[cfg(target_arch = "wasm32")]

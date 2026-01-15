@@ -170,7 +170,11 @@ function calcStats(name, iterations, samples, times, circuitsPerIter = 1) {
 // Define all benchmarks with their categories
 // concurrency is passed to MT benchmarks to control thread count
 function getAllBenchmarkDefs(concurrency = 8) {
-    return [
+    // Check for custom reps from URL parameter
+    const params = new URLSearchParams(window.location.search);
+    const customReps = params.get('reps');
+
+    const benchmarks = [
         // garbler_core benchmarks (raw garbling primitives)
         { category: "garbler_core", name: "garbler_core/half_gates", fn: (n) => wasm.garble_core_half_gates_garble(n), async: false },
         // evaluator_core benchmarks (raw evaluation primitives)
@@ -219,9 +223,11 @@ function getAllBenchmarkDefs(concurrency = 8) {
         // jv_vm_prover_main_thread benchmarks (NO web_spawn, WITH GPU - workaround for web_spawn bug)
         // GPU is async and runs on GPU hardware without blocking main thread
         // See commit 240d7d58 on debug/webspawn-bug-investigation
+        { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/100", fn: (n) => wasm.jv_vm_prover_main_thread(n, 100), async: true, returnsBenchResult: true, warmup: 1, mt: false },
         { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/1k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 1000), async: true, returnsBenchResult: true, warmup: 1, mt: false },
         { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/2k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 2000), async: true, returnsBenchResult: true, warmup: 1, mt: false },
         { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/3k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 3000), async: true, returnsBenchResult: true, warmup: 1, mt: false },
+        { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/4k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 4096), async: true, returnsBenchResult: true, warmup: 1, mt: false },
         { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/8k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 8192), async: true, returnsBenchResult: true, warmup: 1, mt: false },
         { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/16k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 16384), async: true, returnsBenchResult: true, warmup: 1, mt: false },
         { category: "jv_vm_prover_main_thread", name: "jv_vm_prover_main_thread/32k", fn: (n) => wasm.jv_vm_prover_main_thread(n, 32768), async: true, returnsBenchResult: true, warmup: 1, mt: false },
@@ -234,6 +240,25 @@ function getAllBenchmarkDefs(concurrency = 8) {
         { category: "bgv", name: "bgv/justvengers_pattern_webgpu", fn: (n) => wasm.bgv_justvengers_pattern_webgpu(n), async: true, returnsBenchResult: true, warmup: 0 },
         { category: "bgv", name: "bgv/webgpu_worker_test", fn: (n) => wasm.bgv_webgpu_worker_test(n), async: true, returnsBenchResult: true, warmup: 0, mt: true },
     ];
+
+    // Add custom reps benchmark if specified via URL parameter
+    if (customReps) {
+        const reps = parseInt(customReps);
+        if (!isNaN(reps) && reps > 0) {
+            console.log(`[bench.js] Adding custom benchmark with reps=${reps}`);
+            benchmarks.push({
+                category: "jv_vm_prover_main_thread",
+                name: `jv_vm_prover_main_thread/custom_${reps}`,
+                fn: (n) => wasm.jv_vm_prover_main_thread(n, reps),
+                async: true,
+                returnsBenchResult: true,
+                warmup: 1,
+                mt: false
+            });
+        }
+    }
+
+    return benchmarks;
 }
 
 // Check if any of the given benchmark names require MT (thread pool)
