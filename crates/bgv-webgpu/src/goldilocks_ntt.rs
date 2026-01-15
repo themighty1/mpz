@@ -2091,7 +2091,7 @@ impl GoldilocksNttGpu {
     /// Used for chaining operations without CPU round trips.
     /// Note: This keeps the result in row-major layout (skips the final transpose)
     /// which is compatible with multipass_inverse_ntt_from_buffer_direct.
-    pub fn multipass_forward_ntt_to_buffer_direct(
+    pub async fn multipass_forward_ntt_to_buffer_async(
         &self,
         data: &[u64],
         target_n: usize,
@@ -2111,7 +2111,7 @@ impl GoldilocksNttGpu {
 
         if target_n <= MAX_SINGLE_PASS {
             // For small sizes, use single-pass NTT and return buffer
-            let result = pollster::block_on(self.batched_forward_ntt_async(&[work_data]))?;
+            let result = self.batched_forward_ntt_async(&[work_data]).await?;
             return Ok(self.upload_to_buffer(&result[0]));
         }
 
@@ -2152,9 +2152,6 @@ impl GoldilocksNttGpu {
         // Submit all passes at once
         self.queue.submit(Some(encoder.finish()));
 
-        // Wait for GPU to complete
-        self.device.poll(wgpu::Maintain::Wait);
-
         // Return the final buffer directly (row-major layout, no transpose)
         // The intermediate buffers will be cleaned up when dropped
         drop(keep_alive);
@@ -2164,13 +2161,14 @@ impl GoldilocksNttGpu {
         Ok(row_output)
     }
 
-    /// Legacy wrapper for async compatibility
-    pub async fn multipass_forward_ntt_to_buffer_async(
+    /// Sync wrapper for non-WASM contexts (uses pollster)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn multipass_forward_ntt_to_buffer_direct(
         &self,
         data: &[u64],
         target_n: usize,
     ) -> Result<Buffer, GpuError> {
-        self.multipass_forward_ntt_to_buffer_direct(data, target_n)
+        pollster::block_on(self.multipass_forward_ntt_to_buffer_async(data, target_n))
     }
 
     /// Pointwise multiplication on GPU buffers (no CPU round trip).
