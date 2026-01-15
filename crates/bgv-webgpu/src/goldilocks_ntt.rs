@@ -67,9 +67,9 @@ struct GpuBatchedNttParams {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuPointwiseMulParams {
     num_elements: u32, // Total number of elements to multiply
+    poly_stride: u32,  // Stride between polynomials in u32 units (for batched dispatch via wg_id.y)
     _pad1: u32,
     _pad2: u32,
-    _pad3: u32,
 }
 
 /// GPU context for Goldilocks NTT operations.
@@ -707,9 +707,9 @@ impl GoldilocksNttGpu {
 
         let params = GpuPointwiseMulParams {
             num_elements: num_elements as u32,
+            poly_stride: 0,
             _pad1: 0,
             _pad2: 0,
-            _pad3: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pointwise_mul_params"),
@@ -1926,7 +1926,8 @@ impl GoldilocksNttGpu {
             // Pointwise mul params
             let mul_params = GpuPointwiseMulParams {
                 num_elements: ntt_size as u32,
-                _pad1: 0, _pad2: 0, _pad3: 0,
+                poly_stride: 0,
+                _pad1: 0, _pad2: 0,
             };
             let mul_params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mul_params"),
@@ -2634,9 +2635,9 @@ impl GoldilocksNttGpu {
 
         let params = GpuPointwiseMulParams {
             num_elements: num_elements as u32,
+            poly_stride: 0,
             _pad1: 0,
             _pad2: 0,
-            _pad3: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pointwise_mul_buffers_params"),
@@ -2694,9 +2695,9 @@ impl GoldilocksNttGpu {
 
         let params = GpuPointwiseMulParams {
             num_elements: num_elements as u32,
+            poly_stride: 0,
             _pad1: 0,
             _pad2: 0,
-            _pad3: 0,
         };
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("pointwise_mul_params"),
@@ -3784,9 +3785,9 @@ const GOLDILOCKS_POINTWISE_MUL_SHADER: &str = r#"
 
 struct PointwiseMulParams {
     num_elements: u32,
+    poly_stride: u32, // Stride between polynomials in u32 units (for batched dispatch via wg_id.y)
     _pad1: u32,
     _pad2: u32,
-    _pad3: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: PointwiseMulParams;
@@ -3796,13 +3797,16 @@ struct PointwiseMulParams {
 
 @compute @workgroup_size(256, 1, 1)
 fn pointwise_mul(
-    @builtin(global_invocation_id) global_id: vec3<u32>
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(workgroup_id) wg_id: vec3<u32>
 ) {
     let idx = global_id.x;
     if (idx >= params.num_elements) { return; }
 
+    let poly_offset = wg_id.y * params.poly_stride;  // Offset for this polynomial
+
     // Load a[i] and b[i] (each stored as two u32s for u64)
-    let base = idx * 2u;
+    let base = poly_offset + idx * 2u;
     let a_val = vec2<u32>(a[base], a[base + 1u]);
     let b_val = vec2<u32>(b[base], b[base + 1u]);
 
