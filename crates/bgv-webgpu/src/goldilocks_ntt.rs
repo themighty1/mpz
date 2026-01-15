@@ -736,6 +736,43 @@ impl GoldilocksNttGpu {
         // NTT size must be power of 2 and >= max result length
         let ntt_size = max_result_len.next_power_of_two().max(self.n);
 
+        // Max single-pass NTT size
+        const MAX_SINGLE_PASS: usize = 1024;
+
+        // For large NTT sizes, use multipass NTT (one polynomial at a time)
+        if ntt_size > MAX_SINGLE_PASS {
+            let mut results = Vec::with_capacity(pairs.len());
+            for ((a, b), &rlen) in pairs.iter().zip(result_lens.iter()) {
+                if rlen == 0 {
+                    results.push(vec![]);
+                    continue;
+                }
+
+                // Pad inputs to ntt_size
+                let mut a_padded = vec![0u64; ntt_size];
+                let mut b_padded = vec![0u64; ntt_size];
+                a_padded[..a.len()].copy_from_slice(a);
+                b_padded[..b.len()].copy_from_slice(b);
+
+                // Forward NTT (multipass) - use pollster for sync call
+                let a_eval = pollster::block_on(self.multipass_forward_ntt_async(&a_padded, ntt_size))?;
+                let b_eval = pollster::block_on(self.multipass_forward_ntt_async(&b_padded, ntt_size))?;
+
+                // Pointwise multiplication
+                let mut prod_eval = Vec::with_capacity(ntt_size);
+                for i in 0..ntt_size {
+                    let p = ((a_eval[i] as u128 * b_eval[i] as u128) % GOLDILOCKS as u128) as u64;
+                    prod_eval.push(p);
+                }
+
+                // Inverse NTT (multipass)
+                let product = pollster::block_on(self.multipass_inverse_ntt_async(&prod_eval, ntt_size))?;
+
+                results.push(product[..rlen].to_vec());
+            }
+            return Ok(results);
+        }
+
         // Prepare padded polynomials for NTT
         let mut a_polys = Vec::with_capacity(pairs.len());
         let mut b_polys = Vec::with_capacity(pairs.len());
@@ -748,9 +785,17 @@ impl GoldilocksNttGpu {
             b_polys.push(b_padded);
         }
 
-        // Forward NTT on both sets
-        let a_evals = self.batched_forward_ntt(&a_polys)?;
-        let b_evals = self.batched_forward_ntt(&b_polys)?;
+        // Forward NTT on both sets (handle size mismatch)
+        let (a_evals, b_evals) = if ntt_size == self.n {
+            let a_evals = self.batched_forward_ntt(&a_polys)?;
+            let b_evals = self.batched_forward_ntt(&b_polys)?;
+            (a_evals, b_evals)
+        } else {
+            let temp_gpu = GoldilocksNttGpu::new(ntt_size)?;
+            let a_evals = temp_gpu.batched_forward_ntt(&a_polys)?;
+            let b_evals = temp_gpu.batched_forward_ntt(&b_polys)?;
+            (a_evals, b_evals)
+        };
 
         // Pointwise multiplication (CPU for now, could be GPU)
         let mut prod_evals = Vec::with_capacity(pairs.len());
@@ -764,7 +809,12 @@ impl GoldilocksNttGpu {
         }
 
         // Inverse NTT
-        let products = self.batched_inverse_ntt(&prod_evals)?;
+        let products = if ntt_size == self.n {
+            self.batched_inverse_ntt(&prod_evals)?
+        } else {
+            let temp_gpu = GoldilocksNttGpu::new(ntt_size)?;
+            temp_gpu.batched_inverse_ntt(&prod_evals)?
+        };
 
         // Trim to actual result lengths
         let mut results = Vec::with_capacity(pairs.len());
@@ -1091,6 +1141,50 @@ impl GoldilocksNttGpu {
 
         let ntt_size = max_result_len.next_power_of_two().max(self.n);
 
+        // Max single-pass NTT size
+        const MAX_SINGLE_PASS: usize = 1024;
+
+        // For large NTT sizes, use multipass NTT (one polynomial at a time)
+        if ntt_size > MAX_SINGLE_PASS {
+            #[cfg(target_arch = "wasm32")]
+            web_sys::console::log_1(&format!(
+                "[GPU poly_mul] Using multipass NTT for size {} ({} pairs)",
+                ntt_size, pairs.len()
+            ).into());
+
+            let mut results = Vec::with_capacity(pairs.len());
+            for ((a, b), &rlen) in pairs.iter().zip(result_lens.iter()) {
+                if rlen == 0 {
+                    results.push(vec![]);
+                    continue;
+                }
+
+                // Pad inputs to ntt_size
+                let mut a_padded = vec![0u64; ntt_size];
+                let mut b_padded = vec![0u64; ntt_size];
+                a_padded[..a.len()].copy_from_slice(a);
+                b_padded[..b.len()].copy_from_slice(b);
+
+                // Forward NTT (multipass)
+                let a_eval = self.multipass_forward_ntt_async(&a_padded, ntt_size).await?;
+                let b_eval = self.multipass_forward_ntt_async(&b_padded, ntt_size).await?;
+
+                // Pointwise multiplication
+                let mut prod_eval = Vec::with_capacity(ntt_size);
+                for i in 0..ntt_size {
+                    let p = ((a_eval[i] as u128 * b_eval[i] as u128) % GOLDILOCKS as u128) as u64;
+                    prod_eval.push(p);
+                }
+
+                // Inverse NTT (multipass)
+                let product = self.multipass_inverse_ntt_async(&prod_eval, ntt_size).await?;
+
+                results.push(product[..rlen].to_vec());
+            }
+            return Ok(results);
+        }
+
+        // For small NTT sizes, use batched single-pass NTT
         let mut a_polys = Vec::with_capacity(pairs.len());
         let mut b_polys = Vec::with_capacity(pairs.len());
         for (a, b) in pairs {
@@ -1102,32 +1196,17 @@ impl GoldilocksNttGpu {
             b_polys.push(b_padded);
         }
 
-        // DEBUG: Find first nonzero input and check it
-        #[cfg(target_arch = "wasm32")]
-        let debug_idx = {
-            let mut idx = 0;
-            for (i, a) in a_polys.iter().enumerate() {
-                if a.iter().any(|&x| x != 0) {
-                    idx = i;
-                    break;
-                }
-            }
-            idx
+        // Need a GPU context for the correct size
+        let (a_evals, b_evals) = if ntt_size == self.n {
+            let a_evals = self.batched_forward_ntt_async(&a_polys).await?;
+            let b_evals = self.batched_forward_ntt_async(&b_polys).await?;
+            (a_evals, b_evals)
+        } else {
+            let temp_gpu = GoldilocksNttGpu::new_async(ntt_size).await?;
+            let a_evals = temp_gpu.batched_forward_ntt_async(&a_polys).await?;
+            let b_evals = temp_gpu.batched_forward_ntt_async(&b_polys).await?;
+            (a_evals, b_evals)
         };
-
-        let a_evals = self.batched_forward_ntt_async(&a_polys).await?;
-        let b_evals = self.batched_forward_ntt_async(&b_polys).await?;
-
-        // DEBUG: Check NTT results for the first nonzero input
-        #[cfg(target_arch = "wasm32")]
-        {
-            let a_in_nz = a_polys[debug_idx].iter().filter(|&&x| x != 0).count();
-            let a_out_nz = a_evals[debug_idx].iter().filter(|&&x| x != 0).count();
-            web_sys::console::log_1(&format!(
-                "[GPU poly_mul] idx={}: input has {} nonzero, NTT output has {} nonzero (n={})",
-                debug_idx, a_in_nz, a_out_nz, ntt_size
-            ).into());
-        }
 
         let mut prod_evals = Vec::with_capacity(pairs.len());
         for (a_eval, b_eval) in a_evals.iter().zip(b_evals.iter()) {
@@ -1139,7 +1218,12 @@ impl GoldilocksNttGpu {
             prod_evals.push(prod);
         }
 
-        let products = self.batched_inverse_ntt_async(&prod_evals).await?;
+        let products = if ntt_size == self.n {
+            self.batched_inverse_ntt_async(&prod_evals).await?
+        } else {
+            let temp_gpu = GoldilocksNttGpu::new_async(ntt_size).await?;
+            temp_gpu.batched_inverse_ntt_async(&prod_evals).await?
+        };
 
         let mut results = Vec::with_capacity(pairs.len());
         for (prod, &rlen) in products.iter().zip(result_lens.iter()) {
@@ -1554,6 +1638,383 @@ impl GoldilocksNttGpu {
             let lo = output_u32[i * 2] as u64;
             let hi = output_u32[i * 2 + 1] as u64;
             result[i] = lo | (hi << 32);
+        }
+
+        drop(mapped);
+        staging_buffer.unmap();
+
+        Ok(result)
+    }
+
+    /// Multi-pass inverse NTT for sizes > 1024 using Bailey's Four-Step FFT (inverse).
+    ///
+    /// This is the inverse of `multipass_forward_ntt_async`. Input is in the
+    /// column-major order that forward NTT outputs.
+    ///
+    /// # Algorithm (inverse four-step):
+    /// 1. Transpose: convert column-major input to row-major
+    /// 2. Inverse row NTTs of size N1
+    /// 3. Inverse twiddle: multiply by ω_inv^(col * row)
+    /// 4. Inverse column NTTs of size N2
+    pub async fn multipass_inverse_ntt_async(
+        &self,
+        data: &[u64],
+        target_n: usize,
+    ) -> Result<Vec<u64>, GpuError> {
+        if target_n == 0 || (target_n & (target_n - 1)) != 0 {
+            return Err(GpuError::InvalidParams(format!(
+                "target_n={} must be a power of 2", target_n
+            )));
+        }
+
+        if data.len() != target_n {
+            return Err(GpuError::InvalidParams(format!(
+                "Data length {} != target_n={}", data.len(), target_n
+            )));
+        }
+
+        const MAX_SINGLE_PASS: usize = 1024;
+
+        if target_n <= MAX_SINGLE_PASS {
+            // Use single-pass inverse NTT
+            if target_n == self.n {
+                let result = self.batched_inverse_ntt_async(&[data.to_vec()]).await?;
+                return Ok(result.into_iter().next().unwrap());
+            } else {
+                let temp_gpu = GoldilocksNttGpu::new_async(target_n).await?;
+                let result = temp_gpu.batched_inverse_ntt_async(&[data.to_vec()]).await?;
+                return Ok(result.into_iter().next().unwrap());
+            }
+        }
+
+        // Four-step FFT dimensions (same as forward)
+        let n1 = MAX_SINGLE_PASS.min(target_n);  // N1 = min(1024, N)
+        let n2 = target_n / n1;
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&format!(
+            "[Multipass INTT] N={} = N1={} × N2={}", target_n, n1, n2
+        ).into());
+
+        if n1 > MAX_SINGLE_PASS || n2 > MAX_SINGLE_PASS {
+            return Err(GpuError::InvalidParams(format!(
+                "INTT size {} too large, N1={} or N2={} exceeds max {}",
+                target_n, n1, n2, MAX_SINGLE_PASS
+            )));
+        }
+
+        // =====================================================================
+        // Bailey's Four-Step IFFT (inverse of forward):
+        // Input: column-major from forward NTT (X[col * N2 + row])
+        // 1. Transpose: row-major[row * N1 + col] = input[col * N2 + row]
+        // 2. Inverse row NTTs of size N1
+        // 3. Inverse twiddle: element at (row, col) *= ω_inv^(col * row)
+        // 4. Inverse column NTTs of size N2
+        // =====================================================================
+
+        // Step 1: Transpose (column-major input -> row-major)
+        let mut work_data = vec![0u64; target_n];
+        for row in 0..n2 {
+            for col in 0..n1 {
+                let input_idx = col * n2 + row;  // column-major
+                let output_idx = row * n1 + col; // row-major
+                work_data[output_idx] = data[input_idx];
+            }
+        }
+
+        // Step 2: Inverse row NTTs of size N1
+        let rows: Vec<Vec<u64>> = (0..n2)
+            .map(|row| work_data[row * n1..(row + 1) * n1].to_vec())
+            .collect();
+
+        let row_intt_results = if n1 == self.n {
+            self.batched_inverse_ntt_async(&rows).await?
+        } else {
+            let temp_gpu = GoldilocksNttGpu::new_async(n1).await?;
+            temp_gpu.batched_inverse_ntt_async(&rows).await?
+        };
+
+        for (row, row_data) in row_intt_results.iter().enumerate() {
+            for (col, &val) in row_data.iter().enumerate() {
+                work_data[row * n1 + col] = val;
+            }
+        }
+
+        // Step 3: Inverse twiddle (multiply by ω_inv^(col * row))
+        self.apply_inverse_twiddle_async(&mut work_data, target_n, n1).await?;
+
+        // Step 4: Inverse column NTTs of size N2 (stride = N1)
+        work_data = self.batched_column_inverse_ntt_async(&work_data, n1, n2, target_n).await?;
+
+        Ok(work_data)
+    }
+
+    /// Apply inverse twiddle factor multiplication (ω_inv^(col * row)).
+    async fn apply_inverse_twiddle_async(
+        &self,
+        data: &mut [u64],
+        n: usize,
+        n1: usize,
+    ) -> Result<(), GpuError> {
+        if data.len() != n {
+            return Err(GpuError::InvalidParams(format!(
+                "Data length {} != n={}", data.len(), n
+            )));
+        }
+
+        // Compute inverse twiddles for size n
+        let omega = find_primitive_nth_root(n)
+            .ok_or_else(|| GpuError::InvalidParams(format!("No primitive root for n={}", n)))?;
+        let omega_inv = mod_inverse(omega, GOLDILOCKS);
+        let inv_twiddles = compute_powers(omega_inv, n, GOLDILOCKS);
+
+        let inv_twiddles_flat: Vec<u32> = inv_twiddles
+            .iter()
+            .flat_map(|&x| [x as u32, (x >> 32) as u32])
+            .collect();
+
+        let twiddles_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("inverse_twiddles"),
+            contents: bytemuck::cast_slice(&inv_twiddles_flat),
+            usage: BufferUsages::STORAGE,
+        });
+
+        let data_flat: Vec<u32> = data
+            .iter()
+            .flat_map(|&x| [x as u32, (x >> 32) as u32])
+            .collect();
+
+        let data_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("inv_twiddle_data"),
+            contents: bytemuck::cast_slice(&data_flat),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        });
+
+        let params = GpuTwiddleParams {
+            n: n as u32,
+            n1: n1 as u32,
+            num_elements: n as u32,
+            _pad: 0,
+        };
+
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("inv_twiddle_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let bind_group_layout = self.twiddle_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("inv_twiddle bind group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: data_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: twiddles_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("inv_twiddle encoder"),
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("inv_twiddle pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.twiddle_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let num_workgroups = (n + 255) / 256;
+            pass.dispatch_workgroups(num_workgroups as u32, 1, 1);
+        }
+
+        // Read back results
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inv_twiddle_staging"),
+            size: (n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_buffer_to_buffer(
+            &data_buffer,
+            0,
+            &staging_buffer,
+            0,
+            (n * 2 * std::mem::size_of::<u32>()) as u64,
+        );
+
+        self.queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.await
+            .map_err(|_| GpuError::ExecutionFailed("Channel cancelled".into()))?
+            .map_err(GpuError::BufferMapping)?;
+
+        let mapped = buffer_slice.get_mapped_range();
+        let output_u32: &[u32] = bytemuck::cast_slice(&mapped);
+
+        for i in 0..n {
+            let lo = output_u32[i * 2] as u64;
+            let hi = output_u32[i * 2 + 1] as u64;
+            data[i] = lo | (hi << 32);
+        }
+
+        drop(mapped);
+        staging_buffer.unmap();
+
+        Ok(())
+    }
+
+    /// Apply batched inverse column NTTs using the batched_ntt_pipeline with inverse twiddles.
+    async fn batched_column_inverse_ntt_async(
+        &self,
+        data: &[u64],
+        n1: usize, // Number of columns (stride)
+        n2: usize, // Column height (NTT size)
+        total_n: usize,
+    ) -> Result<Vec<u64>, GpuError> {
+        if data.len() != total_n {
+            return Err(GpuError::InvalidParams(format!(
+                "Data length {} != total_n={}", data.len(), total_n
+            )));
+        }
+
+        let input_flat: Vec<u32> = data
+            .iter()
+            .flat_map(|&x| [x as u32, (x >> 32) as u32])
+            .collect();
+
+        let input_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("column_intt_input"),
+            contents: bytemuck::cast_slice(&input_flat),
+            usage: BufferUsages::STORAGE,
+        });
+
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("column_intt_output"),
+            size: (total_n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Inverse twiddles for column NTT size n2
+        let omega = find_primitive_nth_root(n2)
+            .ok_or_else(|| GpuError::InvalidParams(format!("No primitive root for n2={}", n2)))?;
+        let omega_inv = mod_inverse(omega, GOLDILOCKS);
+        let omega_inv_powers = compute_powers(omega_inv, n2, GOLDILOCKS);
+        let twiddles_flat: Vec<u32> = omega_inv_powers
+            .iter()
+            .flat_map(|&x| [x as u32, (x >> 32) as u32])
+            .collect();
+
+        let twiddles_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("column_inv_twiddles"),
+            contents: bytemuck::cast_slice(&twiddles_flat),
+            usage: BufferUsages::STORAGE,
+        });
+
+        // n_inv for normalization (applied on CPU after GPU computation)
+        let n_inv = mod_inverse(n2 as u64, GOLDILOCKS);
+
+        // Batch parameters
+        let log_n2 = n2.trailing_zeros();
+        let batch_per_wg = 1u32; // One column per workgroup
+        let total_batches = n1 as u32; // n1 columns
+
+        let params = GpuBatchedNttParams {
+            n: n2 as u32,
+            log_n: log_n2,
+            batch_per_wg,
+            total_batches,
+            stride: n1 as u32, // Elements are n1 apart
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("column_intt_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        // Batched NTT shader only has 4 bindings (no mod_params)
+        let bind_group_layout = self.batched_ntt_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("column_intt bind group"),
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: input_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: output_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: twiddles_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("column_intt encoder"),
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("column_intt pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.batched_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(total_batches, 1, 1);
+        }
+
+        // Read back results
+        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("column_intt_staging"),
+            size: (total_n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        encoder.copy_buffer_to_buffer(
+            &output_buffer,
+            0,
+            &staging_buffer,
+            0,
+            (total_n * 2 * std::mem::size_of::<u32>()) as u64,
+        );
+
+        self.queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.await
+            .map_err(|_| GpuError::ExecutionFailed("Channel cancelled".into()))?
+            .map_err(GpuError::BufferMapping)?;
+
+        let mapped = buffer_slice.get_mapped_range();
+        let output_u32: &[u32] = bytemuck::cast_slice(&mapped);
+
+        let mut result = vec![0u64; total_n];
+        for i in 0..total_n {
+            let lo = output_u32[i * 2] as u64;
+            let hi = output_u32[i * 2 + 1] as u64;
+            // Apply n_inv normalization for inverse NTT
+            result[i] = mod_mul(lo | (hi << 32), n_inv, GOLDILOCKS);
         }
 
         drop(mapped);
@@ -3226,6 +3687,51 @@ fn test_mulmod() {
             }
 
             println!("  PASS: All {} coefficients match (async)", cpu_result.len());
+        }
+    }
+
+    #[test]
+    fn test_multipass_poly_mul() {
+        let p = GOLDILOCKS;
+
+        // Test sizes that require multipass NTT (> 1024)
+        for &size in &[1024usize, 2048, 4096] {
+            println!("\n=== Testing multipass poly_mul size {} ===", size);
+
+            // Create a small NTT context - batched_poly_mul should use multipass for large sizes
+            let ntt = GoldilocksNttGpu::new(1024).expect("Failed to create NTT context");
+
+            // Generate test polynomials
+            let a: Vec<u64> = (0..size).map(|i| (i as u64 * 12345 + 67890) % p).collect();
+            let b: Vec<u64> = (0..size).map(|i| (i as u64 * 98765 + 43210) % p).collect();
+
+            // CPU multiplication
+            let cpu_result = cpu_poly_mul(&a, &b, p);
+
+            // GPU multiplication (should use multipass for sizes > 1024)
+            let gpu_results = ntt.batched_poly_mul(&[(&a, &b)]).expect("GPU poly_mul failed");
+            let gpu_result = &gpu_results[0];
+
+            // Compare lengths
+            assert_eq!(cpu_result.len(), gpu_result.len(),
+                "Length mismatch: CPU={}, GPU={}", cpu_result.len(), gpu_result.len());
+
+            // Compare values
+            let mut mismatches = 0;
+            for i in 0..cpu_result.len() {
+                if cpu_result[i] != gpu_result[i] {
+                    if mismatches < 5 {
+                        println!("  Mismatch at [{}]: CPU={}, GPU={}", i, cpu_result[i], gpu_result[i]);
+                    }
+                    mismatches += 1;
+                }
+            }
+
+            if mismatches > 0 {
+                panic!("FAIL: {} mismatches out of {} coefficients", mismatches, cpu_result.len());
+            }
+
+            println!("  PASS: All {} coefficients match (multipass)", cpu_result.len());
         }
     }
 }
