@@ -1374,15 +1374,15 @@ impl GoldilocksNttGpu {
                 a_padded[..a.len()].copy_from_slice(a);
                 b_padded[..b.len()].copy_from_slice(b);
 
-                // Forward NTT (multipass) - use pollster for sync call
-                let a_eval = pollster::block_on(self.multipass_forward_ntt_async(&a_padded, ntt_size))?;
-                let b_eval = pollster::block_on(self.multipass_forward_ntt_async(&b_padded, ntt_size))?;
+                // Forward NTT (multipass) - results stay on GPU
+                let a_eval_buf = pollster::block_on(self.multipass_forward_ntt_to_buffer_async(&a_padded, ntt_size))?;
+                let b_eval_buf = pollster::block_on(self.multipass_forward_ntt_to_buffer_async(&b_padded, ntt_size))?;
 
-                // GPU pointwise multiplication
-                let prod_eval = pollster::block_on(self.pointwise_mul_async(&a_eval, &b_eval))?;
+                // GPU pointwise multiplication (buffer to buffer, no CPU round trip)
+                let prod_buf = self.pointwise_mul_buffers(&a_eval_buf, &b_eval_buf, ntt_size)?;
 
-                // Inverse NTT (multipass)
-                let product = pollster::block_on(self.multipass_inverse_ntt_async(&prod_eval, ntt_size))?;
+                // Inverse NTT (starts from GPU buffer)
+                let product = pollster::block_on(self.multipass_inverse_ntt_from_buffer_async(&prod_buf, ntt_size))?;
 
                 results.push(product[..rlen].to_vec());
             }
@@ -1777,15 +1777,15 @@ impl GoldilocksNttGpu {
                 a_padded[..a.len()].copy_from_slice(a);
                 b_padded[..b.len()].copy_from_slice(b);
 
-                // Forward NTT (multipass)
-                let a_eval = self.multipass_forward_ntt_async(&a_padded, ntt_size).await?;
-                let b_eval = self.multipass_forward_ntt_async(&b_padded, ntt_size).await?;
+                // Forward NTT (multipass) - results stay on GPU
+                let a_eval_buf = self.multipass_forward_ntt_to_buffer_async(&a_padded, ntt_size).await?;
+                let b_eval_buf = self.multipass_forward_ntt_to_buffer_async(&b_padded, ntt_size).await?;
 
-                // GPU pointwise multiplication
-                let prod_eval = self.pointwise_mul_async(&a_eval, &b_eval).await?;
+                // GPU pointwise multiplication (buffer to buffer, no CPU round trip)
+                let prod_buf = self.pointwise_mul_buffers(&a_eval_buf, &b_eval_buf, ntt_size)?;
 
-                // Inverse NTT (multipass)
-                let product = self.multipass_inverse_ntt_async(&prod_eval, ntt_size).await?;
+                // Inverse NTT (starts from GPU buffer)
+                let product = self.multipass_inverse_ntt_from_buffer_async(&prod_buf, ntt_size).await?;
 
                 results.push(product[..rlen].to_vec());
             }
@@ -2099,6 +2099,91 @@ impl GoldilocksNttGpu {
         }
 
         Ok(result)
+    }
+
+    /// Forward NTT that returns a GPU buffer instead of downloading.
+    /// Used for chaining operations without CPU round trips.
+    pub async fn multipass_forward_ntt_to_buffer_async(
+        &self,
+        data: &[u64],
+        target_n: usize,
+    ) -> Result<Buffer, GpuError> {
+        // Run the normal forward NTT
+        let result = self.multipass_forward_ntt_async(data, target_n).await?;
+        // Upload result to GPU buffer and return it
+        Ok(self.upload_to_buffer(&result))
+    }
+
+    /// Pointwise multiplication on GPU buffers (no CPU round trip).
+    /// Both buffers must contain the same number of elements.
+    pub fn pointwise_mul_buffers(
+        &self,
+        a_buf: &Buffer,
+        b_buf: &Buffer,
+        num_elements: usize,
+    ) -> Result<Buffer, GpuError> {
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pointwise_mul_buffers_output"),
+            size: (num_elements * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let params = GpuPointwiseMulParams {
+            num_elements: num_elements as u32,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pointwise_mul_buffers_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let layout = self.pointwise_mul_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pointwise_mul_buffers_bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: a_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: output_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("pointwise_mul_buffers_encoder"),
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pointwise_mul_buffers_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pointwise_mul_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let num_wg = (num_elements + 255) / 256;
+            pass.dispatch_workgroups(num_wg as u32, 1, 1);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+
+        Ok(output_buffer)
+    }
+
+    /// Inverse NTT starting from a GPU buffer.
+    /// Downloads the buffer content and runs inverse NTT.
+    pub async fn multipass_inverse_ntt_from_buffer_async(
+        &self,
+        buffer: &Buffer,
+        target_n: usize,
+    ) -> Result<Vec<u64>, GpuError> {
+        // Download buffer content
+        let data = self.download_from_buffer(buffer, target_n).await?;
+        // Run normal inverse NTT
+        self.multipass_inverse_ntt_async(&data, target_n).await
     }
 
     /// Apply batched column NTTs using the batched_ntt_pipeline.
@@ -3873,6 +3958,112 @@ mod tests {
         }
         assert_eq!(mismatches, 0, "GPU vs CPU pointwise mul: {} mismatches", mismatches);
         println!("PASS: GPU pointwise multiplication matches CPU for N={}", n);
+    }
+
+    #[test]
+    fn test_buffer_chained_poly_mul() {
+        // Test that buffer-chained poly_mul produces same result as original
+        let ntt_size = 2048usize;
+        let gpu = GoldilocksNttGpu::new(1024).expect("GPU init failed");
+
+        // Generate test polynomials
+        let a: Vec<u64> = (0..512)
+            .map(|i| (i as u64 * 111 + 222) % GOLDILOCKS)
+            .collect();
+        let b: Vec<u64> = (0..512)
+            .map(|i| (i as u64 * 333 + 444) % GOLDILOCKS)
+            .collect();
+
+        // Pad to NTT size
+        let mut a_padded = vec![0u64; ntt_size];
+        let mut b_padded = vec![0u64; ntt_size];
+        a_padded[..a.len()].copy_from_slice(&a);
+        b_padded[..b.len()].copy_from_slice(&b);
+
+        // === Original approach (separate operations) ===
+        let a_eval = pollster::block_on(gpu.multipass_forward_ntt_async(&a_padded, ntt_size))
+            .expect("Forward NTT a failed");
+        let b_eval = pollster::block_on(gpu.multipass_forward_ntt_async(&b_padded, ntt_size))
+            .expect("Forward NTT b failed");
+        let prod_eval = pollster::block_on(gpu.pointwise_mul_async(&a_eval, &b_eval))
+            .expect("Pointwise mul failed");
+        let original_result = pollster::block_on(gpu.multipass_inverse_ntt_async(&prod_eval, ntt_size))
+            .expect("Inverse NTT failed");
+
+        // === Buffer-chained approach ===
+        let a_buf = pollster::block_on(gpu.multipass_forward_ntt_to_buffer_async(&a_padded, ntt_size))
+            .expect("Forward NTT to buffer a failed");
+        let b_buf = pollster::block_on(gpu.multipass_forward_ntt_to_buffer_async(&b_padded, ntt_size))
+            .expect("Forward NTT to buffer b failed");
+        let prod_buf = gpu.pointwise_mul_buffers(&a_buf, &b_buf, ntt_size)
+            .expect("Pointwise mul buffers failed");
+        let chained_result = pollster::block_on(gpu.multipass_inverse_ntt_from_buffer_async(&prod_buf, ntt_size))
+            .expect("Inverse NTT from buffer failed");
+
+        // === Compare results ===
+        assert_eq!(original_result.len(), chained_result.len());
+        let mut mismatches = 0;
+        for i in 0..ntt_size {
+            if original_result[i] != chained_result[i] {
+                if mismatches < 5 {
+                    println!(
+                        "Mismatch at {}: original={}, chained={}",
+                        i, original_result[i], chained_result[i]
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "Buffer-chained vs original: {} mismatches", mismatches);
+        println!("PASS: Buffer-chained poly_mul matches original for N={}", ntt_size);
+    }
+
+    #[test]
+    fn test_pointwise_mul_buffers() {
+        // Test pointwise_mul_buffers in isolation
+        let n = 4096usize;
+        let gpu = GoldilocksNttGpu::new(1024).expect("GPU init failed");
+
+        // Generate test data
+        let a: Vec<u64> = (0..n)
+            .map(|i| (i as u64 * 12345 + 67890) % GOLDILOCKS)
+            .collect();
+        let b: Vec<u64> = (0..n)
+            .map(|i| (i as u64 * 54321 + 98765) % GOLDILOCKS)
+            .collect();
+
+        // Upload to buffers
+        let a_buf = gpu.upload_to_buffer(&a);
+        let b_buf = gpu.upload_to_buffer(&b);
+
+        // GPU buffer pointwise multiplication
+        let result_buf = gpu.pointwise_mul_buffers(&a_buf, &b_buf, n)
+            .expect("Pointwise mul buffers failed");
+
+        // Download result
+        let gpu_result = pollster::block_on(gpu.download_from_buffer(&result_buf, n))
+            .expect("Download failed");
+
+        // CPU reference
+        let cpu_result: Vec<u64> = a.iter().zip(b.iter())
+            .map(|(&ai, &bi)| ((ai as u128 * bi as u128) % GOLDILOCKS as u128) as u64)
+            .collect();
+
+        // Compare
+        let mut mismatches = 0;
+        for i in 0..n {
+            if gpu_result[i] != cpu_result[i] {
+                if mismatches < 5 {
+                    println!(
+                        "Mismatch at {}: GPU={}, CPU={}",
+                        i, gpu_result[i], cpu_result[i]
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "pointwise_mul_buffers vs CPU: {} mismatches", mismatches);
+        println!("PASS: pointwise_mul_buffers matches CPU for N={}", n);
     }
 }
 
