@@ -3,6 +3,9 @@
 //! Provides batched forward and inverse NTT operations for polynomial multiplication
 //! in the JustVengers ZK protocol.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use bytemuck::{Pod, Zeroable};
 use wgpu::{util::DeviceExt, Buffer, BufferUsages, ComputePipeline, Device, Queue};
 
@@ -59,6 +62,16 @@ struct GpuBatchedNttParams {
     _pad3: u32,
 }
 
+/// Parameters for pointwise multiplication.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuPointwiseMulParams {
+    num_elements: u32, // Total number of elements to multiply
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+
 /// GPU context for Goldilocks NTT operations.
 pub struct GoldilocksNttGpu {
     device: Device,
@@ -71,11 +84,17 @@ pub struct GoldilocksNttGpu {
     inverse_ntt_pipeline: ComputePipeline,
     twiddle_pipeline: ComputePipeline,
     batched_ntt_pipeline: ComputePipeline,
+    pointwise_mul_pipeline: ComputePipeline,
 
     // Precomputed buffers
     modulus_params_buffer: Buffer,
     forward_twiddles_buffer: Buffer,  // omega powers for forward NTT
     inverse_twiddles_buffer: Buffer,  // omega_inv powers for inverse NTT
+
+    // Cached twiddle buffers for multipass NTT (keyed by NTT size n)
+    // These avoid recomputing twiddle factors on every NTT call
+    cached_forward_twiddles: RefCell<HashMap<usize, Buffer>>,
+    cached_inverse_twiddles: RefCell<HashMap<usize, Buffer>>,
 }
 
 impl std::fmt::Debug for GoldilocksNttGpu {
@@ -174,6 +193,587 @@ impl GoldilocksNttGpu {
     /// Returns the NTT size this context was created with.
     pub fn n(&self) -> usize {
         self.n
+    }
+
+    /// Gets or creates a cached forward twiddle buffer for the given NTT size.
+    /// Returns a reference-counted buffer that stays alive in the cache.
+    fn get_forward_twiddle_buffer(&self, ntt_size: usize) -> Result<(), GpuError> {
+        let mut cache = self.cached_forward_twiddles.borrow_mut();
+        if !cache.contains_key(&ntt_size) {
+            let omega = find_primitive_nth_root(ntt_size)
+                .ok_or_else(|| GpuError::InvalidParams(format!("No primitive root for n={}", ntt_size)))?;
+            let omega_powers = compute_powers(omega, ntt_size, GOLDILOCKS);
+            let twiddles_flat: Vec<u32> = omega_powers
+                .iter()
+                .flat_map(|&x| [x as u32, (x >> 32) as u32])
+                .collect();
+
+            let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("cached_forward_twiddles_{}", ntt_size)),
+                contents: bytemuck::cast_slice(&twiddles_flat),
+                usage: BufferUsages::STORAGE,
+            });
+            cache.insert(ntt_size, buffer);
+        }
+        Ok(())
+    }
+
+    /// Gets or creates a cached inverse twiddle buffer for the given NTT size.
+    fn get_inverse_twiddle_buffer(&self, ntt_size: usize) -> Result<(), GpuError> {
+        let mut cache = self.cached_inverse_twiddles.borrow_mut();
+        if !cache.contains_key(&ntt_size) {
+            let omega = find_primitive_nth_root(ntt_size)
+                .ok_or_else(|| GpuError::InvalidParams(format!("No primitive root for n={}", ntt_size)))?;
+            let omega_inv = mod_inverse(omega, GOLDILOCKS);
+            let omega_inv_powers = compute_powers(omega_inv, ntt_size, GOLDILOCKS);
+            let twiddles_flat: Vec<u32> = omega_inv_powers
+                .iter()
+                .flat_map(|&x| [x as u32, (x >> 32) as u32])
+                .collect();
+
+            let buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(&format!("cached_inverse_twiddles_{}", ntt_size)),
+                contents: bytemuck::cast_slice(&twiddles_flat),
+                usage: BufferUsages::STORAGE,
+            });
+            cache.insert(ntt_size, buffer);
+        }
+        Ok(())
+    }
+
+    /// Borrows the cached forward twiddle buffer for the given size.
+    /// Must call get_forward_twiddle_buffer first to ensure it exists.
+    fn borrow_forward_twiddles(&self, ntt_size: usize) -> std::cell::Ref<'_, Buffer> {
+        std::cell::Ref::map(self.cached_forward_twiddles.borrow(), |cache| {
+            cache.get(&ntt_size).expect("Forward twiddles not cached - call get_forward_twiddle_buffer first")
+        })
+    }
+
+    /// Borrows the cached inverse twiddle buffer for the given size.
+    /// Must call get_inverse_twiddle_buffer first to ensure it exists.
+    fn borrow_inverse_twiddles(&self, ntt_size: usize) -> std::cell::Ref<'_, Buffer> {
+        std::cell::Ref::map(self.cached_inverse_twiddles.borrow(), |cache| {
+            cache.get(&ntt_size).expect("Inverse twiddles not cached - call get_inverse_twiddle_buffer first")
+        })
+    }
+
+    // =========================================================================
+    // Buffer-based helpers for chained GPU operations (no CPU round trips)
+    // =========================================================================
+
+    /// Uploads data to a GPU buffer.
+    fn upload_to_buffer(&self, data: &[u64]) -> Buffer {
+        let data_flat: Vec<u32> = data
+            .iter()
+            .flat_map(|&x| [x as u32, (x >> 32) as u32])
+            .collect();
+        self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("upload_buffer"),
+            contents: bytemuck::cast_slice(&data_flat),
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        })
+    }
+
+    /// Downloads data from a GPU buffer.
+    async fn download_from_buffer(&self, buffer: &Buffer, len: usize) -> Result<Vec<u64>, GpuError> {
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("download_staging"),
+            size: (len * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("download_encoder"),
+        });
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, staging.size());
+        self.queue.submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.await
+            .map_err(|_| GpuError::ExecutionFailed("Channel cancelled".into()))?
+            .map_err(GpuError::BufferMapping)?;
+
+        let mapped = slice.get_mapped_range();
+        let data_u32: &[u32] = bytemuck::cast_slice(&mapped);
+        let mut result = vec![0u64; len];
+        for i in 0..len {
+            result[i] = data_u32[i * 2] as u64 | ((data_u32[i * 2 + 1] as u64) << 32);
+        }
+        drop(mapped);
+        staging.unmap();
+        Ok(result)
+    }
+
+    /// Column NTT pass (buffer-to-buffer, no CPU round trip).
+    /// Returns (output_buffer, params_buffer) - caller must keep both alive until submit.
+    fn column_ntt_to_buffer(
+        &self,
+        input: &Buffer,
+        n1: usize,
+        n2: usize,
+        total_n: usize,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(Buffer, Buffer), GpuError> {
+        let output = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("col_ntt_output"),
+            size: (total_n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Ensure twiddles are cached
+        self.get_forward_twiddle_buffer(n2)?;
+        let twiddles_ref = self.borrow_forward_twiddles(n2);
+
+        let max_shared = 2048usize;
+        let batch_per_wg = (max_shared / n2).max(1);
+        let params = GpuBatchedNttParams {
+            n: n2 as u32,
+            log_n: n2.trailing_zeros(),
+            batch_per_wg: batch_per_wg as u32,
+            total_batches: n1 as u32,
+            stride: n1 as u32,
+            _pad1: 0, _pad2: 0, _pad3: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("col_ntt_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let layout = self.batched_ntt_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("col_ntt_bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: input.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: output.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: twiddles_ref.as_entire_binding() },
+            ],
+        });
+
+        let num_wg = (n1 + batch_per_wg - 1) / batch_per_wg;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("col_ntt_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.batched_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(num_wg as u32, 1, 1);
+        }
+
+        Ok((output, params_buffer))
+    }
+
+    /// Twiddle multiplication pass (buffer-to-buffer, in-place on input).
+    /// Returns params_buffer - caller must keep alive until submit.
+    fn twiddle_to_buffer(
+        &self,
+        data: &Buffer,
+        n: usize,
+        n1: usize,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<Buffer, GpuError> {
+        self.get_forward_twiddle_buffer(n)?;
+        let twiddles_ref = self.borrow_forward_twiddles(n);
+
+        let params = GpuTwiddleParams {
+            n: n as u32,
+            n1: n1 as u32,
+            num_elements: n as u32,
+            _pad: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("twiddle_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let layout = self.twiddle_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("twiddle_bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: twiddles_ref.as_entire_binding() },
+            ],
+        });
+
+        let num_wg = (n + 255) / 256;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("twiddle_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.twiddle_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(num_wg as u32, 1, 1);
+        }
+
+        Ok(params_buffer)
+    }
+
+    /// Row NTT pass (buffer-to-buffer, no CPU round trip).
+    /// Processes n2 rows of size n1 each.
+    /// Returns (output_buffer, params_buffer) - caller must keep both alive until submit.
+    fn row_ntt_to_buffer(
+        &self,
+        input: &Buffer,
+        n1: usize,
+        n2: usize,
+        total_n: usize,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(Buffer, Buffer), GpuError> {
+        let output = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("row_ntt_output"),
+            size: (total_n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Row NTT uses twiddles for size n1
+        self.get_forward_twiddle_buffer(n1)?;
+        let twiddles_ref = self.borrow_forward_twiddles(n1);
+
+        // For row NTT: n2 batches of size n1, stride=1 (contiguous rows)
+        let max_shared = 2048usize;
+        let batch_per_wg = (max_shared / n1).max(1);
+        let params = GpuBatchedNttParams {
+            n: n1 as u32,
+            log_n: n1.trailing_zeros(),
+            batch_per_wg: batch_per_wg as u32,
+            total_batches: n2 as u32,
+            stride: 1, // Rows are contiguous
+            _pad1: 0, _pad2: 0, _pad3: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("row_ntt_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let layout = self.batched_ntt_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("row_ntt_bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: input.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: output.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: twiddles_ref.as_entire_binding() },
+            ],
+        });
+
+        let num_wg = (n2 + batch_per_wg - 1) / batch_per_wg;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("row_ntt_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.batched_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(num_wg as u32, 1, 1);
+        }
+
+        Ok((output, params_buffer))
+    }
+
+    /// Inverse twiddle multiplication pass (buffer-to-buffer, in-place).
+    fn inv_twiddle_to_buffer(
+        &self,
+        data: &Buffer,
+        n: usize,
+        n1: usize,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<Buffer, GpuError> {
+        self.get_inverse_twiddle_buffer(n)?;
+        let twiddles_ref = self.borrow_inverse_twiddles(n);
+
+        let params = GpuTwiddleParams {
+            n: n as u32,
+            n1: n1 as u32,
+            num_elements: n as u32,
+            _pad: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("inv_twiddle_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let layout = self.twiddle_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("inv_twiddle_bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: data.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: twiddles_ref.as_entire_binding() },
+            ],
+        });
+
+        let num_wg = (n + 255) / 256;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("inv_twiddle_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.twiddle_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(num_wg as u32, 1, 1);
+        }
+
+        Ok(params_buffer)
+    }
+
+    /// Inverse column NTT pass (buffer-to-buffer).
+    fn inv_column_ntt_to_buffer(
+        &self,
+        input: &Buffer,
+        n1: usize,
+        n2: usize,
+        total_n: usize,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(Buffer, Buffer), GpuError> {
+        let output = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inv_col_ntt_output"),
+            size: (total_n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        self.get_inverse_twiddle_buffer(n2)?;
+        let twiddles_ref = self.borrow_inverse_twiddles(n2);
+
+        let batch_per_wg = 1u32;
+        let params = GpuBatchedNttParams {
+            n: n2 as u32,
+            log_n: n2.trailing_zeros(),
+            batch_per_wg,
+            total_batches: n1 as u32,
+            stride: n1 as u32,
+            _pad1: 0, _pad2: 0, _pad3: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("inv_col_ntt_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let layout = self.batched_ntt_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("inv_col_ntt_bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: input.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: output.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: twiddles_ref.as_entire_binding() },
+            ],
+        });
+
+        let num_wg = n1;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("inv_col_ntt_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.batched_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(num_wg as u32, 1, 1);
+        }
+
+        Ok((output, params_buffer))
+    }
+
+    /// Inverse row NTT pass (buffer-to-buffer).
+    fn inv_row_ntt_to_buffer(
+        &self,
+        input: &Buffer,
+        n1: usize,
+        n2: usize,
+        total_n: usize,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<(Buffer, Buffer), GpuError> {
+        let output = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("inv_row_ntt_output"),
+            size: (total_n * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        self.get_inverse_twiddle_buffer(n1)?;
+        let twiddles_ref = self.borrow_inverse_twiddles(n1);
+
+        let max_shared = 2048usize;
+        let batch_per_wg = (max_shared / n1).max(1);
+        let params = GpuBatchedNttParams {
+            n: n1 as u32,
+            log_n: n1.trailing_zeros(),
+            batch_per_wg: batch_per_wg as u32,
+            total_batches: n2 as u32,
+            stride: 1,
+            _pad1: 0, _pad2: 0, _pad3: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("inv_row_ntt_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let layout = self.batched_ntt_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("inv_row_ntt_bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: input.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: output.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: twiddles_ref.as_entire_binding() },
+            ],
+        });
+
+        let num_wg = (n2 + batch_per_wg - 1) / batch_per_wg;
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("inv_row_ntt_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.batched_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(num_wg as u32, 1, 1);
+        }
+
+        Ok((output, params_buffer))
+    }
+
+    /// Performs GPU-accelerated pointwise multiplication: c[i] = a[i] * b[i] mod p.
+    /// Both inputs must have the same length.
+    pub async fn pointwise_mul_async(&self, a: &[u64], b: &[u64]) -> Result<Vec<u64>, GpuError> {
+        if a.len() != b.len() {
+            return Err(GpuError::InvalidParams(format!(
+                "Pointwise mul: a.len()={} != b.len()={}", a.len(), b.len()
+            )));
+        }
+
+        let num_elements = a.len();
+        if num_elements == 0 {
+            return Ok(vec![]);
+        }
+
+        // Flatten inputs to u32 pairs
+        let a_flat: Vec<u32> = a
+            .iter()
+            .flat_map(|&x| [x as u32, (x >> 32) as u32])
+            .collect();
+        let b_flat: Vec<u32> = b
+            .iter()
+            .flat_map(|&x| [x as u32, (x >> 32) as u32])
+            .collect();
+
+        // Create GPU buffers
+        let a_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pointwise_mul_a"),
+            contents: bytemuck::cast_slice(&a_flat),
+            usage: BufferUsages::STORAGE,
+        });
+
+        let b_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pointwise_mul_b"),
+            contents: bytemuck::cast_slice(&b_flat),
+            usage: BufferUsages::STORAGE,
+        });
+
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pointwise_mul_output"),
+            size: (num_elements * 2 * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let params = GpuPointwiseMulParams {
+            num_elements: num_elements as u32,
+            _pad1: 0,
+            _pad2: 0,
+            _pad3: 0,
+        };
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("pointwise_mul_params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+
+        let layout = self.pointwise_mul_pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pointwise_mul_bind"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: a_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: output_buffer.as_entire_binding() },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("pointwise_mul_encoder"),
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("pointwise_mul_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pointwise_mul_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            // 256 threads per workgroup
+            let num_wg = (num_elements + 255) / 256;
+            pass.dispatch_workgroups(num_wg as u32, 1, 1);
+        }
+
+        // Copy to staging buffer
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pointwise_mul_staging"),
+            size: output_buffer.size(),
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging, 0, output_buffer.size());
+
+        self.queue.submit(Some(encoder.finish()));
+
+        // Map and read back
+        let slice = staging.slice(..);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.await
+            .map_err(|_| GpuError::ExecutionFailed("Channel cancelled".into()))?
+            .map_err(GpuError::BufferMapping)?;
+
+        let mapped = slice.get_mapped_range();
+        let data_u32: &[u32] = bytemuck::cast_slice(&mapped);
+        let mut result = vec![0u64; num_elements];
+        for i in 0..num_elements {
+            result[i] = data_u32[i * 2] as u64 | ((data_u32[i * 2 + 1] as u64) << 32);
+        }
+        drop(mapped);
+        staging.unmap();
+
+        Ok(result)
     }
 
     /// Creates a new GPU context for Goldilocks NTT.
@@ -323,6 +923,23 @@ impl GoldilocksNttGpu {
                 cache: None,
             });
 
+        let pointwise_mul_shader = crate::shader_math::create_shader_module(
+            &device,
+            GOLDILOCKS_POINTWISE_MUL_SHADER,
+            "goldilocks_pointwise_mul.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
+
+        let pointwise_mul_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("goldilocks_pointwise_mul pipeline"),
+                layout: None,
+                module: &pointwise_mul_shader,
+                entry_point: Some("pointwise_mul"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         // Compute Goldilocks parameters
         let p = GOLDILOCKS;
         let mu: u128 = ((1u128 << 127) / (p as u128)) * 2;
@@ -390,9 +1007,12 @@ impl GoldilocksNttGpu {
             inverse_ntt_pipeline,
             twiddle_pipeline,
             batched_ntt_pipeline,
+            pointwise_mul_pipeline,
             modulus_params_buffer,
             forward_twiddles_buffer,
             inverse_twiddles_buffer,
+            cached_forward_twiddles: RefCell::new(HashMap::new()),
+            cached_inverse_twiddles: RefCell::new(HashMap::new()),
         })
     }
 
@@ -758,12 +1378,8 @@ impl GoldilocksNttGpu {
                 let a_eval = pollster::block_on(self.multipass_forward_ntt_async(&a_padded, ntt_size))?;
                 let b_eval = pollster::block_on(self.multipass_forward_ntt_async(&b_padded, ntt_size))?;
 
-                // Pointwise multiplication
-                let mut prod_eval = Vec::with_capacity(ntt_size);
-                for i in 0..ntt_size {
-                    let p = ((a_eval[i] as u128 * b_eval[i] as u128) % GOLDILOCKS as u128) as u64;
-                    prod_eval.push(p);
-                }
+                // GPU pointwise multiplication
+                let prod_eval = pollster::block_on(self.pointwise_mul_async(&a_eval, &b_eval))?;
 
                 // Inverse NTT (multipass)
                 let product = pollster::block_on(self.multipass_inverse_ntt_async(&prod_eval, ntt_size))?;
@@ -797,14 +1413,10 @@ impl GoldilocksNttGpu {
             (a_evals, b_evals)
         };
 
-        // Pointwise multiplication (CPU for now, could be GPU)
+        // GPU pointwise multiplication for each pair
         let mut prod_evals = Vec::with_capacity(pairs.len());
         for (a_eval, b_eval) in a_evals.iter().zip(b_evals.iter()) {
-            let mut prod = Vec::with_capacity(ntt_size);
-            for i in 0..ntt_size {
-                let p = ((a_eval[i] as u128 * b_eval[i] as u128) % GOLDILOCKS as u128) as u64;
-                prod.push(p);
-            }
+            let prod = pollster::block_on(self.pointwise_mul_async(a_eval, b_eval))?;
             prod_evals.push(prod);
         }
 
@@ -1169,12 +1781,8 @@ impl GoldilocksNttGpu {
                 let a_eval = self.multipass_forward_ntt_async(&a_padded, ntt_size).await?;
                 let b_eval = self.multipass_forward_ntt_async(&b_padded, ntt_size).await?;
 
-                // Pointwise multiplication
-                let mut prod_eval = Vec::with_capacity(ntt_size);
-                for i in 0..ntt_size {
-                    let p = ((a_eval[i] as u128 * b_eval[i] as u128) % GOLDILOCKS as u128) as u64;
-                    prod_eval.push(p);
-                }
+                // GPU pointwise multiplication
+                let prod_eval = self.pointwise_mul_async(&a_eval, &b_eval).await?;
 
                 // Inverse NTT (multipass)
                 let product = self.multipass_inverse_ntt_async(&prod_eval, ntt_size).await?;
@@ -1208,13 +1816,10 @@ impl GoldilocksNttGpu {
             (a_evals, b_evals)
         };
 
+        // GPU pointwise multiplication for each pair
         let mut prod_evals = Vec::with_capacity(pairs.len());
         for (a_eval, b_eval) in a_evals.iter().zip(b_evals.iter()) {
-            let mut prod = Vec::with_capacity(ntt_size);
-            for i in 0..ntt_size {
-                let p = ((a_eval[i] as u128 * b_eval[i] as u128) % GOLDILOCKS as u128) as u64;
-                prod.push(p);
-            }
+            let prod = self.pointwise_mul_async(a_eval, b_eval).await?;
             prod_evals.push(prod);
         }
 
@@ -1275,30 +1880,11 @@ impl GoldilocksNttGpu {
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
         });
 
-        // Create twiddles for size N (need ω_N^k for k = 0..N-1)
-        // We can reuse forward_twiddles if N == self.n, otherwise compute new ones
-        let twiddles_buffer = if n == self.n {
-            // Reuse existing twiddles
-            &self.forward_twiddles_buffer
-        } else {
-            // Need to compute twiddles for the larger size N
-            let omega = find_primitive_nth_root(n)
-                .ok_or_else(|| GpuError::InvalidParams(format!("No primitive root for n={}", n)))?;
-            let omega_powers = compute_powers(omega, n, GOLDILOCKS);
-            let twiddles: Vec<u32> = omega_powers
-                .iter()
-                .flat_map(|&x| [x as u32, (x >> 32) as u32])
-                .collect();
-
-            // Create temporary buffer
-            let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("twiddle_factors_temp"),
-                contents: bytemuck::cast_slice(&twiddles),
-                usage: BufferUsages::STORAGE,
-            });
-            // Note: We leak this buffer for now. For production, we'd cache it.
-            Box::leak(Box::new(buf))
-        };
+        // Get or create cached twiddles for size N (need ω_N^k for k = 0..N-1)
+        // The cached buffer stays alive in the HashMap, so no need to leak memory
+        self.get_forward_twiddle_buffer(n)?;
+        let cached_twiddles_ref = self.borrow_forward_twiddles(n);
+        let twiddles_buffer: &Buffer = &*cached_twiddles_ref;
 
         // Create params buffer
         let params = GpuTwiddleParams {
@@ -1443,26 +2029,45 @@ impl GoldilocksNttGpu {
         }
 
         // =====================================================================
-        // Bailey's Four-Step FFT (correct order):
-        // Data: N2 rows × N1 columns (row-major), N = N1 * N2
-        // 1. Column NTTs: N1 NTTs of size N2
-        // 2. Twiddle: element at (row, col) *= ω_N^(col * row)
-        // 3. Row NTTs: N2 NTTs of size N1
-        // 4. Read output column-major: X[col * N2 + row] = D[row][col]
+        // PARTIALLY CHAINED GPU OPERATIONS
+        // Column NTT + Twiddle are chained (1 round trip)
+        // Row NTT uses original batched approach (1 round trip)
+        // Total: 2 round trips instead of 3
         // =====================================================================
 
-        // =====================================================================
-        // Pass 1: N1 column NTTs of size N2 (stride = N1)
-        // =====================================================================
-        work_data = self.batched_column_ntt_async(&work_data, n1, n2, target_n).await?;
+        // Upload input data once
+        let input_buffer = self.upload_to_buffer(&work_data);
+
+        // Create command encoder for column NTT + twiddle
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("multipass_col_twiddle_encoder"),
+        });
+
+        // Keep buffers alive until submit
+        let mut keep_alive: Vec<Buffer> = Vec::new();
+
+        // Pass 1: Column NTTs
+        let (col_output, col_params) = self.column_ntt_to_buffer(&input_buffer, n1, n2, target_n, &mut encoder)?;
+        keep_alive.push(col_params);
+
+        // Pass 2: Twiddle multiplication (in-place on col_output)
+        let twiddle_params = self.twiddle_to_buffer(&col_output, target_n, n1, &mut encoder)?;
+        keep_alive.push(twiddle_params);
+
+        // Submit column NTT + twiddle
+        self.queue.submit(Some(encoder.finish()));
+
+        // Download intermediate result (round trip 1)
+        let mut work_data = self.download_from_buffer(&col_output, target_n).await?;
+
+        // Drop chained buffers
+        drop(keep_alive);
+        drop(col_output);
+        drop(input_buffer);
 
         // =====================================================================
-        // Twiddle multiplication: element at (row, col) *= ω_N^(col * row)
-        // =====================================================================
-        self.apply_twiddle_async(&mut work_data, target_n, n1).await?;
-
-        // =====================================================================
-        // Pass 2: N2 row NTTs of size N1
+        // Pass 3: Row NTTs using original batched approach (round trip 2)
+        // The batched_ntt_pipeline doesn't support contiguous row layout
         // =====================================================================
         let rows: Vec<Vec<u64>> = (0..n2)
             .map(|row| work_data[row * n1..(row + 1) * n1].to_vec())
@@ -1530,20 +2135,10 @@ impl GoldilocksNttGpu {
             mapped_at_creation: false,
         });
 
-        // Twiddles for column NTT size n2
-        let omega = find_primitive_nth_root(n2)
-            .ok_or_else(|| GpuError::InvalidParams(format!("No primitive root for n2={}", n2)))?;
-        let omega_powers = compute_powers(omega, n2, GOLDILOCKS);
-        let twiddles_flat: Vec<u32> = omega_powers
-            .iter()
-            .flat_map(|&x| [x as u32, (x >> 32) as u32])
-            .collect();
-
-        let twiddles_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("column_twiddles"),
-            contents: bytemuck::cast_slice(&twiddles_flat),
-            usage: BufferUsages::STORAGE,
-        });
+        // Get or create cached twiddles for column NTT size n2
+        self.get_forward_twiddle_buffer(n2)?;
+        let cached_twiddles_ref = self.borrow_forward_twiddles(n2);
+        let twiddles_buffer: &Buffer = &*cached_twiddles_ref;
 
         // Configure batched NTT params:
         // - n = n2 (NTT size per column)
@@ -1704,15 +2299,16 @@ impl GoldilocksNttGpu {
         }
 
         // =====================================================================
+        // PARTIALLY CHAINED GPU OPERATIONS
         // Bailey's Four-Step IFFT (inverse of forward):
-        // Input: column-major from forward NTT (X[col * N2 + row])
-        // 1. Transpose: row-major[row * N1 + col] = input[col * N2 + row]
-        // 2. Inverse row NTTs of size N1
-        // 3. Inverse twiddle: element at (row, col) *= ω_inv^(col * row)
-        // 4. Inverse column NTTs of size N2
+        // 1. Transpose (CPU)
+        // 2. Inverse row NTTs - original batched approach (round trip 1)
+        // 3. Inverse twiddle + Inverse column NTTs chained (round trip 2)
+        // 4. Scale by n_inv (CPU)
+        // Total: 2 round trips instead of 3
         // =====================================================================
 
-        // Step 1: Transpose (column-major input -> row-major)
+        // Step 1: Transpose (column-major input -> row-major) - done on CPU
         let mut work_data = vec![0u64; target_n];
         for row in 0..n2 {
             for col in 0..n1 {
@@ -1722,7 +2318,7 @@ impl GoldilocksNttGpu {
             }
         }
 
-        // Step 2: Inverse row NTTs of size N1
+        // Step 2: Inverse row NTTs using original batched approach (round trip 1)
         let rows: Vec<Vec<u64>> = (0..n2)
             .map(|row| work_data[row * n1..(row + 1) * n1].to_vec())
             .collect();
@@ -1740,13 +2336,44 @@ impl GoldilocksNttGpu {
             }
         }
 
-        // Step 3: Inverse twiddle (multiply by ω_inv^(col * row))
-        self.apply_inverse_twiddle_async(&mut work_data, target_n, n1).await?;
+        // Upload for chained twiddle + column NTT
+        let input_buffer = self.upload_to_buffer(&work_data);
 
-        // Step 4: Inverse column NTTs of size N2 (stride = N1)
-        work_data = self.batched_column_inverse_ntt_async(&work_data, n1, n2, target_n).await?;
+        // Create command encoder for twiddle + column NTT
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("multipass_inv_twiddle_col_encoder"),
+        });
 
-        Ok(work_data)
+        // Keep buffers alive until submit
+        let mut keep_alive: Vec<Buffer> = Vec::new();
+
+        // Step 3: Inverse twiddle (in-place on input_buffer)
+        let twiddle_params = self.inv_twiddle_to_buffer(&input_buffer, target_n, n1, &mut encoder)?;
+        keep_alive.push(twiddle_params);
+
+        // Step 4: Inverse column NTTs of size N2 (strided columns)
+        let (col_output, col_params) = self.inv_column_ntt_to_buffer(&input_buffer, n1, n2, target_n, &mut encoder)?;
+        keep_alive.push(col_params);
+
+        // Submit twiddle + column NTT
+        self.queue.submit(Some(encoder.finish()));
+
+        // Download result (round trip 2)
+        let mut result = self.download_from_buffer(&col_output, target_n).await?;
+
+        // Drop chained buffers
+        drop(keep_alive);
+        drop(col_output);
+        drop(input_buffer);
+
+        // Step 5: Scale by n2_inv for the column INTT
+        // Note: batched_inverse_ntt_async already applied n1_inv for row INTT
+        let n2_inv = mod_inverse(n2 as u64, GOLDILOCKS);
+        for val in result.iter_mut() {
+            *val = mod_mul(*val, n2_inv, GOLDILOCKS);
+        }
+
+        Ok(result)
     }
 
     /// Apply inverse twiddle factor multiplication (ω_inv^(col * row)).
@@ -1762,22 +2389,10 @@ impl GoldilocksNttGpu {
             )));
         }
 
-        // Compute inverse twiddles for size n
-        let omega = find_primitive_nth_root(n)
-            .ok_or_else(|| GpuError::InvalidParams(format!("No primitive root for n={}", n)))?;
-        let omega_inv = mod_inverse(omega, GOLDILOCKS);
-        let inv_twiddles = compute_powers(omega_inv, n, GOLDILOCKS);
-
-        let inv_twiddles_flat: Vec<u32> = inv_twiddles
-            .iter()
-            .flat_map(|&x| [x as u32, (x >> 32) as u32])
-            .collect();
-
-        let twiddles_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("inverse_twiddles"),
-            contents: bytemuck::cast_slice(&inv_twiddles_flat),
-            usage: BufferUsages::STORAGE,
-        });
+        // Get or create cached inverse twiddles for size n
+        self.get_inverse_twiddle_buffer(n)?;
+        let cached_twiddles_ref = self.borrow_inverse_twiddles(n);
+        let twiddles_buffer: &Buffer = &*cached_twiddles_ref;
 
         let data_flat: Vec<u32> = data
             .iter()
@@ -1907,21 +2522,10 @@ impl GoldilocksNttGpu {
             mapped_at_creation: false,
         });
 
-        // Inverse twiddles for column NTT size n2
-        let omega = find_primitive_nth_root(n2)
-            .ok_or_else(|| GpuError::InvalidParams(format!("No primitive root for n2={}", n2)))?;
-        let omega_inv = mod_inverse(omega, GOLDILOCKS);
-        let omega_inv_powers = compute_powers(omega_inv, n2, GOLDILOCKS);
-        let twiddles_flat: Vec<u32> = omega_inv_powers
-            .iter()
-            .flat_map(|&x| [x as u32, (x >> 32) as u32])
-            .collect();
-
-        let twiddles_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("column_inv_twiddles"),
-            contents: bytemuck::cast_slice(&twiddles_flat),
-            usage: BufferUsages::STORAGE,
-        });
+        // Get or create cached inverse twiddles for column NTT size n2
+        self.get_inverse_twiddle_buffer(n2)?;
+        let cached_twiddles_ref = self.borrow_inverse_twiddles(n2);
+        let twiddles_buffer: &Buffer = &*cached_twiddles_ref;
 
         // n_inv for normalization (applied on CPU after GPU computation)
         let n_inv = mod_inverse(n2 as u64, GOLDILOCKS);
@@ -2460,6 +3064,44 @@ fn apply_twiddle(
     // Store
     data[elem_base] = result.x;
     data[elem_base + 1u] = result.y;
+}
+"#;
+
+/// Pointwise multiplication shader for Goldilocks field.
+/// Computes c[i] = a[i] * b[i] mod p for each element.
+const GOLDILOCKS_POINTWISE_MUL_SHADER: &str = r#"
+#import math
+
+struct PointwiseMulParams {
+    num_elements: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: PointwiseMulParams;
+@group(0) @binding(1) var<storage, read> a: array<u32>;
+@group(0) @binding(2) var<storage, read> b: array<u32>;
+@group(0) @binding(3) var<storage, read_write> c: array<u32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn pointwise_mul(
+    @builtin(global_invocation_id) global_id: vec3<u32>
+) {
+    let idx = global_id.x;
+    if (idx >= params.num_elements) { return; }
+
+    // Load a[i] and b[i] (each stored as two u32s for u64)
+    let base = idx * 2u;
+    let a_val = vec2<u32>(a[base], a[base + 1u]);
+    let b_val = vec2<u32>(b[base], b[base + 1u]);
+
+    // Multiply using optimized Goldilocks multiplication
+    let result = math::goldilocks_mul(a_val, b_val);
+
+    // Store result
+    c[base] = result.x;
+    c[base + 1u] = result.y;
 }
 "#;
 
@@ -3123,6 +3765,114 @@ mod tests {
         }
 
         println!("Multipass NTT 16384 test passed!");
+    }
+
+    #[test]
+    fn test_chained_col_twiddle_vs_original() {
+        // Test that chained column NTT + twiddle produces same result as original separate calls
+        let target_n = 2048usize;
+        let n1 = 1024usize;
+        let n2 = target_n / n1; // 2
+
+        let gpu = GoldilocksNttGpu::new(1024).expect("GPU init failed");
+
+        // Test data
+        let input: Vec<u64> = (0..target_n)
+            .map(|i| (i as u64 * 12345 + 67890) % GOLDILOCKS)
+            .collect();
+
+        // === Original implementation (separate calls) ===
+        let original_col_result = pollster::block_on(
+            gpu.batched_column_ntt_async(&input, n1, n2, target_n)
+        ).expect("Original column NTT failed");
+
+        let mut original_twiddled = original_col_result.clone();
+        pollster::block_on(
+            gpu.apply_twiddle_async(&mut original_twiddled, target_n, n1)
+        ).expect("Original twiddle failed");
+
+        // === Chained implementation ===
+        let input_buffer = gpu.upload_to_buffer(&input);
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test_chained_encoder"),
+        });
+
+        let mut keep_alive = Vec::new();
+        let (col_output, col_params) = gpu.column_ntt_to_buffer(&input_buffer, n1, n2, target_n, &mut encoder)
+            .expect("Chained column NTT failed");
+        keep_alive.push(col_params);
+
+        let twiddle_params = gpu.twiddle_to_buffer(&col_output, target_n, n1, &mut encoder)
+            .expect("Chained twiddle failed");
+        keep_alive.push(twiddle_params);
+
+        gpu.queue.submit(Some(encoder.finish()));
+
+        let chained_result = pollster::block_on(gpu.download_from_buffer(&col_output, target_n))
+            .expect("Download failed");
+
+        drop(keep_alive);
+        drop(col_output);
+        drop(input_buffer);
+
+        // === Compare results ===
+        assert_eq!(original_twiddled.len(), chained_result.len());
+        let mut mismatches = 0;
+        for i in 0..target_n {
+            if original_twiddled[i] != chained_result[i] {
+                if mismatches < 5 {
+                    println!(
+                        "Mismatch at {}: original={}, chained={}",
+                        i, original_twiddled[i], chained_result[i]
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+
+        assert_eq!(mismatches, 0, "Chained vs original: {} mismatches", mismatches);
+        println!("PASS: Chained column NTT + twiddle matches original for N={}", target_n);
+    }
+
+    #[test]
+    fn test_gpu_pointwise_mul() {
+        // Test GPU pointwise multiplication against CPU reference
+        let n = 2048usize;
+        let gpu = GoldilocksNttGpu::new(1024).expect("GPU init failed");
+
+        // Generate test data
+        let a: Vec<u64> = (0..n)
+            .map(|i| (i as u64 * 12345 + 67890) % GOLDILOCKS)
+            .collect();
+        let b: Vec<u64> = (0..n)
+            .map(|i| (i as u64 * 54321 + 98765) % GOLDILOCKS)
+            .collect();
+
+        // GPU pointwise multiplication
+        let gpu_result = pollster::block_on(gpu.pointwise_mul_async(&a, &b))
+            .expect("GPU pointwise mul failed");
+
+        // CPU reference
+        let cpu_result: Vec<u64> = a.iter().zip(b.iter())
+            .map(|(&ai, &bi)| ((ai as u128 * bi as u128) % GOLDILOCKS as u128) as u64)
+            .collect();
+
+        // Compare
+        assert_eq!(gpu_result.len(), cpu_result.len());
+        let mut mismatches = 0;
+        for i in 0..n {
+            if gpu_result[i] != cpu_result[i] {
+                if mismatches < 5 {
+                    println!(
+                        "Mismatch at {}: GPU={}, CPU={}",
+                        i, gpu_result[i], cpu_result[i]
+                    );
+                }
+                mismatches += 1;
+            }
+        }
+        assert_eq!(mismatches, 0, "GPU vs CPU pointwise mul: {} mismatches", mismatches);
+        println!("PASS: GPU pointwise multiplication matches CPU for N={}", n);
     }
 }
 
