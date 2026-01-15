@@ -1849,14 +1849,19 @@ impl GoldilocksNttGpu {
 
             // Pre-create shared params buffers (same for all pairs since n1, n2, ntt_size are constant)
             // Ensure twiddles are cached
+            // Column NTT uses n2-sized twiddles, Row NTT uses n1-sized twiddles
+            self.get_forward_twiddle_buffer(n1)?;
             self.get_forward_twiddle_buffer(n2)?;
             self.get_forward_twiddle_buffer(ntt_size)?;
+            self.get_inverse_twiddle_buffer(n1)?;
             self.get_inverse_twiddle_buffer(n2)?;
             self.get_inverse_twiddle_buffer(ntt_size)?;
-            let fwd_twiddles_n2 = self.borrow_forward_twiddles(n2);
-            let fwd_twiddles_n = self.borrow_forward_twiddles(ntt_size);
-            let inv_twiddles_n2 = self.borrow_inverse_twiddles(n2);
-            let inv_twiddles_n = self.borrow_inverse_twiddles(ntt_size);
+            let fwd_twiddles_n1 = self.borrow_forward_twiddles(n1);  // For row NTT
+            let fwd_twiddles_n2 = self.borrow_forward_twiddles(n2);  // For column NTT
+            let fwd_twiddles_n = self.borrow_forward_twiddles(ntt_size);  // For twiddle mul
+            let inv_twiddles_n1 = self.borrow_inverse_twiddles(n1);  // For inverse row NTT
+            let inv_twiddles_n2 = self.borrow_inverse_twiddles(n2);  // For inverse column NTT
+            let inv_twiddles_n = self.borrow_inverse_twiddles(ntt_size);  // For inverse twiddle mul
 
             let max_shared = 2048usize;
             let batch_per_wg_col = (max_shared / n2).max(1);
@@ -1993,7 +1998,7 @@ impl GoldilocksNttGpu {
                         wgpu::BindGroupEntry { binding: 0, resource: row_ntt_params_buf.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: a_cols[local_idx].as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 2, resource: a_rows[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n2.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n1.as_entire_binding() },
                     ],
                 });
                 {
@@ -2042,7 +2047,7 @@ impl GoldilocksNttGpu {
                         wgpu::BindGroupEntry { binding: 0, resource: row_ntt_params_buf.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: b_cols[local_idx].as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 2, resource: b_rows[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n2.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: fwd_twiddles_n1.as_entire_binding() },
                     ],
                 });
                 {
@@ -2079,7 +2084,7 @@ impl GoldilocksNttGpu {
                         wgpu::BindGroupEntry { binding: 0, resource: row_ntt_params_buf.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: prods[local_idx].as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 2, resource: inv_rows[local_idx].as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: inv_twiddles_n2.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: inv_twiddles_n1.as_entire_binding() },
                     ],
                 });
                 {
