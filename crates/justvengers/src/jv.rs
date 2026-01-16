@@ -116,7 +116,7 @@ macro_rules! wasm_log {
 
 // Optional GPU acceleration for slot multiplication and NTT
 #[cfg(feature = "gpu")]
-use bgv_webgpu::{RnsSlotMulGpuRadix4, RnsBatchParams, GoldilocksNttGpu};
+use bgv_webgpu::{RnsSlotMulGpuV3, RnsBatchParams, GoldilocksNttGpu};
 
 // ============================================================================
 // Goldilocks IT-MAC Field
@@ -651,7 +651,7 @@ pub struct JVProver {
     /// GPU context for slot multiplication (pre-initialized for WASM).
     /// Wrapped in Arc for Clone support (GPU handles can't be cloned).
     #[cfg(feature = "gpu")]
-    gpu_context: Option<std::sync::Arc<RnsSlotMulGpuRadix4>>,
+    gpu_context: Option<std::sync::Arc<RnsSlotMulGpuV3>>,
     /// GPU context for Goldilocks NTT (polynomial multiplication).
     #[cfg(feature = "gpu")]
     ntt_gpu: Option<std::sync::Arc<GoldilocksNttGpu>>,
@@ -854,13 +854,13 @@ impl JVProver {
         let gpu_params = RnsBatchParams::from_moduli(slot_count, t, &moduli_with_psi)
             .ok_or(JVProverError::GpuInitFailed)?;
 
-        match RnsSlotMulGpuRadix4::new_async(gpu_params).await {
+        match RnsSlotMulGpuV3::new_async(gpu_params).await {
             Ok(ctx) => {
                 // V2 preallocates buffers and bind groups during construction
                 self.gpu_context = Some(std::sync::Arc::new(ctx));
             }
             Err(e) => {
-                eprintln!("[prepare_gpu_async] RnsSlotMulGpuRadix4 init failed: {}", e);
+                eprintln!("[prepare_gpu_async] RnsSlotMulGpuV3 init failed: {}", e);
                 return Err(JVProverError::GpuInitFailed);
             }
         }
@@ -908,13 +908,13 @@ impl JVProver {
         let gpu_params = RnsBatchParams::from_moduli(slot_count, t, &moduli_with_psi)
             .ok_or(JVProverError::GpuInitFailed)?;
 
-        match RnsSlotMulGpuRadix4::new(gpu_params) {
+        match RnsSlotMulGpuV3::new(gpu_params) {
             Ok(ctx) => {
                 // V2 preallocates buffers and bind groups during construction
                 self.gpu_context = Some(std::sync::Arc::new(ctx));
             }
             Err(e) => {
-                eprintln!("[prepare_gpu] RnsSlotMulGpuRadix4 init failed: {}", e);
+                eprintln!("[prepare_gpu] RnsSlotMulGpuV3 init failed: {}", e);
                 return Err(JVProverError::GpuInitFailed);
             }
         }
@@ -951,12 +951,12 @@ impl JVProver {
     /// Use this for benchmarks to initialize GPU before receiving verifier data.
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
     pub fn prepare_gpu_goldilocks(&mut self, slot_count: usize) -> Result<(), JVProverError> {
-        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpuRadix4};
+        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpuV3};
 
         let gpu_params = RnsBatchParams::goldilocks(slot_count)
             .ok_or(JVProverError::GpuInitFailed)?;
 
-        match RnsSlotMulGpuRadix4::new(gpu_params) {
+        match RnsSlotMulGpuV3::new(gpu_params) {
             Ok(ctx) => {
                 self.gpu_context = Some(std::sync::Arc::new(ctx));
                 Ok(())
@@ -971,13 +971,13 @@ impl JVProver {
     /// Creates a pre-initialized GPU context for Goldilocks parameters.
     /// Returns Arc that can be shared across multiple provers.
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    pub fn create_gpu_context_goldilocks(slot_count: usize) -> Result<std::sync::Arc<bgv_webgpu::RnsSlotMulGpuRadix4>, JVProverError> {
-        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpuRadix4};
+    pub fn create_gpu_context_goldilocks(slot_count: usize) -> Result<std::sync::Arc<bgv_webgpu::RnsSlotMulGpuV3>, JVProverError> {
+        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpuV3};
 
         let gpu_params = RnsBatchParams::goldilocks(slot_count)
             .ok_or(JVProverError::GpuInitFailed)?;
 
-        match RnsSlotMulGpuRadix4::new(gpu_params) {
+        match RnsSlotMulGpuV3::new(gpu_params) {
             Ok(ctx) => {
                 Ok(std::sync::Arc::new(ctx))
             }
@@ -991,13 +991,13 @@ impl JVProver {
     /// Async version of create_gpu_context_goldilocks for WASM.
     /// Returns Arc that can be shared across multiple provers.
     #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
-    pub async fn create_gpu_context_goldilocks(slot_count: usize) -> Result<std::sync::Arc<bgv_webgpu::RnsSlotMulGpuRadix4>, JVProverError> {
-        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpuRadix4};
+    pub async fn create_gpu_context_goldilocks(slot_count: usize) -> Result<std::sync::Arc<bgv_webgpu::RnsSlotMulGpuV3>, JVProverError> {
+        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpuV3};
 
         let gpu_params = RnsBatchParams::goldilocks(slot_count)
             .ok_or(JVProverError::GpuInitFailed)?;
 
-        match RnsSlotMulGpuRadix4::new_async(gpu_params).await {
+        match RnsSlotMulGpuV3::new_async(gpu_params).await {
             Ok(ctx) => {
                 Ok(std::sync::Arc::new(ctx))
             }
@@ -1010,7 +1010,7 @@ impl JVProver {
 
     /// Sets a pre-initialized GPU context (for sharing across iterations).
     #[cfg(feature = "gpu")]
-    pub fn set_gpu_context(&mut self, ctx: std::sync::Arc<bgv_webgpu::RnsSlotMulGpuRadix4>) {
+    pub fn set_gpu_context(&mut self, ctx: std::sync::Arc<bgv_webgpu::RnsSlotMulGpuV3>) {
         self.gpu_context = Some(ctx);
     }
 
@@ -1547,7 +1547,7 @@ impl JVProver {
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
     /// Returns (ciphertexts, total_gpu_time_ms, collapse_time_ms)
     fn commit_gpu_batched_with_ctx(
-        gpu_ctx: &RnsSlotMulGpuRadix4,
+        gpu_ctx: &RnsSlotMulGpuV3,
         polynomials: &[Vec<u64>],
         packed_powers_chunks: &[PackedEncryptedPowers],
         vole_blinders: &[u64],
@@ -1780,7 +1780,7 @@ impl JVProver {
     /// Returns (ciphertexts, gpu_time_ms, reshape_time_ms, ntt_extract_time_ms, collapse_time_ms)
     #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
     async fn commit_gpu_batched_with_ctx(
-        gpu_ctx: &RnsSlotMulGpuRadix4,
+        gpu_ctx: &RnsSlotMulGpuV3,
         polynomials: &[Vec<u64>],
         packed_powers_chunks: &[PackedEncryptedPowers],
         vole_blinders: &[u64],
