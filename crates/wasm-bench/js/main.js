@@ -24,6 +24,7 @@ const statusEl = document.getElementById('status');
 const outputEl = document.getElementById('output');
 const runAllBtn = document.getElementById('runAll');
 const runGarbleCoreBtn = document.getElementById('runGarbleCore');
+const gpuInfoBtn = document.getElementById('gpuInfo');
 const iterationsInput = document.getElementById('iterations');
 const samplesInput = document.getElementById('samples');
 
@@ -42,6 +43,7 @@ function setStatus(msg, isError = false) {
 function disableButtons(disabled) {
     runAllBtn.disabled = disabled;
     runGarbleCoreBtn.disabled = disabled;
+    gpuInfoBtn.disabled = disabled;
 }
 
 async function runBenchmarks(type, filter = null, concurrency = 8) {
@@ -138,6 +140,20 @@ window.onunhandledrejection = (event) => {
 
 runAllBtn.addEventListener('click', () => runBenchmarks('all'));
 runGarbleCoreBtn.addEventListener('click', () => runBenchmarks('garble_core'));
+gpuInfoBtn.addEventListener('click', async () => {
+    disableButtons(true);
+    setStatus('Getting GPU info...');
+    try {
+        const info = await bench.getGpuInfo();
+        outputEl.textContent = info;
+        setStatus('GPU info retrieved!');
+    } catch (e) {
+        setStatus(`Error: ${e.message}`, true);
+        outputEl.textContent = e.stack || e.toString();
+    } finally {
+        disableButtons(false);
+    }
+});
 
 // Expose for chromiumoxide
 window.runBenchmark = async (config) => {

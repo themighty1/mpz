@@ -390,3 +390,10 @@ export async function runBenchmark(config = {}) {
         formatted,
     };
 }
+
+// Get GPU adapter info - useful for debugging WebGPU support
+// Returns info about the GPU adapter including device type (Cpu = software fallback)
+export async function getGpuInfo() {
+    if (!wasm) throw new Error("WASM not initialized. Call init() first.");
+    return await wasm.get_gpu_info();
+}

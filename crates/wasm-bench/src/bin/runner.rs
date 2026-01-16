@@ -480,6 +480,150 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     selected_benchmarks.push(custom_name);
                 }
             }
+            "--gpu-info" => {
+                // Quick GPU info check - launch browser and check adapter
+                // Use non-headless mode with Xvfb for WebGPU support
+                let builder = BrowserConfig::builder()
+                    .with_head()  // Disable headless mode for WebGPU
+                    .arg("--no-sandbox")
+                    .arg("--disable-dev-shm-usage")
+                    .arg("--ozone-platform=x11")  // Force X11 for Xvfb
+                    .arg("--enable-unsafe-webgpu")
+                    .arg("--enable-features=Vulkan,UseSkiaRenderer,WebGPU")
+                    .arg("--use-angle=vulkan")
+                    .arg("--enable-gpu")
+                    .arg("--ignore-gpu-blocklist")
+                    .arg("--use-vulkan")
+                    .window_size(800, 600)
+                    .request_timeout(Duration::from_secs(30));
+
+                let config = builder.build()?;
+                let (browser, mut handler) = Browser::launch(config).await?;
+
+                tokio::spawn(async move {
+                    while let Some(_) = handler.next().await {}
+                });
+
+                // Start a simple localhost server for secure context
+                let crate_dir = get_crate_dir();
+                let server_addr = start_server(crate_dir).await?;
+                let url = format!("http://{}/", server_addr);
+
+                let page = browser.new_page(&url).await?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                // Check GPU adapter info using JavaScript
+                let js = r#"
+                    (async () => {
+                        if (!navigator.gpu) {
+                            return {
+                                error: "WebGPU not supported",
+                                debug: {
+                                    navigatorGpuType: typeof navigator.gpu,
+                                    navigatorKeys: Object.keys(navigator).filter(k => k.toLowerCase().includes('gpu')),
+                                }
+                            };
+                        }
+                        const adapter = await navigator.gpu.requestAdapter();
+                        if (!adapter) {
+                            return { error: "No GPU adapter found (requestAdapter returned null)" };
+                        }
+
+                        // requestAdapterInfo may not exist in older Chrome versions
+                        let info = {};
+                        if (typeof adapter.requestAdapterInfo === 'function') {
+                            info = await adapter.requestAdapterInfo();
+                        }
+
+                        return {
+                            isFallbackAdapter: adapter.isFallbackAdapter,
+                            vendor: info.vendor || 'N/A',
+                            architecture: info.architecture || 'N/A',
+                            device: info.device || 'N/A',
+                            description: info.description || 'N/A',
+                            features: [...adapter.features].join(", "),
+                            limits: {
+                                maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+                                maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+                                maxComputeWorkgroupSizeX: adapter.limits.maxComputeWorkgroupSizeX,
+                                maxComputeInvocationsPerWorkgroup: adapter.limits.maxComputeInvocationsPerWorkgroup,
+                            }
+                        };
+                    })()
+                "#;
+
+                let result = page.evaluate(js).await?;
+                let json: serde_json::Value = result.into_value()?;
+
+                println!("\n=== WebGPU Adapter Info ===\n");
+                if let Some(error) = json.get("error") {
+                    println!("Error: {}", error);
+                    if let Some(debug) = json.get("debug") {
+                        println!("Debug info: {}", serde_json::to_string_pretty(debug).unwrap_or_default());
+                    }
+
+                    // Also check chrome://gpu for more info
+                    println!("\n=== Checking chrome://gpu ===\n");
+                    page.goto(NavigateParams::builder().url("chrome://gpu").build()?).await?;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+
+                    let gpu_js = r#"
+                        (async function() {
+                            // Wait for info-view to populate
+                            await new Promise(r => setTimeout(r, 3000));
+
+                            // Try to get shadow DOM content from info-view
+                            const infoView = document.querySelector('info-view');
+                            if (infoView && infoView.shadowRoot) {
+                                return infoView.shadowRoot.textContent || infoView.shadowRoot.innerHTML.substring(0, 8000);
+                            }
+
+                            // Fallback to body content
+                            let content = '';
+                            if (document.body) {
+                                content = document.body.innerText || document.body.textContent || '';
+                            }
+                            if (!content || content.length < 100) {
+                                content = document.documentElement.outerHTML.substring(0, 5000);
+                            }
+                            return content.substring(0, 8000);
+                        })()
+                    "#;
+
+                    if let Ok(gpu_result) = page.evaluate(gpu_js).await {
+                        if let Ok(gpu_text) = gpu_result.into_value::<String>() {
+                            if gpu_text.is_empty() {
+                                println!("(empty page content)");
+                            } else {
+                                println!("{}", gpu_text);
+                            }
+                        }
+                    }
+                } else {
+                    println!("isFallbackAdapter: {}", json.get("isFallbackAdapter").unwrap_or(&serde_json::Value::Null));
+                    println!("vendor: {}", json.get("vendor").unwrap_or(&serde_json::Value::Null));
+                    println!("architecture: {}", json.get("architecture").unwrap_or(&serde_json::Value::Null));
+                    println!("device: {}", json.get("device").unwrap_or(&serde_json::Value::Null));
+                    println!("description: {}", json.get("description").unwrap_or(&serde_json::Value::Null));
+                    println!("\nFeatures: {}", json.get("features").unwrap_or(&serde_json::Value::Null));
+                    if let Some(limits) = json.get("limits") {
+                        println!("\nLimits:");
+                        println!("  maxComputeWorkgroupStorageSize: {} bytes ({} KB)",
+                            limits.get("maxComputeWorkgroupStorageSize").unwrap_or(&serde_json::Value::Null),
+                            limits.get("maxComputeWorkgroupStorageSize").and_then(|v| v.as_u64()).unwrap_or(0) / 1024);
+                        println!("  maxStorageBufferBindingSize: {} bytes ({} MB)",
+                            limits.get("maxStorageBufferBindingSize").unwrap_or(&serde_json::Value::Null),
+                            limits.get("maxStorageBufferBindingSize").and_then(|v| v.as_u64()).unwrap_or(0) / (1024*1024));
+                        println!("  maxComputeWorkgroupSizeX: {}",
+                            limits.get("maxComputeWorkgroupSizeX").unwrap_or(&serde_json::Value::Null));
+                        println!("  maxComputeInvocationsPerWorkgroup: {}",
+                            limits.get("maxComputeInvocationsPerWorkgroup").unwrap_or(&serde_json::Value::Null));
+                    }
+                }
+
+                drop(browser);
+                return Ok(());
+            }
             "--help" | "-h" => {
                 println!("WASM Benchmark Runner");
                 println!();
@@ -495,6 +639,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  --group, -g <GROUP>  Run all benchmarks in a group (can be repeated)");
                 println!("  --bench, -b <NAME>   Run specific benchmark (can be repeated)");
                 println!("  --reps, -r <N>       Run jv_vm_prover_main_thread with custom reps value");
+                println!("  --gpu-info           Show WebGPU adapter info (isFallbackAdapter, limits)");
                 println!("  --list, -l           List available groups and benchmarks");
                 println!("  --verbose, -v        Print browser console logs to terminal");
                 println!("  --help, -h           Show this help");
@@ -554,15 +699,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start HTTP server
     let server_addr = start_server(crate_dir).await?;
 
-    // Configure browser (headless with WebGPU support)
+    // Configure browser for WebGPU with real GPU acceleration
+    // IMPORTANT: Run with xvfb-run for headless GPU: xvfb-run -a cargo run --release --bin wasm-bench-runner -- [args]
     let builder = BrowserConfig::builder()
+        .with_head()  // Non-headless for WebGPU (requires Xvfb)
         .arg("--no-sandbox")
         .arg("--disable-dev-shm-usage")
         .arg("--disable-cache")
         .arg("--disable-application-cache")
-        .arg("--headless=new")  // New headless mode supports GPU
+        .arg("--ozone-platform=x11")  // Force X11 for Xvfb
         .arg("--enable-unsafe-webgpu")  // Enable WebGPU
-        .arg("--enable-features=Vulkan,UseSkiaRenderer")  // GPU backend
+        .arg("--enable-features=Vulkan,UseSkiaRenderer,WebGPU")  // GPU backend
+        .arg("--use-angle=vulkan")
+        .arg("--enable-gpu")
+        .arg("--ignore-gpu-blocklist")
+        .arg("--use-vulkan")
         .window_size(1200, 800)
         // Increase CDP request timeout to match benchmark timeout (20 min)
         // Default is 30s which causes "Timeout" errors during long CPU operations

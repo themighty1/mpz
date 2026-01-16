@@ -171,6 +171,31 @@ impl RnsSlotMulGpuRadix4 {
             .await
             .ok_or(GpuError::AdapterNotFound)?;
 
+        // Print adapter info for debugging
+        #[cfg(target_arch = "wasm32")]
+        {
+            let info = adapter.get_info();
+            let limits = adapter.limits();
+            web_sys::console::log_1(&format!(
+                "[GPU] Adapter: {} ({:?})",
+                info.name, info.backend
+            ).into());
+            web_sys::console::log_1(&format!(
+                "[GPU] DeviceType: {:?} (Cpu = software fallback)",
+                info.device_type
+            ).into());
+            web_sys::console::log_1(&format!(
+                "[GPU] maxComputeWorkgroupStorageSize: {} bytes ({} KB)",
+                limits.max_compute_workgroup_storage_size,
+                limits.max_compute_workgroup_storage_size / 1024
+            ).into());
+            web_sys::console::log_1(&format!(
+                "[GPU] maxStorageBufferBindingSize: {} bytes ({} MB)",
+                limits.max_storage_buffer_binding_size,
+                limits.max_storage_buffer_binding_size / (1024 * 1024)
+            ).into());
+        }
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {

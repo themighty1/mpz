@@ -117,8 +117,12 @@ pub struct RnsSlotMulGpuV3 {
     device: Device,
     queue: Queue,
 
-    // Four-step pipelines
-    slot_encode_pipeline: ComputePipeline,        // Slots → coefficients (in plaintext ring)
+    // Four-step slot encode pipelines (Goldilocks INTT decomposed)
+    slot_encode_col_intt_pipeline: ComputePipeline,      // 32-point INTT on columns
+    slot_encode_cross_twiddle_inv_pipeline: ComputePipeline,  // Cross-twiddle inverse
+    slot_encode_row_intt_pipeline: ComputePipeline,      // 256-point INTT on rows + n^-1
+
+    // Four-step NTT pipelines (RNS moduli)
     twist_pipeline: ComputePipeline,              // Coefficients → twisted + RNS expanded
     row_ntt_pipeline: ComputePipeline,            // 256-point NTTs (step 1)
     cross_twiddle_pipeline: ComputePipeline,      // Multiply by omega^(row*col) (step 2)
@@ -168,8 +172,15 @@ pub struct RnsSlotMulGpuV3 {
     preallocated_cts_c0_buffer: Buffer,
     preallocated_cts_c1_buffer: Buffer,
 
+    // Goldilocks twiddle buffers for four-step slot encoding
+    goldilocks_col_inv_twiddles_buffer: Buffer,   // 32 elements (zeta_inv^(256*i))
+    goldilocks_row_inv_twiddles_buffer: Buffer,   // 256 elements (zeta_inv^(32*i))
+    // Note: cross_inv_twiddles reuses plaintext_twiddles_buffer (zeta_inv^(row*col) = zeta_inv^idx)
+
     // Bind groups (one per step for flexibility)
-    slot_encode_bind_group: BindGroup,
+    slot_encode_col_intt_bind_group: BindGroup,
+    slot_encode_cross_twiddle_inv_bind_group: BindGroup,
+    slot_encode_row_intt_bind_group: BindGroup,
     twist_bind_group: BindGroup,
     row_ntt_bind_group: BindGroup,
     cross_twiddle_bind_group: BindGroup,
@@ -245,6 +256,32 @@ impl RnsSlotMulGpuV3 {
             .await
             .ok_or(GpuError::AdapterNotFound)?;
 
+        // Print GPU limits for debugging
+        let limits = adapter.limits();
+        let info = adapter.get_info();
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::console::log_1(&format!(
+                "[V3 GPU] Adapter: {} ({:?})",
+                info.name, info.backend
+            ).into());
+            web_sys::console::log_1(&format!(
+                "[V3 GPU] DeviceType: {:?} (Cpu = software fallback)",
+                info.device_type
+            ).into());
+            web_sys::console::log_1(&format!(
+                "[V3 GPU] maxComputeWorkgroupStorageSize: {} bytes ({} KB)",
+                limits.max_compute_workgroup_storage_size,
+                limits.max_compute_workgroup_storage_size / 1024
+            ).into());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        eprintln!(
+            "[V3 GPU] maxComputeWorkgroupStorageSize: {} bytes ({} KB)",
+            limits.max_compute_workgroup_storage_size,
+            limits.max_compute_workgroup_storage_size / 1024
+        );
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -288,10 +325,25 @@ impl RnsSlotMulGpuV3 {
         assert_eq!(n1 * n2, n, "Four-step decomposition requires n = n1 * n2");
 
         // Compile shaders using naga_oil composition
-        let slot_encode_shader = crate::shader_math::create_shader_module(
+        // Four-step slot encode shaders (Goldilocks INTT)
+        let slot_encode_col_intt_shader = crate::shader_math::create_shader_module(
             &device,
-            SLOT_ENCODE_SHADER,
-            "slot_encode_v3.wgsl",
+            SLOT_ENCODE_COL_INTT_SHADER,
+            "slot_encode_col_intt_v3.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
+
+        let slot_encode_cross_twiddle_inv_shader = crate::shader_math::create_shader_module(
+            &device,
+            SLOT_ENCODE_CROSS_TWIDDLE_INV_SHADER,
+            "slot_encode_cross_twiddle_inv_v3.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
+
+        let slot_encode_row_intt_shader = crate::shader_math::create_shader_module(
+            &device,
+            SLOT_ENCODE_ROW_INTT_SHADER,
+            "slot_encode_row_intt_v3.wgsl",
         )
         .map_err(GpuError::ShaderCompilation)?;
 
@@ -345,12 +397,33 @@ impl RnsSlotMulGpuV3 {
         .map_err(GpuError::ShaderCompilation)?;
 
         // Create pipelines
-        let slot_encode_pipeline =
+        // Four-step slot encode pipelines
+        let slot_encode_col_intt_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("slot_encode_v3 pipeline"),
+                label: Some("slot_encode_col_intt_v3 pipeline"),
                 layout: None,
-                module: &slot_encode_shader,
-                entry_point: Some("slot_encode_batched"),
+                module: &slot_encode_col_intt_shader,
+                entry_point: Some("slot_encode_col_intt"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let slot_encode_cross_twiddle_inv_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("slot_encode_cross_twiddle_inv_v3 pipeline"),
+                layout: None,
+                module: &slot_encode_cross_twiddle_inv_shader,
+                entry_point: Some("slot_encode_cross_twiddle_inv"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let slot_encode_row_intt_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("slot_encode_row_intt_v3 pipeline"),
+                layout: None,
+                module: &slot_encode_row_intt_shader,
+                entry_point: Some("slot_encode_row_intt"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -463,6 +536,37 @@ impl RnsSlotMulGpuV3 {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("plaintext_twiddles_v3"),
                 contents: bytemuck::cast_slice(&pt_twiddles_flat),
+                usage: BufferUsages::STORAGE,
+            });
+
+        // Create Goldilocks twiddle buffers for four-step slot encoding
+        // Col INTT: zeta_inv^(256*i) for i = 0..32 (32-point INTT twiddles)
+        let mut goldilocks_col_inv_twiddles: Vec<u32> = Vec::with_capacity(n1 * 2);
+        for i in 0..n1 {
+            let idx = (256 * i) % n;
+            let zeta_inv = pt_data.zeta_inv_powers[idx];
+            goldilocks_col_inv_twiddles.push(zeta_inv as u32);
+            goldilocks_col_inv_twiddles.push((zeta_inv >> 32) as u32);
+        }
+        let goldilocks_col_inv_twiddles_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("goldilocks_col_inv_twiddles_v3"),
+                contents: bytemuck::cast_slice(&goldilocks_col_inv_twiddles),
+                usage: BufferUsages::STORAGE,
+            });
+
+        // Row INTT: zeta_inv^(32*j) for j = 0..256 (256-point INTT twiddles)
+        let mut goldilocks_row_inv_twiddles: Vec<u32> = Vec::with_capacity(n2 * 2);
+        for j in 0..n2 {
+            let idx = (32 * j) % n;
+            let zeta_inv = pt_data.zeta_inv_powers[idx];
+            goldilocks_row_inv_twiddles.push(zeta_inv as u32);
+            goldilocks_row_inv_twiddles.push((zeta_inv >> 32) as u32);
+        }
+        let goldilocks_row_inv_twiddles_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("goldilocks_row_inv_twiddles_v3"),
+                contents: bytemuck::cast_slice(&goldilocks_row_inv_twiddles),
                 usage: BufferUsages::STORAGE,
             });
 
@@ -713,14 +817,15 @@ impl RnsSlotMulGpuV3 {
                 usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             });
 
-        // Create bind groups
-        let slot_encode_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("slot_encode_bind_group_v3"),
-            layout: &slot_encode_pipeline.get_bind_group_layout(0),
+        // Create bind groups for four-step slot encoding
+        // Step 1: Col INTT - reads slots, writes to temp
+        let slot_encode_col_intt_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("slot_encode_col_intt_bind_group_v3"),
+            layout: &slot_encode_col_intt_pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: preallocated_batch_params_buffer.as_entire_binding(),
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -728,11 +833,55 @@ impl RnsSlotMulGpuV3 {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: preallocated_temp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: goldilocks_col_inv_twiddles_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Step 2: Cross-twiddle inverse - in-place on temp
+        let slot_encode_cross_twiddle_inv_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("slot_encode_cross_twiddle_inv_bind_group_v3"),
+            layout: &slot_encode_cross_twiddle_inv_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: preallocated_temp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: plaintext_twiddles_buffer.as_entire_binding(),  // Full zeta_inv powers
+                },
+            ],
+        });
+
+        // Step 3: Row INTT - reads temp, writes to encoded
+        let slot_encode_row_intt_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("slot_encode_row_intt_bind_group_v3"),
+            layout: &slot_encode_row_intt_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: preallocated_temp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
                     resource: preallocated_encoded_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: plaintext_twiddles_buffer.as_entire_binding(),
+                    resource: goldilocks_row_inv_twiddles_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -1070,7 +1219,9 @@ impl RnsSlotMulGpuV3 {
         Ok(Self {
             device,
             queue,
-            slot_encode_pipeline,
+            slot_encode_col_intt_pipeline,
+            slot_encode_cross_twiddle_inv_pipeline,
+            slot_encode_row_intt_pipeline,
             twist_pipeline,
             row_ntt_pipeline,
             cross_twiddle_pipeline,
@@ -1084,6 +1235,8 @@ impl RnsSlotMulGpuV3 {
             n2,
             plaintext_twiddles_buffer,
             plaintext_params_buffer,
+            goldilocks_col_inv_twiddles_buffer,
+            goldilocks_row_inv_twiddles_buffer,
             all_row_twiddles_buffer,
             all_row_inv_twiddles_buffer,
             all_col_twiddles_buffer,
@@ -1104,7 +1257,9 @@ impl RnsSlotMulGpuV3 {
             preallocated_slots_buffer,
             preallocated_cts_c0_buffer,
             preallocated_cts_c1_buffer,
-            slot_encode_bind_group,
+            slot_encode_col_intt_bind_group,
+            slot_encode_cross_twiddle_inv_bind_group,
+            slot_encode_row_intt_bind_group,
             twist_bind_group,
             row_ntt_bind_group,
             cross_twiddle_bind_group,
@@ -1117,6 +1272,208 @@ impl RnsSlotMulGpuV3 {
             cross_twiddle_inv_c1_bind_group,
             row_intt_c1_bind_group,
         })
+    }
+
+    // =========================================================================
+    // Warmup (Force Shader Compilation)
+    // =========================================================================
+
+    /// Forces shader compilation by dispatching minimal workloads through all pipelines.
+    /// Call this after context creation to avoid compilation delays during actual work.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn warmup(&self) {
+        pollster::block_on(self.warmup_async());
+    }
+
+    /// Async warmup for WASM - dispatches through all pipelines to force compilation.
+    pub async fn warmup_async(&self) {
+        let n = self.params.n;
+        let k = self.params.k;
+        let n1 = self.n1;
+        let n2 = self.n2;
+
+        // Use minimal batch count (1) for warmup
+        let num_batches = 1usize;
+        let log_n = (n as u32).trailing_zeros();
+
+        // Update batch params for warmup
+        let batch_params = GpuBatchParams {
+            n: n as u32,
+            log_n,
+            num_batches: num_batches as u32,
+            num_moduli: k as u32,
+        };
+        self.queue.write_buffer(
+            &self.preallocated_batch_params_buffer,
+            0,
+            bytemuck::bytes_of(&batch_params),
+        );
+
+        // Update fourstep params for warmup
+        let fourstep_params = GpuFourStepParams {
+            n: n as u32,
+            n1: n1 as u32,
+            n2: n2 as u32,
+            log_n2: (n2 as u32).trailing_zeros(),
+            num_batches: num_batches as u32,
+            num_moduli: k as u32,
+            log_n1: (n1 as u32).trailing_zeros(),
+            _pad: 0,
+        };
+        self.queue.write_buffer(
+            &self.preallocated_fourstep_params_buffer,
+            0,
+            bytemuck::bytes_of(&fourstep_params),
+        );
+
+        // Update fused params for warmup
+        let fused_params = GpuBatchParamsMultiCt {
+            n: n as u32,
+            n1: n1 as u32,
+            n2: n2 as u32,
+            num_batches: num_batches as u32,
+            num_moduli: k as u32,
+            num_cts: 1,
+            batches_per_ct: num_batches as u32,
+            _pad: 0,
+        };
+        self.queue.write_buffer(
+            &self.preallocated_fused_params_buffer,
+            0,
+            bytemuck::bytes_of(&fused_params),
+        );
+
+        let wg_per_n = (n + 255) / 256;
+
+        // Create encoder and dispatch through all pipelines
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("warmup_v3"),
+        });
+
+        // 1. Slot encode (four-step decomposition)
+        // Step 1: Column INTT (32-point INTT on each of 256 columns)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_slot_encode_col_intt"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.slot_encode_col_intt_pipeline);
+            pass.set_bind_group(0, &self.slot_encode_col_intt_bind_group, &[]);
+            pass.dispatch_workgroups(n2 as u32, num_batches as u32, 1);
+        }
+        // Step 2: Cross-twiddle inverse
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_slot_encode_cross_inv"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.slot_encode_cross_twiddle_inv_pipeline);
+            pass.set_bind_group(0, &self.slot_encode_cross_twiddle_inv_bind_group, &[]);
+            pass.dispatch_workgroups(wg_per_n as u32, num_batches as u32, 1);
+        }
+        // Step 3: Row INTT (256-point INTT on each of 32 rows)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_slot_encode_row_intt"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.slot_encode_row_intt_pipeline);
+            pass.set_bind_group(0, &self.slot_encode_row_intt_bind_group, &[]);
+            pass.dispatch_workgroups(n1 as u32, num_batches as u32, 1);
+        }
+
+        // 2. Twist (forward)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_twist"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.twist_pipeline);
+            pass.set_bind_group(0, &self.twist_bind_group, &[]);
+            pass.dispatch_workgroups(wg_per_n as u32, num_batches as u32, k as u32);
+        }
+
+        // 3. Row NTT
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_row_ntt"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.row_ntt_pipeline);
+            pass.set_bind_group(0, &self.row_ntt_bind_group, &[]);
+            pass.dispatch_workgroups(n1 as u32, num_batches as u32, k as u32);
+        }
+
+        // 4. Cross twiddle (forward)
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_cross_twiddle"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.cross_twiddle_pipeline);
+            pass.set_bind_group(0, &self.cross_twiddle_bind_group, &[]);
+            pass.dispatch_workgroups(wg_per_n as u32, num_batches as u32, k as u32);
+        }
+
+        // 5. Col NTT
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_col_ntt"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.col_ntt_pipeline);
+            pass.set_bind_group(0, &self.col_ntt_bind_group, &[]);
+            pass.dispatch_workgroups(n2 as u32, num_batches as u32, k as u32);
+        }
+
+        // 6. Pointwise mul
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_pointwise_mul"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pointwise_mul_pipeline);
+            pass.set_bind_group(0, &self.pointwise_mul_bind_group, &[]);
+            pass.dispatch_workgroups(wg_per_n as u32, num_batches as u32, k as u32);
+        }
+
+        // 7. Col INTT
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_col_intt"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.col_intt_pipeline);
+            pass.set_bind_group(0, &self.col_intt_bind_group, &[]);
+            pass.dispatch_workgroups(n2 as u32, num_batches as u32, k as u32);
+        }
+
+        // 8. Cross twiddle inv
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_cross_twiddle_inv"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.cross_twiddle_pipeline);
+            pass.set_bind_group(0, &self.cross_twiddle_inv_bind_group, &[]);
+            pass.dispatch_workgroups(wg_per_n as u32, num_batches as u32, k as u32);
+        }
+
+        // 9. Row INTT
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_row_intt"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.row_intt_pipeline);
+            pass.set_bind_group(0, &self.row_intt_bind_group, &[]);
+            pass.dispatch_workgroups(n1 as u32, num_batches as u32, k as u32);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Force GPU to complete warmup before returning
+        self.device.poll(wgpu::Maintain::Wait);
     }
 
     // =========================================================================
@@ -1257,23 +1614,59 @@ impl RnsSlotMulGpuV3 {
 
         // Execute GPU pipeline
         // =====================================================================
-        // Phase 1: Slot encode (plaintext INTT) - separate submit
+        // Phase 1: Slot encode (plaintext INTT) - four-step decomposition
+        // Step 1: 32-point col INTT, Step 2: cross-twiddle inv, Step 3: 256-point row INTT
         // =====================================================================
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&"[V3] Starting slot_encode phase".into());
+
+        let wg_per_n = ((n + 255) / 256) as u32;
         {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("slot_encode_v3_encoder"),
             });
+
+            // Step 1: Column INTT (32-point INTT on each of 256 columns)
+            // Dispatch: (n2, num_batches, 1) = (256, num_batches, 1)
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("slot_encode_v3"),
+                    label: Some("slot_encode_col_intt"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.slot_encode_pipeline);
-                pass.set_bind_group(0, &self.slot_encode_bind_group, &[]);
-                pass.dispatch_workgroups(num_batches as u32, 1, 1);
+                pass.set_pipeline(&self.slot_encode_col_intt_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_col_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, 1);
             }
+
+            // Step 2: Cross-twiddle inverse (multiply by zeta_inv^(row*col))
+            // Dispatch: (n/256, num_batches, 1) = (32, num_batches, 1) with workgroup_size(256)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_cross_twiddle_inv"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_cross_twiddle_inv_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_cross_twiddle_inv_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, 1);
+            }
+
+            // Step 3: Row INTT (256-point INTT on each of 32 rows) + n^-1 scaling
+            // Dispatch: (n1, num_batches, 1) = (32, num_batches, 1)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_row_intt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_row_intt_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_row_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, 1);
+            }
+
             self.queue.submit(std::iter::once(encoder.finish()));
         }
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&"[V3] slot_encode submitted, starting NTT phase".into());
 
         // =====================================================================
         // Phase 2: Four-step forward NTT + pointwise mul + INTT
@@ -1450,6 +1843,9 @@ impl RnsSlotMulGpuV3 {
             mapped_at_creation: false,
         });
 
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&"[V3] NTT phase done, copying results".into());
+
         // Copy from output buffers to staging
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("copy_results_v3"),
@@ -1458,26 +1854,93 @@ impl RnsSlotMulGpuV3 {
         encoder.copy_buffer_to_buffer(&self.preallocated_out_c1_buffer, 0, &staging_c1, 0, result_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Map and read
+        // Map and read - use futures oneshot channels for proper async await
         let c0_slice = staging_c0.slice(..);
         let c1_slice = staging_c1.slice(..);
 
+        let (tx0, rx0) = futures::channel::oneshot::channel();
+        let (tx1, rx1) = futures::channel::oneshot::channel();
+
+        c0_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx0.send(result);
+        });
+        c1_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx1.send(result);
+        });
+
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&"[V3] Awaiting buffer maps...".into());
+
+        // In WASM, we need to poll the device and yield to event loop repeatedly
         #[cfg(target_arch = "wasm32")]
         {
-            c0_slice.map_async(wgpu::MapMode::Read, |_| {});
-            c1_slice.map_async(wgpu::MapMode::Read, |_| {});
-            self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+            use std::pin::Pin;
+            use std::task::{Context, Poll};
+            use futures::Future;
+            use wasm_bindgen::prelude::*;
+            use wasm_bindgen_futures::JsFuture;
+
+            // Helper to yield to event loop
+            async fn yield_now() {
+                let promise = js_sys::Promise::resolve(&JsValue::undefined());
+                let _ = JsFuture::from(promise).await;
+            }
+
+            let mut rx0 = rx0;
+            let mut rx1 = rx1;
+            let mut poll_count = 0u32;
+
+            // Poll rx0 until ready
+            loop {
+                self.device.poll(wgpu::Maintain::Poll);
+                poll_count += 1;
+                if poll_count % 100 == 0 {
+                    web_sys::console::log_1(&format!("[V3] Poll iteration {}", poll_count).into());
+                }
+                let waker = futures::task::noop_waker();
+                let mut cx = Context::from_waker(&waker);
+                match Pin::new(&mut rx0).poll(&mut cx) {
+                    Poll::Ready(result) => {
+                        web_sys::console::log_1(&format!("[V3] C0 ready after {} polls", poll_count).into());
+                        result.map_err(|_| GpuError::MapFailed)?
+                            .map_err(|_| GpuError::MapFailed)?;
+                        break;
+                    }
+                    Poll::Pending => {
+                        // Yield to event loop
+                        yield_now().await;
+                    }
+                }
+            }
+            web_sys::console::log_1(&"[V3] C0 map complete".into());
+
+            // Poll rx1 until ready
+            loop {
+                self.device.poll(wgpu::Maintain::Poll);
+                let waker = futures::task::noop_waker();
+                let mut cx = Context::from_waker(&waker);
+                match Pin::new(&mut rx1).poll(&mut cx) {
+                    Poll::Ready(result) => {
+                        result.map_err(|_| GpuError::MapFailed)?
+                            .map_err(|_| GpuError::MapFailed)?;
+                        break;
+                    }
+                    Poll::Pending => {
+                        yield_now().await;
+                    }
+                }
+            }
         }
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let (tx0, rx0) = std::sync::mpsc::channel();
-            let (tx1, rx1) = std::sync::mpsc::channel();
-            c0_slice.map_async(wgpu::MapMode::Read, move |r| tx0.send(r).unwrap());
-            c1_slice.map_async(wgpu::MapMode::Read, move |r| tx1.send(r).unwrap());
-            self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
-            rx0.recv().unwrap().unwrap();
-            rx1.recv().unwrap().unwrap();
+            self.device.poll(wgpu::Maintain::Wait);
+            rx0.await
+                .map_err(|_| GpuError::MapFailed)?
+                .map_err(|_| GpuError::MapFailed)?;
+            rx1.await
+                .map_err(|_| GpuError::MapFailed)?
+                .map_err(|_| GpuError::MapFailed)?;
         }
 
         let c0_data: Vec<u32> = bytemuck::cast_slice(&c0_slice.get_mapped_range()).to_vec();
@@ -1548,19 +2011,44 @@ impl RnsSlotMulGpuV3 {
             bytemuck::bytes_of(&batch_params),
         );
 
-        // Execute slot_encode
+        // Execute slot_encode (four-step decomposition)
         {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("slot_encode_only_test"),
             });
+            let n1 = self.n1;
+            let n2 = self.n2;
+            let wg_per_n = ((n + 255) / 256) as u32;
+
+            // Step 1: Column INTT
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("slot_encode_only"),
+                    label: Some("slot_encode_col_intt"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.slot_encode_pipeline);
-                pass.set_bind_group(0, &self.slot_encode_bind_group, &[]);
-                pass.dispatch_workgroups(num_batches as u32, 1, 1);
+                pass.set_pipeline(&self.slot_encode_col_intt_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_col_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, 1);
+            }
+            // Step 2: Cross-twiddle inverse
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_cross_inv"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_cross_twiddle_inv_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_cross_twiddle_inv_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, 1);
+            }
+            // Step 3: Row INTT
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_row_intt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_row_intt_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_row_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
         }
@@ -1660,19 +2148,42 @@ impl RnsSlotMulGpuV3 {
         );
 
         // Execute forward NTT pipeline
-        // 1. Slot encode
+        // 1. Slot encode (four-step decomposition)
         {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("slot_encode_v3_test"),
             });
+            let wg_per_n = ((n + 255) / 256) as u32;
+
+            // Step 1: Column INTT
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("slot_encode_test"),
+                    label: Some("slot_encode_col_intt_test"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.slot_encode_pipeline);
-                pass.set_bind_group(0, &self.slot_encode_bind_group, &[]);
-                pass.dispatch_workgroups(num_batches as u32, 1, 1);
+                pass.set_pipeline(&self.slot_encode_col_intt_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_col_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, 1);
+            }
+            // Step 2: Cross-twiddle inverse
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_cross_inv_test"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_cross_twiddle_inv_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_cross_twiddle_inv_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, 1);
+            }
+            // Step 3: Row INTT
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_row_intt_test"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_row_intt_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_row_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
         }
@@ -1827,19 +2338,44 @@ impl RnsSlotMulGpuV3 {
             bytemuck::bytes_of(&fourstep_params),
         );
 
-        // Execute slot_encode
+        // Execute slot_encode (four-step decomposition)
         {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("slot_encode_twist_test"),
             });
+            let n1 = self.n1;
+            let n2 = self.n2;
+            let wg_per_n = ((n + 255) / 256) as u32;
+
+            // Step 1: Column INTT
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("slot_encode_twist"),
+                    label: Some("slot_encode_col_intt_twist"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.slot_encode_pipeline);
-                pass.set_bind_group(0, &self.slot_encode_bind_group, &[]);
-                pass.dispatch_workgroups(num_batches as u32, 1, 1);
+                pass.set_pipeline(&self.slot_encode_col_intt_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_col_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, 1);
+            }
+            // Step 2: Cross-twiddle inverse
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_cross_inv_twist"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_cross_twiddle_inv_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_cross_twiddle_inv_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, 1);
+            }
+            // Step 3: Row INTT
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_row_intt_twist"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_row_intt_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_row_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
         }
@@ -1960,19 +2496,42 @@ impl RnsSlotMulGpuV3 {
             bytemuck::bytes_of(&fourstep_params),
         );
 
-        // Execute slot_encode
+        // Execute slot_encode (four-step decomposition)
         {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("slot_encode_roundtrip"),
             });
+            let wg_per_n_encode = ((n + 255) / 256) as u32;
+
+            // Step 1: Column INTT
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("slot_encode_rt"),
+                    label: Some("slot_encode_col_intt_rt"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.slot_encode_pipeline);
-                pass.set_bind_group(0, &self.slot_encode_bind_group, &[]);
-                pass.dispatch_workgroups(num_batches as u32, 1, 1);
+                pass.set_pipeline(&self.slot_encode_col_intt_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_col_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, 1);
+            }
+            // Step 2: Cross-twiddle inverse
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_cross_inv_rt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_cross_twiddle_inv_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_cross_twiddle_inv_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n_encode, num_batches as u32, 1);
+            }
+            // Step 3: Row INTT
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_row_intt_rt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_row_intt_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_row_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, 1);
             }
             self.queue.submit(std::iter::once(encoder.finish()));
         }
@@ -2127,79 +2686,83 @@ impl RnsSlotMulGpuV3 {
         Ok(result)
     }
 }
-const SLOT_ENCODE_SHADER: &str = r#"
+// =============================================================================
+// Four-Step Slot Encode Shaders (Goldilocks INTT)
+// For N=8192 = 32 rows × 256 columns, we decompose INTT into:
+//   1. 32-point INTT on each of 256 columns (shared mem: 256 bytes)
+//   2. Inverse cross-twiddle multiplication
+//   3. 256-point INTT on each of 32 rows (shared mem: 2KB)
+//   4. Scale by n^-1
+// =============================================================================
+
+/// Step 1: Column INTT - 32-point INTT on each column
+/// Input layout: slots[batch * n + row * n2 + col] (row-major)
+/// Each workgroup processes one column of one batch
+/// Dispatch: (n2, num_batches, 1) = (256, num_batches, 1)
+const SLOT_ENCODE_COL_INTT_SHADER: &str = r#"
 #import math
 
-struct BatchParams {
-    n: u32,
-    log_n: u32,
+struct FourStepParams {
+    n: u32,           // 8192
+    n1: u32,          // 32 (rows)
+    n2: u32,          // 256 (columns)
+    log_n2: u32,      // 8
     num_batches: u32,
     num_moduli: u32,
+    log_n1: u32,      // 5
+    _pad: u32,
 }
 
-struct ModulusParams {
-    modulus_lo: u32,
-    modulus_hi: u32,
-    mu_lo: u32,
-    mu_hi: u32,
-    n_inv_lo: u32,
-    n_inv_hi: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0) var<uniform> params: BatchParams;
+@group(0) @binding(0) var<uniform> params: FourStepParams;
 @group(0) @binding(1) var<storage, read> slots: array<u32>;
-@group(0) @binding(2) var<storage, read_write> coeffs: array<u32>;
-@group(0) @binding(3) var<storage, read> twiddles: array<u32>;
-@group(0) @binding(4) var<uniform> mod_params: ModulusParams;
+@group(0) @binding(2) var<storage, read_write> temp: array<u32>;
+@group(0) @binding(3) var<storage, read> col_inv_twiddles: array<u32>;
 
-var<workgroup> shared_lo: array<u32, 8192>;
-var<workgroup> shared_hi: array<u32, 8192>;
+var<workgroup> shared_lo: array<u32, 32>;
+var<workgroup> shared_hi: array<u32, 32>;
 
-@compute @workgroup_size(256, 1, 1)
-fn slot_encode_batched(
+@compute @workgroup_size(32, 1, 1)
+fn slot_encode_col_intt(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) wg_id: vec3<u32>
 ) {
     let tid = local_id.x;
-    let batch_idx = wg_id.x;
+    let col = wg_id.x;
+    let batch_idx = wg_id.y;
+    let n1 = params.n1;
+    let n2 = params.n2;
+    let log_n1 = params.log_n1;
     let n = params.n;
-    let log_n = params.log_n;
 
-    if batch_idx >= params.num_batches { return; }
+    if col >= n2 || batch_idx >= params.num_batches { return; }
 
-    let q = vec2<u32>(mod_params.modulus_lo, mod_params.modulus_hi);
+    // Load column elements with bit-reversal
+    // Input: slots[batch * n + row * n2 + col]
     let batch_offset = batch_idx * n;
-    let elements_per_thread = n / 256u;
-
-    // Load with bit-reversal
-    for (var i = 0u; i < elements_per_thread; i++) {
-        let idx = tid * elements_per_thread + i;
-        let base = (batch_offset + idx) * 2u;
-        let val = vec2<u32>(slots[base], slots[base + 1u]);
-        let rev_idx = math::bit_reverse(idx, log_n);
-        shared_lo[rev_idx] = val.x;
-        shared_hi[rev_idx] = val.y;
-    }
+    let row = tid;
+    let in_idx = batch_offset + row * n2 + col;
+    let in_base = in_idx * 2u;
+    let val = vec2<u32>(slots[in_base], slots[in_base + 1u]);
+    let rev_row = math::bit_reverse(row, log_n1);
+    shared_lo[rev_row] = val.x;
+    shared_hi[rev_row] = val.y;
     workgroupBarrier();
 
-    // INTT butterfly stages
-    for (var stage = 0u; stage < log_n; stage++) {
+    // 32-point INTT (5 stages)
+    for (var stage = 0u; stage < log_n1; stage++) {
         let m = 1u << (stage + 1u);
         let half_m = 1u << stage;
-        let butterflies_per_thread = (n >> 1u) / 256u;
 
-        for (var b = 0u; b < butterflies_per_thread; b++) {
-            let butterfly_idx = tid * butterflies_per_thread + b;
+        if tid < (n1 >> 1u) {
+            let butterfly_idx = tid;
             let group = butterfly_idx / half_m;
             let idx_in_group = butterfly_idx % half_m;
             let ii = group * m + idx_in_group;
             let jj = ii + half_m;
 
-            let twiddle_idx = idx_in_group * (n / m);
+            let twiddle_idx = idx_in_group * (n1 / m);
             let tw_base = twiddle_idx * 2u;
-            let twiddle = vec2<u32>(twiddles[tw_base], twiddles[tw_base + 1u]);
+            let twiddle = vec2<u32>(col_inv_twiddles[tw_base], col_inv_twiddles[tw_base + 1u]);
 
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
@@ -2216,16 +2779,175 @@ fn slot_encode_batched(
         workgroupBarrier();
     }
 
-    // Scale by n^-1 and store
-    let n_inv = vec2<u32>(mod_params.n_inv_lo, mod_params.n_inv_hi);
-    for (var i = 0u; i < elements_per_thread; i++) {
-        let idx = tid * elements_per_thread + i;
-        var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::goldilocks_mul(val, n_inv);
-        let out_base = (batch_offset + idx) * 2u;
-        coeffs[out_base] = val.x;
-        coeffs[out_base + 1u] = val.y;
+    // Store to temp (same layout: temp[batch * n + row * n2 + col])
+    let out_val = vec2<u32>(shared_lo[row], shared_hi[row]);
+    let out_idx = batch_offset + row * n2 + col;
+    let out_base = out_idx * 2u;
+    temp[out_base] = out_val.x;
+    temp[out_base + 1u] = out_val.y;
+}
+"#;
+
+/// Step 2: Inverse cross-twiddle multiplication
+/// Multiply each element by zeta_inv^(row * col)
+/// Dispatch: (n / 256, num_batches, 1) = (32, num_batches, 1) with workgroup_size(256)
+const SLOT_ENCODE_CROSS_TWIDDLE_INV_SHADER: &str = r#"
+#import math
+
+struct FourStepParams {
+    n: u32,
+    n1: u32,
+    n2: u32,
+    log_n2: u32,
+    num_batches: u32,
+    num_moduli: u32,
+    log_n1: u32,
+    _pad: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: FourStepParams;
+@group(0) @binding(1) var<storage, read_write> data: array<u32>;
+@group(0) @binding(2) var<storage, read> cross_inv_twiddles: array<u32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn slot_encode_cross_twiddle_inv(
+    @builtin(global_invocation_id) global_id: vec3<u32>,
+    @builtin(workgroup_id) wg_id: vec3<u32>
+) {
+    let idx = global_id.x;
+    let batch_idx = wg_id.y;
+    let n = params.n;
+    let n1 = params.n1;
+    let n2 = params.n2;
+
+    if idx >= n || batch_idx >= params.num_batches { return; }
+
+    let row = idx / n2;
+    let col = idx % n2;
+
+    // Load value
+    let batch_offset = batch_idx * n;
+    let data_idx = batch_offset + idx;
+    let base = data_idx * 2u;
+    let val = vec2<u32>(data[base], data[base + 1u]);
+
+    // Get inverse cross-twiddle: zeta_inv^(row * col)
+    let tw_idx = row * col;  // This wraps naturally for powers
+    let tw_base = (tw_idx % n) * 2u;
+    let twiddle = vec2<u32>(cross_inv_twiddles[tw_base], cross_inv_twiddles[tw_base + 1u]);
+
+    // Multiply
+    let result = math::goldilocks_mul(val, twiddle);
+
+    // Store
+    data[base] = result.x;
+    data[base + 1u] = result.y;
+}
+"#;
+
+/// Step 3: Row INTT - 256-point INTT on each row + n^-1 scaling
+/// Each workgroup processes one row of one batch
+/// Dispatch: (n1, num_batches, 1) = (32, num_batches, 1)
+const SLOT_ENCODE_ROW_INTT_SHADER: &str = r#"
+#import math
+
+struct FourStepParams {
+    n: u32,
+    n1: u32,
+    n2: u32,
+    log_n2: u32,
+    num_batches: u32,
+    num_moduli: u32,
+    log_n1: u32,
+    _pad: u32,
+}
+
+struct ModulusParams {
+    modulus_lo: u32,
+    modulus_hi: u32,
+    mu_lo: u32,
+    mu_hi: u32,
+    n_inv_lo: u32,
+    n_inv_hi: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+@group(0) @binding(0) var<uniform> params: FourStepParams;
+@group(0) @binding(1) var<storage, read> temp: array<u32>;
+@group(0) @binding(2) var<storage, read_write> coeffs: array<u32>;
+@group(0) @binding(3) var<storage, read> row_inv_twiddles: array<u32>;
+@group(0) @binding(4) var<uniform> mod_params: ModulusParams;
+
+var<workgroup> shared_lo: array<u32, 256>;
+var<workgroup> shared_hi: array<u32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn slot_encode_row_intt(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) wg_id: vec3<u32>
+) {
+    let tid = local_id.x;
+    let row = wg_id.x;
+    let batch_idx = wg_id.y;
+    let n1 = params.n1;
+    let n2 = params.n2;
+    let log_n2 = params.log_n2;
+    let n = params.n;
+
+    if row >= n1 || batch_idx >= params.num_batches { return; }
+
+    // Load row elements with bit-reversal
+    // Input: temp[batch * n + row * n2 + col]
+    let batch_offset = batch_idx * n;
+    let col = tid;
+    let in_idx = batch_offset + row * n2 + col;
+    let in_base = in_idx * 2u;
+    let val = vec2<u32>(temp[in_base], temp[in_base + 1u]);
+    let rev_col = math::bit_reverse(col, log_n2);
+    shared_lo[rev_col] = val.x;
+    shared_hi[rev_col] = val.y;
+    workgroupBarrier();
+
+    // 256-point INTT (8 stages)
+    for (var stage = 0u; stage < log_n2; stage++) {
+        let m = 1u << (stage + 1u);
+        let half_m = 1u << stage;
+
+        if tid < (n2 >> 1u) {
+            let butterfly_idx = tid;
+            let group = butterfly_idx / half_m;
+            let idx_in_group = butterfly_idx % half_m;
+            let ii = group * m + idx_in_group;
+            let jj = ii + half_m;
+
+            let twiddle_idx = idx_in_group * (n2 / m);
+            let tw_base = twiddle_idx * 2u;
+            let twiddle = vec2<u32>(row_inv_twiddles[tw_base], row_inv_twiddles[tw_base + 1u]);
+
+            let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
+            let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
+
+            let tw_v = math::goldilocks_mul(v, twiddle);
+            let new_u = math::goldilocks_add(u, tw_v);
+            let new_v = math::goldilocks_sub(u, tw_v);
+
+            shared_lo[ii] = new_u.x;
+            shared_hi[ii] = new_u.y;
+            shared_lo[jj] = new_v.x;
+            shared_hi[jj] = new_v.y;
+        }
+        workgroupBarrier();
     }
+
+    // Scale by n^-1 and store to coeffs
+    let n_inv = vec2<u32>(mod_params.n_inv_lo, mod_params.n_inv_hi);
+    var out_val = vec2<u32>(shared_lo[col], shared_hi[col]);
+    out_val = math::goldilocks_mul(out_val, n_inv);
+    let out_idx = batch_offset + row * n2 + col;
+    let out_base = out_idx * 2u;
+    coeffs[out_base] = out_val.x;
+    coeffs[out_base + 1u] = out_val.y;
 }
 "#;
 
