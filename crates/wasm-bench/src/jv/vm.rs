@@ -336,6 +336,11 @@ pub struct TimingBreakdown {
     pub open_polynomial_ms: f64,
     pub mk_commit_vole_ms: f64,
     pub mk_commit_packing_ms: f64,
+    // Commit phase CPU/GPU breakdown
+    pub commit_gpu_ms: f64,
+    pub commit_reshape_ms: f64,
+    pub commit_ntt_extract_ms: f64,
+    pub commit_collapse_ms: f64,
     // Benchmark-level timing (total call time, includes internal timing)
     pub vole_pool_ms: f64,
     pub prover_new_ms: f64,
@@ -353,7 +358,7 @@ pub struct TimingBreakdown {
 
 #[cfg(target_arch = "wasm32")]
 impl TimingBreakdown {
-    fn from_prover_timing(t: (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)) -> Self {
+    fn from_prover_timing(t: (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)) -> Self {
         Self {
             intt_ms: t.0,
             collapse_ms: t.1,
@@ -372,8 +377,112 @@ impl TimingBreakdown {
             open_polynomial_ms: t.14,
             mk_commit_vole_ms: t.15,
             mk_commit_packing_ms: t.16,
+            commit_gpu_ms: t.17,
+            commit_reshape_ms: t.18,
+            commit_ntt_extract_ms: t.19,
+            commit_collapse_ms: t.20,
             ..Default::default()
         }
+    }
+
+    /// Prints a neat summary table of all timing statistics.
+    fn print_summary_table(&self, total_elapsed_ms: f64, total_gpu_time_ms: f64, iterations: u32, reps: usize, total_mults: u64) {
+        let avg_iter_ms = total_elapsed_ms / iterations as f64;
+        let mults_per_sec = (total_mults as f64 / total_elapsed_ms) * 1000.0;
+
+        // Helper to format percentage
+        let pct = |v: f64| -> f64 { (v / total_elapsed_ms) * 100.0 };
+
+        // Calculate total call time
+        let total_call_time = self.vole_pool_ms + self.prover_new_ms +
+                              self.prover_setup_ms + self.prover_setup_soldering_ms +
+                              self.commit_ms + self.commit_mk_poly_ms +
+                              self.commit_soldering_call_ms + self.disclose_call_ms +
+                              self.reveal_soldering_call_ms + self.open_call_ms +
+                              self.open_itpac_ms + self.prove_mults_ms;
+        let overhead_ms = total_elapsed_ms - total_call_time;
+
+        // Print header
+        web_sys::console::log_1(&"\n".into());
+        web_sys::console::log_1(&"╔══════════════════════════════════════════════════════════════════════════════╗".into());
+        web_sys::console::log_1(&"║                        JV PROVER TIMING SUMMARY                              ║".into());
+        web_sys::console::log_1(&"╠══════════════════════════════════════════════════════════════════════════════╣".into());
+        web_sys::console::log_1(&format!("║  Iterations: {:>6}  │  Reps: {:>6}  │  Total Mults: {:>15}       ║", iterations, reps, total_mults).into());
+        web_sys::console::log_1(&format!("║  Total Time: {:>10.2}ms  │  Avg/Iter: {:>10.2}ms  │  {:>10.0} mults/sec   ║", total_elapsed_ms, avg_iter_ms, mults_per_sec).into());
+        web_sys::console::log_1(&format!("║  GPU Time:   {:>10.2}ms ({:>5.1}% of total)                                  ║", total_gpu_time_ms, pct(total_gpu_time_ms)).into());
+        web_sys::console::log_1(&"╠══════════════════════════════════════════════════════════════════════════════╣".into());
+        web_sys::console::log_1(&"║                           CALL-LEVEL TIMING                                  ║".into());
+        web_sys::console::log_1(&"╠═════════════════════════════════════╤═══════════════╤═════════╤══════════════╣".into());
+        web_sys::console::log_1(&"║ Phase                               │    Total (ms) │      %  │   Avg (ms)   ║".into());
+        web_sys::console::log_1(&"╟─────────────────────────────────────┼───────────────┼─────────┼──────────────╢".into());
+
+        // Print each timing row
+        let print_row = |name: &str, value: f64| {
+            let avg = value / iterations as f64;
+            web_sys::console::log_1(&format!("║ {:<35} │ {:>13.2} │ {:>6.1}% │ {:>12.2} ║", name, value, pct(value), avg).into());
+        };
+
+        print_row("VOLE pool generation", self.vole_pool_ms);
+        print_row("Prover::new", self.prover_new_ms);
+        print_row("Prover::setup", self.prover_setup_ms);
+        print_row("Prover::setup_soldering", self.prover_setup_soldering_ms);
+        print_row("Prover::commit (IT-PAC)", self.commit_ms);
+        print_row("Prover::commit_mk_polynomials", self.commit_mk_poly_ms);
+        print_row("Prover::commit_soldering", self.commit_soldering_call_ms);
+        print_row("Prover::disclose", self.disclose_call_ms);
+        print_row("Prover::reveal_soldering", self.reveal_soldering_call_ms);
+        print_row("Prover::open", self.open_call_ms);
+        print_row("Prover::open_itpac", self.open_itpac_ms);
+        print_row("Prover::prove_multiplications", self.prove_mults_ms);
+
+        web_sys::console::log_1(&"╟─────────────────────────────────────┼───────────────┼─────────┼──────────────╢".into());
+        print_row("Loop/other overhead", overhead_ms);
+        web_sys::console::log_1(&"╠═════════════════════════════════════╧═══════════════╧═════════╧══════════════╣".into());
+
+        // COMMIT PHASE CPU/GPU BREAKDOWN
+        web_sys::console::log_1(&"║                     COMMIT PHASE BREAKDOWN (CPU vs GPU)                      ║".into());
+        web_sys::console::log_1(&"╠═════════════════════════════════════╤═══════════════╤═════════╤══════════════╣".into());
+        web_sys::console::log_1(&"║ Operation                           │    Total (ms) │      %  │   Avg (ms)   ║".into());
+        web_sys::console::log_1(&"╟─────────────────────────────────────┼───────────────┼─────────┼──────────────╢".into());
+
+        print_row("  GPU: Slot multiplication", self.commit_gpu_ms);
+        print_row("  CPU: Reshape/blinding", self.commit_reshape_ms);
+        print_row("  CPU: NTT extraction", self.commit_ntt_extract_ms);
+        print_row("  CPU: CT collapse", self.commit_collapse_ms);
+
+        // Calculate commit overhead (total commit time - tracked time)
+        let commit_tracked = self.commit_gpu_ms + self.commit_reshape_ms + self.commit_ntt_extract_ms + self.commit_collapse_ms;
+        let commit_overhead = self.commit_ms - commit_tracked;
+        print_row("  Untracked/overhead", commit_overhead);
+
+        web_sys::console::log_1(&"╠═════════════════════════════════════╧═══════════════╧═════════╧══════════════╣".into());
+
+        // Prover internal timing breakdown (within commit)
+        web_sys::console::log_1(&"║                        PROVER INTERNAL BREAKDOWN                             ║".into());
+        web_sys::console::log_1(&"╠═════════════════════════════════════╤═══════════════╤═════════╤══════════════╣".into());
+        web_sys::console::log_1(&"║ Operation                           │    Total (ms) │      %  │   Avg (ms)   ║".into());
+        web_sys::console::log_1(&"╟─────────────────────────────────────┼───────────────┼─────────┼──────────────╢".into());
+
+        print_row("INTT (interpolation)", self.intt_ms);
+        print_row("Collapse (CT addition)", self.collapse_ms);
+        print_row("IT-PAC creation", self.itpac_ms);
+        print_row("Packing (2-way)", self.packing_ms);
+        print_row("Setup (circuit eval)", self.setup_ms);
+        print_row("MK poly (interpolation)", self.mk_poly_ms);
+        print_row("MK binary eval", self.mk_binary_ms);
+        print_row("MK sum", self.mk_sum_ms);
+        print_row("MK commit VOLE", self.mk_commit_vole_ms);
+        print_row("MK commit packing", self.mk_commit_packing_ms);
+        print_row("Disclose (topology)", self.disclose_ms);
+        print_row("Commit soldering", self.commit_soldering_ms);
+        print_row("Reveal soldering", self.reveal_soldering_ms);
+        print_row("Open (IT-PAC eval)", self.open_ms);
+        print_row("Open polynomial", self.open_polynomial_ms);
+        print_row("Poly division (LPZK)", self.poly_div_ms);
+        print_row("LPZK poly accumulation", self.lpzk_accumulation_ms);
+
+        web_sys::console::log_1(&"╚═════════════════════════════════════╧═══════════════╧═════════╧══════════════╝".into());
+        web_sys::console::log_1(&"\n".into());
     }
 }
 
@@ -386,7 +495,7 @@ async fn run_prover_iteration(
     inputs_per_rep: &[Vec<u64>],
     soldering_constraints: &[SolderingConstraint],
     recorded: &JVRecordedMessages,
-    gpu_ctx: &std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>,
+    gpu_ctx: &std::sync::Arc<bgv_webgpu::RnsSlotMulGpuRadix4>,
     ntt_gpu_ctx: &std::sync::Arc<bgv_webgpu::GoldilocksNttGpu>,
 ) -> (f64, TimingBreakdown) {
     let performance = web_sys::window().unwrap().performance().unwrap();
@@ -640,6 +749,10 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
                 total_timing.open_polynomial_ms += timing.open_polynomial_ms;
                 total_timing.mk_commit_vole_ms += timing.mk_commit_vole_ms;
                 total_timing.mk_commit_packing_ms += timing.mk_commit_packing_ms;
+                total_timing.commit_gpu_ms += timing.commit_gpu_ms;
+                total_timing.commit_reshape_ms += timing.commit_reshape_ms;
+                total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
+                total_timing.commit_collapse_ms += timing.commit_collapse_ms;
                 // Benchmark-level timing (total call times)
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
@@ -664,86 +777,8 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
             // Total mults = iterations * reps * branches * mults_per_circuit
             let total_mults = n as u64 * R as u64 * NUM_BRANCHES as u64 * num_mults as u64;
 
-            // Helper macro for printing timing
-            macro_rules! print_timing {
-                ($name:expr, $value:expr) => {
-                    web_sys::console::log_1(
-                        &format!(
-                            "[jv_vm]   {}: {:.2}ms ({:.1}%)",
-                            $name,
-                            $value,
-                            ($value / total_elapsed_ms) * 100.0
-                        )
-                        .into(),
-                    );
-                };
-            }
-
-            web_sys::console::log_1(
-                &format!(
-                    "[jv_vm] Done: {:.2}ms total, {:.2}ms/iter, {} total mults",
-                    total_elapsed_ms,
-                    total_elapsed_ms / n as f64,
-                    total_mults
-                )
-                .into(),
-            );
-            web_sys::console::log_1(
-                &format!(
-                    "[jv_vm] Total GPU time: {:.2}ms ({:.1}% of total time)",
-                    total_gpu_time_ms,
-                    (total_gpu_time_ms / total_elapsed_ms) * 100.0
-                )
-                .into(),
-            );
-
-            // Print timing breakdown - Prover internal timing
-            web_sys::console::log_1(&"[jv_vm] === Prover Internal Timing ===".into());
-            print_timing!("INTT (interpolation)", total_timing.intt_ms);
-            print_timing!("Collapse (CT addition)", total_timing.collapse_ms);
-            print_timing!("Poly division (LPZK)", total_timing.poly_div_ms);
-            print_timing!("Open (IT-PAC eval)", total_timing.open_ms);
-            print_timing!("MK poly (interpolation)", total_timing.mk_poly_ms);
-            print_timing!("IT-PAC creation", total_timing.itpac_ms);
-            print_timing!("Packing (2-way)", total_timing.packing_ms);
-            print_timing!("Setup (circuit eval)", total_timing.setup_ms);
-            print_timing!("Disclose (topology)", total_timing.disclose_ms);
-            print_timing!("Commit soldering", total_timing.commit_soldering_ms);
-            print_timing!("LPZK poly accumulation", total_timing.lpzk_accumulation_ms);
-            print_timing!("Reveal soldering", total_timing.reveal_soldering_ms);
-            print_timing!("MK binary eval", total_timing.mk_binary_ms);
-            print_timing!("MK sum", total_timing.mk_sum_ms);
-            print_timing!("Open polynomial", total_timing.open_polynomial_ms);
-            print_timing!("MK commit VOLE", total_timing.mk_commit_vole_ms);
-            print_timing!("MK commit packing", total_timing.mk_commit_packing_ms);
-
-            // Print benchmark-level timing (total time for each call)
-            web_sys::console::log_1(&"[jv_vm] === Call-Level Timing (should sum to ~100%) ===".into());
-            print_timing!("VOLE pool generation", total_timing.vole_pool_ms);
-            print_timing!("Prover::new", total_timing.prover_new_ms);
-            print_timing!("Prover::setup", total_timing.prover_setup_ms);
-            print_timing!("Prover::setup_soldering", total_timing.prover_setup_soldering_ms);
-            print_timing!("Prover::commit", total_timing.commit_ms);
-            print_timing!("Prover::commit_mk_polynomials", total_timing.commit_mk_poly_ms);
-            print_timing!("Prover::commit_soldering", total_timing.commit_soldering_call_ms);
-            print_timing!("Prover::disclose", total_timing.disclose_call_ms);
-            print_timing!("Prover::reveal_soldering", total_timing.reveal_soldering_call_ms);
-            print_timing!("Prover::open", total_timing.open_call_ms);
-            print_timing!("Prover::open_itpac", total_timing.open_itpac_ms);
-            print_timing!("Prover::prove_multiplications", total_timing.prove_mults_ms);
-
-            // Calculate total call time (should be close to elapsed)
-            let total_call_time = total_timing.vole_pool_ms + total_timing.prover_new_ms +
-                                  total_timing.prover_setup_ms + total_timing.prover_setup_soldering_ms +
-                                  total_timing.commit_ms + total_timing.commit_mk_poly_ms +
-                                  total_timing.commit_soldering_call_ms + total_timing.disclose_call_ms +
-                                  total_timing.reveal_soldering_call_ms + total_timing.open_call_ms +
-                                  total_timing.open_itpac_ms + total_timing.prove_mults_ms;
-            let loop_overhead = total_elapsed_ms - total_call_time;
-
-            web_sys::console::log_1(&"[jv_vm] === Summary ===".into());
-            print_timing!("Total call time", total_call_time);
-            print_timing!("Loop/other overhead", loop_overhead);
+            // Print neat summary table
+            total_timing.print_summary_table(total_elapsed_ms, total_gpu_time_ms, n, R, total_mults);
 
             Ok(BenchResult {
                 elapsed_ms: total_elapsed_ms,
@@ -877,6 +912,10 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
                 total_timing.open_polynomial_ms += timing.open_polynomial_ms;
                 total_timing.mk_commit_vole_ms += timing.mk_commit_vole_ms;
                 total_timing.mk_commit_packing_ms += timing.mk_commit_packing_ms;
+                total_timing.commit_gpu_ms += timing.commit_gpu_ms;
+                total_timing.commit_reshape_ms += timing.commit_reshape_ms;
+                total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
+                total_timing.commit_collapse_ms += timing.commit_collapse_ms;
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
                 total_timing.prover_setup_ms += timing.prover_setup_ms;
@@ -899,82 +938,8 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
 
             let total_mults = n as u64 * reps as u64 * NUM_BRANCHES as u64 * num_mults as u64;
 
-            macro_rules! print_timing {
-                ($name:expr, $value:expr) => {
-                    web_sys::console::log_1(
-                        &format!(
-                            "[jv_vm]   {}: {:.2}ms ({:.1}%)",
-                            $name,
-                            $value,
-                            ($value / total_elapsed_ms) * 100.0
-                        )
-                        .into(),
-                    );
-                };
-            }
-
-            web_sys::console::log_1(
-                &format!(
-                    "[jv_vm] Done: {:.2}ms total, {:.2}ms/iter, {} total mults",
-                    total_elapsed_ms,
-                    total_elapsed_ms / n as f64,
-                    total_mults
-                )
-                .into(),
-            );
-            web_sys::console::log_1(
-                &format!(
-                    "[jv_vm] Total GPU time: {:.2}ms ({:.1}% of total time)",
-                    total_gpu_time_ms,
-                    (total_gpu_time_ms / total_elapsed_ms) * 100.0
-                )
-                .into(),
-            );
-
-            web_sys::console::log_1(&"[jv_vm] === Prover Internal Timing ===".into());
-            print_timing!("INTT (interpolation)", total_timing.intt_ms);
-            print_timing!("Collapse (CT addition)", total_timing.collapse_ms);
-            print_timing!("Poly division (LPZK)", total_timing.poly_div_ms);
-            print_timing!("Open (IT-PAC eval)", total_timing.open_ms);
-            print_timing!("MK poly (interpolation)", total_timing.mk_poly_ms);
-            print_timing!("IT-PAC creation", total_timing.itpac_ms);
-            print_timing!("Packing (2-way)", total_timing.packing_ms);
-            print_timing!("Setup (circuit eval)", total_timing.setup_ms);
-            print_timing!("Disclose (topology)", total_timing.disclose_ms);
-            print_timing!("Commit soldering", total_timing.commit_soldering_ms);
-            print_timing!("LPZK poly accumulation", total_timing.lpzk_accumulation_ms);
-            print_timing!("Reveal soldering", total_timing.reveal_soldering_ms);
-            print_timing!("MK binary eval", total_timing.mk_binary_ms);
-            print_timing!("MK sum", total_timing.mk_sum_ms);
-            print_timing!("Open polynomial", total_timing.open_polynomial_ms);
-            print_timing!("MK commit VOLE", total_timing.mk_commit_vole_ms);
-            print_timing!("MK commit packing", total_timing.mk_commit_packing_ms);
-
-            web_sys::console::log_1(&"[jv_vm] === Call-Level Timing (should sum to ~100%) ===".into());
-            print_timing!("VOLE pool generation", total_timing.vole_pool_ms);
-            print_timing!("Prover::new", total_timing.prover_new_ms);
-            print_timing!("Prover::setup", total_timing.prover_setup_ms);
-            print_timing!("Prover::setup_soldering", total_timing.prover_setup_soldering_ms);
-            print_timing!("Prover::commit", total_timing.commit_ms);
-            print_timing!("Prover::commit_mk_polynomials", total_timing.commit_mk_poly_ms);
-            print_timing!("Prover::commit_soldering", total_timing.commit_soldering_call_ms);
-            print_timing!("Prover::disclose", total_timing.disclose_call_ms);
-            print_timing!("Prover::reveal_soldering", total_timing.reveal_soldering_call_ms);
-            print_timing!("Prover::open", total_timing.open_call_ms);
-            print_timing!("Prover::open_itpac", total_timing.open_itpac_ms);
-            print_timing!("Prover::prove_multiplications", total_timing.prove_mults_ms);
-
-            let total_call_time = total_timing.vole_pool_ms + total_timing.prover_new_ms +
-                                  total_timing.prover_setup_ms + total_timing.prover_setup_soldering_ms +
-                                  total_timing.commit_ms + total_timing.commit_mk_poly_ms +
-                                  total_timing.commit_soldering_call_ms + total_timing.disclose_call_ms +
-                                  total_timing.reveal_soldering_call_ms + total_timing.open_call_ms +
-                                  total_timing.open_itpac_ms + total_timing.prove_mults_ms;
-            let loop_overhead = total_elapsed_ms - total_call_time;
-
-            web_sys::console::log_1(&"[jv_vm] === Summary ===".into());
-            print_timing!("Total call time", total_call_time);
-            print_timing!("Loop/other overhead", loop_overhead);
+            // Print neat summary table
+            total_timing.print_summary_table(total_elapsed_ms, total_gpu_time_ms, n, reps, total_mults);
 
             Ok(BenchResult {
                 elapsed_ms: total_elapsed_ms,
@@ -1106,6 +1071,10 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
                 total_timing.open_polynomial_ms += timing.open_polynomial_ms;
                 total_timing.mk_commit_vole_ms += timing.mk_commit_vole_ms;
                 total_timing.mk_commit_packing_ms += timing.mk_commit_packing_ms;
+                total_timing.commit_gpu_ms += timing.commit_gpu_ms;
+                total_timing.commit_reshape_ms += timing.commit_reshape_ms;
+                total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
+                total_timing.commit_collapse_ms += timing.commit_collapse_ms;
                 // Benchmark-level timing (total call times)
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
@@ -1130,86 +1099,8 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
             // Total mults = iterations * reps * branches * mults_per_circuit
             let total_mults = n as u64 * R as u64 * NUM_BRANCHES as u64 * num_mults as u64;
 
-            // Helper macro for printing timing
-            macro_rules! print_timing {
-                ($name:expr, $value:expr) => {
-                    web_sys::console::log_1(
-                        &format!(
-                            "[jv_vm]   {}: {:.2}ms ({:.1}%)",
-                            $name,
-                            $value,
-                            ($value / total_elapsed_ms) * 100.0
-                        )
-                        .into(),
-                    );
-                };
-            }
-
-            web_sys::console::log_1(
-                &format!(
-                    "[jv_vm] Done: {:.2}ms total, {:.2}ms/iter, {} total mults",
-                    total_elapsed_ms,
-                    total_elapsed_ms / n as f64,
-                    total_mults
-                )
-                .into(),
-            );
-            web_sys::console::log_1(
-                &format!(
-                    "[jv_vm] Total GPU time: {:.2}ms ({:.1}% of total time)",
-                    total_gpu_time_ms,
-                    (total_gpu_time_ms / total_elapsed_ms) * 100.0
-                )
-                .into(),
-            );
-
-            // Print timing breakdown - Prover internal timing
-            web_sys::console::log_1(&"[jv_vm] === Prover Internal Timing ===".into());
-            print_timing!("INTT (interpolation)", total_timing.intt_ms);
-            print_timing!("Collapse (CT addition)", total_timing.collapse_ms);
-            print_timing!("Poly division (LPZK)", total_timing.poly_div_ms);
-            print_timing!("Open (IT-PAC eval)", total_timing.open_ms);
-            print_timing!("MK poly (interpolation)", total_timing.mk_poly_ms);
-            print_timing!("IT-PAC creation", total_timing.itpac_ms);
-            print_timing!("Packing (2-way)", total_timing.packing_ms);
-            print_timing!("Setup (circuit eval)", total_timing.setup_ms);
-            print_timing!("Disclose (topology)", total_timing.disclose_ms);
-            print_timing!("Commit soldering", total_timing.commit_soldering_ms);
-            print_timing!("LPZK poly accumulation", total_timing.lpzk_accumulation_ms);
-            print_timing!("Reveal soldering", total_timing.reveal_soldering_ms);
-            print_timing!("MK binary eval", total_timing.mk_binary_ms);
-            print_timing!("MK sum", total_timing.mk_sum_ms);
-            print_timing!("Open polynomial", total_timing.open_polynomial_ms);
-            print_timing!("MK commit VOLE", total_timing.mk_commit_vole_ms);
-            print_timing!("MK commit packing", total_timing.mk_commit_packing_ms);
-
-            // Print benchmark-level timing (total time for each call)
-            web_sys::console::log_1(&"[jv_vm] === Call-Level Timing (should sum to ~100%) ===".into());
-            print_timing!("VOLE pool generation", total_timing.vole_pool_ms);
-            print_timing!("Prover::new", total_timing.prover_new_ms);
-            print_timing!("Prover::setup", total_timing.prover_setup_ms);
-            print_timing!("Prover::setup_soldering", total_timing.prover_setup_soldering_ms);
-            print_timing!("Prover::commit", total_timing.commit_ms);
-            print_timing!("Prover::commit_mk_polynomials", total_timing.commit_mk_poly_ms);
-            print_timing!("Prover::commit_soldering", total_timing.commit_soldering_call_ms);
-            print_timing!("Prover::disclose", total_timing.disclose_call_ms);
-            print_timing!("Prover::reveal_soldering", total_timing.reveal_soldering_call_ms);
-            print_timing!("Prover::open", total_timing.open_call_ms);
-            print_timing!("Prover::open_itpac", total_timing.open_itpac_ms);
-            print_timing!("Prover::prove_multiplications", total_timing.prove_mults_ms);
-
-            // Calculate total call time (should be close to elapsed)
-            let total_call_time = total_timing.vole_pool_ms + total_timing.prover_new_ms +
-                                  total_timing.prover_setup_ms + total_timing.prover_setup_soldering_ms +
-                                  total_timing.commit_ms + total_timing.commit_mk_poly_ms +
-                                  total_timing.commit_soldering_call_ms + total_timing.disclose_call_ms +
-                                  total_timing.reveal_soldering_call_ms + total_timing.open_call_ms +
-                                  total_timing.open_itpac_ms + total_timing.prove_mults_ms;
-            let loop_overhead = total_elapsed_ms - total_call_time;
-
-            web_sys::console::log_1(&"[jv_vm] === Summary ===".into());
-            print_timing!("Total call time", total_call_time);
-            print_timing!("Loop/other overhead", loop_overhead);
+            // Print neat summary table
+            total_timing.print_summary_table(total_elapsed_ms, total_gpu_time_ms, n, R, total_mults);
 
             Ok(BenchResult {
                 elapsed_ms: total_elapsed_ms,
@@ -1319,6 +1210,10 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
                 total_timing.open_polynomial_ms += timing.open_polynomial_ms;
                 total_timing.mk_commit_vole_ms += timing.mk_commit_vole_ms;
                 total_timing.mk_commit_packing_ms += timing.mk_commit_packing_ms;
+                total_timing.commit_gpu_ms += timing.commit_gpu_ms;
+                total_timing.commit_reshape_ms += timing.commit_reshape_ms;
+                total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
+                total_timing.commit_collapse_ms += timing.commit_collapse_ms;
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
                 total_timing.prover_setup_ms += timing.prover_setup_ms;
@@ -1341,82 +1236,8 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
 
             let total_mults = n as u64 * reps as u64 * NUM_BRANCHES as u64 * num_mults as u64;
 
-            macro_rules! print_timing {
-                ($name:expr, $value:expr) => {
-                    web_sys::console::log_1(
-                        &format!(
-                            "[jv_vm]   {}: {:.2}ms ({:.1}%)",
-                            $name,
-                            $value,
-                            ($value / total_elapsed_ms) * 100.0
-                        )
-                        .into(),
-                    );
-                };
-            }
-
-            web_sys::console::log_1(
-                &format!(
-                    "[jv_vm] Done: {:.2}ms total, {:.2}ms/iter, {} total mults",
-                    total_elapsed_ms,
-                    total_elapsed_ms / n as f64,
-                    total_mults
-                )
-                .into(),
-            );
-            web_sys::console::log_1(
-                &format!(
-                    "[jv_vm] Total GPU time: {:.2}ms ({:.1}% of total time)",
-                    total_gpu_time_ms,
-                    (total_gpu_time_ms / total_elapsed_ms) * 100.0
-                )
-                .into(),
-            );
-
-            web_sys::console::log_1(&"[jv_vm] === Prover Internal Timing ===".into());
-            print_timing!("INTT (interpolation)", total_timing.intt_ms);
-            print_timing!("Collapse (CT addition)", total_timing.collapse_ms);
-            print_timing!("Poly division (LPZK)", total_timing.poly_div_ms);
-            print_timing!("Open (IT-PAC eval)", total_timing.open_ms);
-            print_timing!("MK poly (interpolation)", total_timing.mk_poly_ms);
-            print_timing!("IT-PAC creation", total_timing.itpac_ms);
-            print_timing!("Packing (2-way)", total_timing.packing_ms);
-            print_timing!("Setup (circuit eval)", total_timing.setup_ms);
-            print_timing!("Disclose (topology)", total_timing.disclose_ms);
-            print_timing!("Commit soldering", total_timing.commit_soldering_ms);
-            print_timing!("LPZK poly accumulation", total_timing.lpzk_accumulation_ms);
-            print_timing!("Reveal soldering", total_timing.reveal_soldering_ms);
-            print_timing!("MK binary eval", total_timing.mk_binary_ms);
-            print_timing!("MK sum", total_timing.mk_sum_ms);
-            print_timing!("Open polynomial", total_timing.open_polynomial_ms);
-            print_timing!("MK commit VOLE", total_timing.mk_commit_vole_ms);
-            print_timing!("MK commit packing", total_timing.mk_commit_packing_ms);
-
-            web_sys::console::log_1(&"[jv_vm] === Call-Level Timing (should sum to ~100%) ===".into());
-            print_timing!("VOLE pool generation", total_timing.vole_pool_ms);
-            print_timing!("Prover::new", total_timing.prover_new_ms);
-            print_timing!("Prover::setup", total_timing.prover_setup_ms);
-            print_timing!("Prover::setup_soldering", total_timing.prover_setup_soldering_ms);
-            print_timing!("Prover::commit", total_timing.commit_ms);
-            print_timing!("Prover::commit_mk_polynomials", total_timing.commit_mk_poly_ms);
-            print_timing!("Prover::commit_soldering", total_timing.commit_soldering_call_ms);
-            print_timing!("Prover::disclose", total_timing.disclose_call_ms);
-            print_timing!("Prover::reveal_soldering", total_timing.reveal_soldering_call_ms);
-            print_timing!("Prover::open", total_timing.open_call_ms);
-            print_timing!("Prover::open_itpac", total_timing.open_itpac_ms);
-            print_timing!("Prover::prove_multiplications", total_timing.prove_mults_ms);
-
-            let total_call_time = total_timing.vole_pool_ms + total_timing.prover_new_ms +
-                                  total_timing.prover_setup_ms + total_timing.prover_setup_soldering_ms +
-                                  total_timing.commit_ms + total_timing.commit_mk_poly_ms +
-                                  total_timing.commit_soldering_call_ms + total_timing.disclose_call_ms +
-                                  total_timing.reveal_soldering_call_ms + total_timing.open_call_ms +
-                                  total_timing.open_itpac_ms + total_timing.prove_mults_ms;
-            let loop_overhead = total_elapsed_ms - total_call_time;
-
-            web_sys::console::log_1(&"[jv_vm] === Summary ===".into());
-            print_timing!("Total call time", total_call_time);
-            print_timing!("Loop/other overhead", loop_overhead);
+            // Print neat summary table
+            total_timing.print_summary_table(total_elapsed_ms, total_gpu_time_ms, n, reps, total_mults);
 
             Ok(BenchResult {
                 elapsed_ms: total_elapsed_ms,

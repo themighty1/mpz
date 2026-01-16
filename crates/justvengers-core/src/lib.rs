@@ -29,6 +29,7 @@ pub use ahe::{
     SlotPackedEncryptedPowers, SlotPackedCiphertextBatch, decrypt_batched_evaluation,
     CiphertextPacking, PackedSlots, PackedValue, SlotPacker,
     PackedEncryptedPowers, PackedProverEvaluator, PackedVerifierEvaluator,
+    SlotEncoder,
 };
 pub use itmac::{GlobalKey, ItMac, ItMacBatch, ItMacField, ProverShare, VerifierShare, VolePool, VoleSource};
 pub use itpac::{EncryptedPowers, ItPac, ItPacGenerator, ItPacVerifier, RnsEncryptedPowers, RnsItPacVerifier};

@@ -32,4 +32,16 @@ pub enum GpuError {
     /// Buffer mapping failed.
     #[error("Buffer async mapping failed: {0}")]
     BufferMapping(#[from] wgpu::BufferAsyncError),
+
+    /// Buffer map async failed (channel error).
+    #[error("Buffer map async failed")]
+    MapFailed,
+
+    /// Batch size exceeded maximum.
+    #[error("Batch size exceeded: requested {requested}, max {max}")]
+    BatchSizeExceeded { requested: usize, max: usize },
+
+    /// No GPU adapter available.
+    #[error("No GPU adapter available")]
+    NoAdapter,
 }

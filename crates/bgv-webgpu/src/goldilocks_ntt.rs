@@ -1043,6 +1043,512 @@ impl GoldilocksNttGpu {
         Err(GpuError::InvalidParams("from_device not supported - Device/Queue don't impl Clone. Use new_async instead.".into()))
     }
 
+    /// Warms up all GPU pipelines by running minimal dispatches.
+    /// This forces shader compilation to happen upfront rather than on first use.
+    pub fn warmup(&self) {
+        // Create minimal dummy buffers for warmup
+        let dummy_data: Vec<u32> = vec![0u32; self.n * 2]; // n elements as u64 pairs
+
+        let dummy_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("warmup_dummy"),
+                contents: bytemuck::cast_slice(&dummy_data),
+                usage: BufferUsages::STORAGE,
+            },
+        );
+
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("warmup_output"),
+            size: (self.n * 2 * 4) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let batch_params = GpuBatchParams {
+            n: self.n as u32,
+            log_n: self.log_n,
+            num_batches: 1,
+            _pad: 0,
+        };
+        let batch_params_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("warmup_batch_params"),
+                contents: bytemuck::bytes_of(&batch_params),
+                usage: BufferUsages::UNIFORM,
+            },
+        );
+
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor {
+                label: Some("warmup encoder"),
+            },
+        );
+
+        // Warmup forward_ntt_pipeline
+        {
+            let bind_group_layout = self.forward_ntt_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("warmup_forward_ntt"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: batch_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.forward_twiddles_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.modulus_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_forward_ntt pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.forward_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        // Warmup inverse_ntt_pipeline
+        {
+            let bind_group_layout = self.inverse_ntt_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("warmup_inverse_ntt"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: batch_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.inverse_twiddles_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.modulus_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_inverse_ntt pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.inverse_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        // Warmup batched_ntt_pipeline
+        {
+            let bind_group_layout = self.batched_ntt_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("warmup_batched_ntt"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: batch_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.forward_twiddles_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.modulus_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_batched_ntt pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.batched_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        // Warmup pointwise_mul_pipeline
+        {
+            let bind_group_layout = self.pointwise_mul_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("warmup_pointwise_mul"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: batch_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.modulus_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_pointwise_mul pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pointwise_mul_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        // Warmup twiddle_pipeline
+        {
+            let twiddle_params = GpuTwiddleParams {
+                n: self.n as u32,
+                n1: self.n as u32,
+                num_elements: self.n as u32,
+                poly_stride: self.n as u32,
+            };
+            let twiddle_params_buffer = self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("warmup_twiddle_params"),
+                    contents: bytemuck::bytes_of(&twiddle_params),
+                    usage: BufferUsages::UNIFORM,
+                },
+            );
+
+            let bind_group_layout = self.twiddle_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("warmup_twiddle"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: twiddle_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.forward_twiddles_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.modulus_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_twiddle pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.twiddle_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        self.device.poll(wgpu::Maintain::Wait);
+    }
+
+    /// Async version of warmup for WASM.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn warmup_async(&self) {
+        // Create minimal dummy buffers for warmup
+        let dummy_data: Vec<u32> = vec![0u32; self.n * 2];
+
+        let dummy_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("warmup_dummy"),
+                contents: bytemuck::cast_slice(&dummy_data),
+                usage: BufferUsages::STORAGE,
+            },
+        );
+
+        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("warmup_output"),
+            size: (self.n * 2 * 4) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let batch_params = GpuBatchParams {
+            n: self.n as u32,
+            log_n: self.log_n,
+            num_batches: 1,
+            _pad: 0,
+        };
+        let batch_params_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("warmup_batch_params"),
+                contents: bytemuck::bytes_of(&batch_params),
+                usage: BufferUsages::UNIFORM,
+            },
+        );
+
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor {
+                label: Some("warmup encoder"),
+            },
+        );
+
+        // Warmup forward_ntt_pipeline
+        {
+            let bind_group_layout = self.forward_ntt_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("warmup_forward_ntt"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: batch_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.forward_twiddles_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.modulus_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_forward_ntt pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.forward_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        // Warmup inverse_ntt_pipeline
+        {
+            let bind_group_layout = self.inverse_ntt_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("warmup_inverse_ntt"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: batch_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.inverse_twiddles_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.modulus_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_inverse_ntt pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.inverse_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        // Warmup batched_ntt_pipeline
+        {
+            let bind_group_layout = self.batched_ntt_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("warmup_batched_ntt"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: batch_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.forward_twiddles_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.modulus_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_batched_ntt pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.batched_ntt_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        // Warmup pointwise_mul_pipeline
+        {
+            let bind_group_layout = self.pointwise_mul_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("warmup_pointwise_mul"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: batch_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: output_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.modulus_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_pointwise_mul pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pointwise_mul_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        // Warmup twiddle_pipeline
+        {
+            let twiddle_params = GpuTwiddleParams {
+                n: self.n as u32,
+                n1: self.n as u32,
+                num_elements: self.n as u32,
+                poly_stride: self.n as u32,
+            };
+            let twiddle_params_buffer = self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("warmup_twiddle_params"),
+                    contents: bytemuck::bytes_of(&twiddle_params),
+                    usage: BufferUsages::UNIFORM,
+                },
+            );
+
+            let bind_group_layout = self.twiddle_pipeline.get_bind_group_layout(0);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("warmup_twiddle"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: twiddle_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: dummy_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.forward_twiddles_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.modulus_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("warmup_twiddle pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.twiddle_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+
+        // Create a small staging buffer to synchronize GPU completion
+        let sync_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("warmup_sync"),
+            size: 4,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let buffer_slice = sync_buffer.slice(..);
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+
+        // Await GPU completion (browser handles scheduling in WASM)
+        let _ = receiver.await;
+    }
+
     /// Performs batched forward NTT on multiple polynomials.
     ///
     /// # Arguments

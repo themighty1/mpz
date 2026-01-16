@@ -65,6 +65,7 @@ use mpz_justvengers_core::{
     RnsBgvParams, RnsCiphertext, RnsKeyPair, RnsPublicKey, RnsSecretKey,
     PackedEncryptedPowers, PackedProverEvaluator,
     CiphertextPacking, // trait needed for pack_2way method
+    SlotEncoder, // for cached encoder in blinding
 };
 
 use mpz_core::{prg::Prg, Block};
@@ -115,7 +116,7 @@ macro_rules! wasm_log {
 
 // Optional GPU acceleration for slot multiplication and NTT
 #[cfg(feature = "gpu")]
-use bgv_webgpu::{RnsSlotMulGpu, RnsBatchParams, GoldilocksNttGpu};
+use bgv_webgpu::{RnsSlotMulGpuRadix4, RnsBatchParams, GoldilocksNttGpu};
 
 // ============================================================================
 // Goldilocks IT-MAC Field
@@ -650,7 +651,7 @@ pub struct JVProver {
     /// GPU context for slot multiplication (pre-initialized for WASM).
     /// Wrapped in Arc for Clone support (GPU handles can't be cloned).
     #[cfg(feature = "gpu")]
-    gpu_context: Option<std::sync::Arc<RnsSlotMulGpu>>,
+    gpu_context: Option<std::sync::Arc<RnsSlotMulGpuRadix4>>,
     /// GPU context for Goldilocks NTT (polynomial multiplication).
     #[cfg(feature = "gpu")]
     ntt_gpu: Option<std::sync::Arc<GoldilocksNttGpu>>,
@@ -675,6 +676,14 @@ pub struct JVProver {
     timing_open_polynomial_ms: f64,
     timing_mk_commit_vole_ms: f64,
     timing_mk_commit_packing_ms: f64,
+    /// Commit phase breakdown: GPU slot multiplication time
+    timing_commit_gpu_ms: f64,
+    /// Commit phase breakdown: CPU reshape/blinding time
+    timing_commit_reshape_ms: f64,
+    /// Commit phase breakdown: NTT extraction time
+    timing_commit_ntt_extract_ms: f64,
+    /// Commit phase breakdown: CT collapse time
+    timing_commit_collapse_ms: f64,
 }
 
 /// Protocol phases for the optimized prover.
@@ -758,6 +767,10 @@ impl JVProver {
             timing_open_polynomial_ms: 0.0,
             timing_mk_commit_vole_ms: 0.0,
             timing_mk_commit_packing_ms: 0.0,
+            timing_commit_gpu_ms: 0.0,
+            timing_commit_reshape_ms: 0.0,
+            timing_commit_ntt_extract_ms: 0.0,
+            timing_commit_collapse_ms: 0.0,
         }
     }
 
@@ -788,8 +801,11 @@ impl JVProver {
     }
 
     /// Returns timing breakdown for performance analysis.
-    /// (intt, collapse, poly_div, open, mk_poly, itpac, packing, setup, disclose, commit_soldering, lpzk_accumulation, reveal_soldering)
-    pub fn timing_breakdown(&self) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
+    /// Fields: (intt, collapse, poly_div, open, mk_poly, itpac, packing, setup, disclose,
+    ///          commit_soldering, lpzk_accumulation, reveal_soldering, mk_binary, mk_sum,
+    ///          open_polynomial, mk_commit_vole, mk_commit_packing,
+    ///          commit_gpu, commit_reshape, commit_ntt_extract, commit_collapse)
+    pub fn timing_breakdown(&self) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
         (
             self.timing_intt_ms,
             self.timing_collapse_ms,
@@ -808,6 +824,10 @@ impl JVProver {
             self.timing_open_polynomial_ms,
             self.timing_mk_commit_vole_ms,
             self.timing_mk_commit_packing_ms,
+            self.timing_commit_gpu_ms,
+            self.timing_commit_reshape_ms,
+            self.timing_commit_ntt_extract_ms,
+            self.timing_commit_collapse_ms,
         )
     }
 
@@ -834,12 +854,13 @@ impl JVProver {
         let gpu_params = RnsBatchParams::from_moduli(slot_count, t, &moduli_with_psi)
             .ok_or(JVProverError::GpuInitFailed)?;
 
-        match RnsSlotMulGpu::new_async(gpu_params).await {
+        match RnsSlotMulGpuRadix4::new_async(gpu_params).await {
             Ok(ctx) => {
+                // V2 preallocates buffers and bind groups during construction
                 self.gpu_context = Some(std::sync::Arc::new(ctx));
             }
             Err(e) => {
-                eprintln!("[prepare_gpu_async] RnsSlotMulGpu init failed: {}", e);
+                eprintln!("[prepare_gpu_async] RnsSlotMulGpuRadix4 init failed: {}", e);
                 return Err(JVProverError::GpuInitFailed);
             }
         }
@@ -849,6 +870,11 @@ impl JVProver {
         let ntt_size = (2 * self.r).next_power_of_two().max(1024);
         match GoldilocksNttGpu::new_async(ntt_size).await {
             Ok(ctx) => {
+                // Warmup shader compilation
+                #[cfg(target_arch = "wasm32")]
+                ctx.warmup_async().await;
+                #[cfg(not(target_arch = "wasm32"))]
+                ctx.warmup();
                 self.ntt_gpu = Some(std::sync::Arc::new(ctx));
             }
             Err(e) => {
@@ -882,12 +908,13 @@ impl JVProver {
         let gpu_params = RnsBatchParams::from_moduli(slot_count, t, &moduli_with_psi)
             .ok_or(JVProverError::GpuInitFailed)?;
 
-        match RnsSlotMulGpu::new(gpu_params) {
+        match RnsSlotMulGpuRadix4::new(gpu_params) {
             Ok(ctx) => {
+                // V2 preallocates buffers and bind groups during construction
                 self.gpu_context = Some(std::sync::Arc::new(ctx));
             }
             Err(e) => {
-                eprintln!("[prepare_gpu] RnsSlotMulGpu init failed: {}", e);
+                eprintln!("[prepare_gpu] RnsSlotMulGpuRadix4 init failed: {}", e);
                 return Err(JVProverError::GpuInitFailed);
             }
         }
@@ -896,6 +923,7 @@ impl JVProver {
         let ntt_size = (2 * self.r).next_power_of_two().max(1024);
         match GoldilocksNttGpu::new(ntt_size) {
             Ok(ctx) => {
+                ctx.warmup();
                 self.ntt_gpu = Some(std::sync::Arc::new(ctx));
             }
             Err(e) => {
@@ -923,12 +951,12 @@ impl JVProver {
     /// Use this for benchmarks to initialize GPU before receiving verifier data.
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
     pub fn prepare_gpu_goldilocks(&mut self, slot_count: usize) -> Result<(), JVProverError> {
-        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpu};
+        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpuRadix4};
 
         let gpu_params = RnsBatchParams::goldilocks(slot_count)
             .ok_or(JVProverError::GpuInitFailed)?;
 
-        match RnsSlotMulGpu::new(gpu_params) {
+        match RnsSlotMulGpuRadix4::new(gpu_params) {
             Ok(ctx) => {
                 self.gpu_context = Some(std::sync::Arc::new(ctx));
                 Ok(())
@@ -943,14 +971,16 @@ impl JVProver {
     /// Creates a pre-initialized GPU context for Goldilocks parameters.
     /// Returns Arc that can be shared across multiple provers.
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    pub fn create_gpu_context_goldilocks(slot_count: usize) -> Result<std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>, JVProverError> {
-        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpu};
+    pub fn create_gpu_context_goldilocks(slot_count: usize) -> Result<std::sync::Arc<bgv_webgpu::RnsSlotMulGpuRadix4>, JVProverError> {
+        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpuRadix4};
 
         let gpu_params = RnsBatchParams::goldilocks(slot_count)
             .ok_or(JVProverError::GpuInitFailed)?;
 
-        match RnsSlotMulGpu::new(gpu_params) {
-            Ok(ctx) => Ok(std::sync::Arc::new(ctx)),
+        match RnsSlotMulGpuRadix4::new(gpu_params) {
+            Ok(ctx) => {
+                Ok(std::sync::Arc::new(ctx))
+            }
             Err(e) => {
                 eprintln!("[create_gpu_context_goldilocks] GPU init failed: {}", e);
                 Err(JVProverError::GpuInitFailed)
@@ -961,14 +991,16 @@ impl JVProver {
     /// Async version of create_gpu_context_goldilocks for WASM.
     /// Returns Arc that can be shared across multiple provers.
     #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
-    pub async fn create_gpu_context_goldilocks(slot_count: usize) -> Result<std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>, JVProverError> {
-        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpu};
+    pub async fn create_gpu_context_goldilocks(slot_count: usize) -> Result<std::sync::Arc<bgv_webgpu::RnsSlotMulGpuRadix4>, JVProverError> {
+        use bgv_webgpu::{RnsBatchParams, RnsSlotMulGpuRadix4};
 
         let gpu_params = RnsBatchParams::goldilocks(slot_count)
             .ok_or(JVProverError::GpuInitFailed)?;
 
-        match RnsSlotMulGpu::new_async(gpu_params).await {
-            Ok(ctx) => Ok(std::sync::Arc::new(ctx)),
+        match RnsSlotMulGpuRadix4::new_async(gpu_params).await {
+            Ok(ctx) => {
+                Ok(std::sync::Arc::new(ctx))
+            }
             Err(e) => {
                 eprintln!("[create_gpu_context_goldilocks_async] GPU init failed: {}", e);
                 Err(JVProverError::GpuInitFailed)
@@ -978,7 +1010,7 @@ impl JVProver {
 
     /// Sets a pre-initialized GPU context (for sharing across iterations).
     #[cfg(feature = "gpu")]
-    pub fn set_gpu_context(&mut self, ctx: std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>) {
+    pub fn set_gpu_context(&mut self, ctx: std::sync::Arc<bgv_webgpu::RnsSlotMulGpuRadix4>) {
         self.gpu_context = Some(ctx);
     }
 
@@ -1431,7 +1463,7 @@ impl JVProver {
         let bgv_start = profile_start!();
 
         // GPU-only path: GPU context must be initialized
-        let (mut collapsed_cts, gpu_time, collapse_time) = {
+        let (mut collapsed_cts, gpu_time, reshape_time, ntt_extract_time, collapse_time) = {
             if let Some(ref gpu_ctx) = self.gpu_context {
                 Self::commit_gpu_batched_with_ctx(
                     gpu_ctx,
@@ -1447,6 +1479,10 @@ impl JVProver {
             }
         };
         self.total_gpu_time_ms += gpu_time;
+        self.timing_commit_gpu_ms += gpu_time;
+        self.timing_commit_reshape_ms += reshape_time;
+        self.timing_commit_ntt_extract_ms += ntt_extract_time;
+        self.timing_commit_collapse_ms += collapse_time;
         self.timing_collapse_ms += collapse_time;
 
         // Step 2: Ensure even number for 2-way packing
@@ -1511,7 +1547,7 @@ impl JVProver {
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
     /// Returns (ciphertexts, total_gpu_time_ms, collapse_time_ms)
     fn commit_gpu_batched_with_ctx(
-        gpu_ctx: &RnsSlotMulGpu,
+        gpu_ctx: &RnsSlotMulGpuRadix4,
         polynomials: &[Vec<u64>],
         packed_powers_chunks: &[PackedEncryptedPowers],
         vole_blinders: &[u64],
@@ -1560,6 +1596,10 @@ impl JVProver {
         let mut gpu_calls = 0;
         let mut accumulated_gpu_time_ms = 0.0;
 
+        // Pre-create slot encoder once for all blinding operations
+        let slot_encoder = SlotEncoder::new_direct(bgv_params.n, t)
+            .expect("slot encoder should work for blinding");
+
         #[cfg(target_arch = "wasm32")]
         wasm_log!("[IT-PAC] Starting GPU slot multiplication for {} chunks (max {} chunks per GPU call)...", num_chunks, max_chunks_per_call);
 
@@ -1596,11 +1636,22 @@ impl JVProver {
 
         // Prepare first batch outside loop
         let group_starts: Vec<usize> = (0..num_chunks).step_by(max_chunks_per_call).collect();
+
+        #[cfg(target_arch = "wasm32")]
+        let initial_prep_start = web_sys::window().unwrap().performance().unwrap().now();
+
         let mut next_group_data = if !group_starts.is_empty() {
             Some(prepare_group_data(group_starts[0]))
         } else {
             None
         };
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let initial_prep_time = web_sys::window().unwrap().performance().unwrap().now() - initial_prep_start;
+            accumulated_reshape_time_ms += initial_prep_time;
+            wasm_log!("[IT-PAC] Initial batch prep time: {:.2}ms", initial_prep_time);
+        }
 
         for group_idx in 0..group_starts.len() {
             let (group_start, group_end, group_c0_ntt, group_c1_ntt, group_plaintext_slots) =
@@ -1609,12 +1660,12 @@ impl JVProver {
             #[cfg(target_arch = "wasm32")]
             wasm_log!("[IT-PAC] GPU dispatch {}: processing chunks {}-{}/{}", gpu_calls + 1, group_start, group_end - 1, num_chunks);
 
-            // Start GPU work
+            // Start GPU work (V2 API: slots first, then CTs, then batches_per_ct as slice)
             let gpu_result = gpu_ctx.mul_batched_multi_ct(
+                &group_plaintext_slots,
                 &group_c0_ntt,
                 &group_c1_ntt,
-                &group_plaintext_slots,
-                num_polys,
+                &[num_polys],
             );
 
             // OPTIMIZATION: Prepare NEXT batch while GPU works on current batch
@@ -1660,7 +1711,7 @@ impl JVProver {
                         let r_last = ((vole_blinder as u128 + t as u128 - sum) % t as u128) as u64;
                         blinders.push(r_last);
 
-                        ct.sub_plaintext_slots(&blinders)
+                        ct.sub_plaintext_slots_with_encoder(&blinders, &slot_encoder)
                     } else {
                         ct
                     };
@@ -1726,17 +1777,17 @@ impl JVProver {
     }
 
     /// WASM async version of commit_gpu_batched_with_ctx (avoids blocking main thread)
-    /// Returns (ciphertexts, total_gpu_time_ms, collapse_time_ms)
+    /// Returns (ciphertexts, gpu_time_ms, reshape_time_ms, ntt_extract_time_ms, collapse_time_ms)
     #[cfg(all(feature = "gpu", target_arch = "wasm32"))]
     async fn commit_gpu_batched_with_ctx(
-        gpu_ctx: &RnsSlotMulGpu,
+        gpu_ctx: &RnsSlotMulGpuRadix4,
         polynomials: &[Vec<u64>],
         packed_powers_chunks: &[PackedEncryptedPowers],
         vole_blinders: &[u64],
         slot_count: usize,
         t: u64,
         seed_offset: usize,
-    ) -> Result<(Vec<RnsCiphertext>, f64, f64), String> {
+    ) -> Result<(Vec<RnsCiphertext>, f64, f64, f64, f64), String> {
         let num_polys = polynomials.len();
         let num_chunks = packed_powers_chunks.len();
 
@@ -1759,22 +1810,35 @@ impl JVProver {
         #[cfg(target_arch = "wasm32")]
         wasm_log!("[IT-PAC] Starting NTT residue extraction for {} chunks...", num_chunks);
 
+        #[cfg(target_arch = "wasm32")]
+        let ntt_extract_start = web_sys::window().unwrap().performance().unwrap().now();
+
         let mut all_cts_ntt: Vec<(Vec<Vec<u64>>, Vec<Vec<u64>>)> = Vec::with_capacity(num_chunks);
         for (chunk_idx, chunk) in packed_powers_chunks.iter().enumerate() {
             #[cfg(target_arch = "wasm32")]
-            wasm_log!("[IT-PAC] Extracting NTT residues chunk {}/{}", chunk_idx + 1, num_chunks);
+            if chunk_idx % 10 == 0 || chunk_idx == num_chunks - 1 {
+                wasm_log!("[IT-PAC] Extracting NTT residues chunk {}/{}", chunk_idx + 1, num_chunks);
+            }
 
             let ntt_result = chunk.powers_ct.extract_ntt_residues();
             all_cts_ntt.push(ntt_result);
         }
 
         #[cfg(target_arch = "wasm32")]
-        wasm_log!("[IT-PAC] NTT residue extraction complete");
+        let ntt_extract_time = web_sys::window().unwrap().performance().unwrap().now() - ntt_extract_start;
+        #[cfg(target_arch = "wasm32")]
+        wasm_log!("[IT-PAC] NTT residue extraction complete: {:.2}ms", ntt_extract_time);
 
         // Process in groups of chunks that fit in GPU buffer
         let mut chunk_results: Vec<Vec<RnsCiphertext>> = vec![Vec::new(); num_chunks];
         let mut gpu_calls = 0;
         let mut accumulated_gpu_time_ms = 0.0;
+        #[cfg(target_arch = "wasm32")]
+        let mut accumulated_reshape_time_ms = 0.0;
+
+        // Pre-create slot encoder once for all blinding operations (avoids 240 recreations)
+        let slot_encoder = SlotEncoder::new_direct(bgv_params.n, t)
+            .expect("slot encoder should work for blinding");
 
         #[cfg(target_arch = "wasm32")]
         wasm_log!("[IT-PAC] Starting GPU slot multiplication for {} chunks (max {} chunks per GPU call)...", num_chunks, max_chunks_per_call);
@@ -1812,11 +1876,22 @@ impl JVProver {
 
         // Prepare first batch outside loop
         let group_starts: Vec<usize> = (0..num_chunks).step_by(max_chunks_per_call).collect();
+
+        #[cfg(target_arch = "wasm32")]
+        let initial_prep_start = web_sys::window().unwrap().performance().unwrap().now();
+
         let mut next_group_data = if !group_starts.is_empty() {
             Some(prepare_group_data(group_starts[0]))
         } else {
             None
         };
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let initial_prep_time = web_sys::window().unwrap().performance().unwrap().now() - initial_prep_start;
+            accumulated_reshape_time_ms += initial_prep_time;
+            wasm_log!("[IT-PAC] Initial batch prep time: {:.2}ms", initial_prep_time);
+        }
 
         for group_idx in 0..group_starts.len() {
             let (group_start, group_end, group_c0_ntt, group_c1_ntt, group_plaintext_slots) =
@@ -1829,11 +1904,13 @@ impl JVProver {
             #[cfg(target_arch = "wasm32")]
             let gpu_start = web_sys::window().unwrap().performance().unwrap().now();
 
+            // V2 API: slots first, then CTs, then batches_per_ct as slice
+            let batches_per_ct = [num_polys];
             let gpu_future = gpu_ctx.mul_batched_multi_ct(
+                &group_plaintext_slots,
                 &group_c0_ntt,
                 &group_c1_ntt,
-                &group_plaintext_slots,
-                num_polys,
+                &batches_per_ct,
             );
 
             // OPTIMIZATION: Prepare NEXT batch while GPU works on current batch
@@ -1843,7 +1920,9 @@ impl JVProver {
 
                 let prep_start = web_sys::window().unwrap().performance().unwrap().now();
                 next_group_data = Some(prepare_group_data(group_starts[group_idx + 1]));
-                web_sys::window().unwrap().performance().unwrap().now() - prep_start
+                let prep_time = web_sys::window().unwrap().performance().unwrap().now() - prep_start;
+                accumulated_reshape_time_ms += prep_time;
+                prep_time
             } else {
                 0.0
             };
@@ -1882,6 +1961,9 @@ impl JVProver {
             #[cfg(target_arch = "wasm32")]
             wasm_log!("[IT-PAC] GPU dispatch {} complete, processing results...", gpu_calls);
 
+            #[cfg(target_arch = "wasm32")]
+            let reshape_start = web_sys::window().unwrap().performance().unwrap().now();
+
             // Reshape and store results for this group
             for (local_chunk_idx, global_chunk_idx) in (group_start..group_end).enumerate() {
                 let mut cts: Vec<RnsCiphertext> = Vec::with_capacity(num_polys);
@@ -1910,7 +1992,7 @@ impl JVProver {
                         let r_last = ((vole_blinder as u128 + t as u128 - sum) % t as u128) as u64;
                         blinders.push(r_last);
 
-                        ct.sub_plaintext_slots(&blinders)
+                        ct.sub_plaintext_slots_with_encoder(&blinders, &slot_encoder)
                     } else {
                         ct
                     };
@@ -1919,10 +2001,17 @@ impl JVProver {
                 }
                 chunk_results[global_chunk_idx] = cts;
             }
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                let reshape_time = web_sys::window().unwrap().performance().unwrap().now() - reshape_start;
+                accumulated_reshape_time_ms += reshape_time;
+                wasm_log!("[IT-PAC] Reshape/blinding time for dispatch {}: {:.2}ms", gpu_calls, reshape_time);
+            }
         }
 
         #[cfg(target_arch = "wasm32")]
-        wasm_log!("[IT-PAC] All GPU dispatches complete ({} total calls)", gpu_calls);
+        wasm_log!("[IT-PAC] All GPU dispatches complete ({} total calls), total reshape time: {:.2}ms", gpu_calls, accumulated_reshape_time_ms);
 
         profile_end!(
             gpu_start,
@@ -1972,7 +2061,19 @@ impl JVProver {
 
         profile_end!(collapse_start, "[commit] GPU collapse: {:?}");
 
-        Ok((collapsed_cts, accumulated_gpu_time_ms, collapse_time_ms))
+        // Summary timing log
+        #[cfg(target_arch = "wasm32")]
+        {
+            let total_fn_time = web_sys::window().unwrap().performance().unwrap().now() - ntt_extract_start;
+            let tracked_time = ntt_extract_time + accumulated_gpu_time_ms + accumulated_reshape_time_ms + collapse_time_ms;
+            let unaccounted = total_fn_time - tracked_time;
+            wasm_log!(
+                "[IT-PAC] TIMING SUMMARY: total={:.2}ms, ntt_extract={:.2}ms, gpu={:.2}ms, reshape={:.2}ms, collapse={:.2}ms, unaccounted={:.2}ms",
+                total_fn_time, ntt_extract_time, accumulated_gpu_time_ms, accumulated_reshape_time_ms, collapse_time_ms, unaccounted
+            );
+        }
+
+        Ok((collapsed_cts, accumulated_gpu_time_ms, accumulated_reshape_time_ms, ntt_extract_time, collapse_time_ms))
     }
 
     /// CPU parallel slot multiplication (rayon fallback).
@@ -2307,7 +2408,7 @@ impl JVProver {
         let t = packed_powers_chunks[0].t;
 
         // GPU-only path with async on WASM
-        let (mut collapsed_cts, gpu_time, collapse_time) = {
+        let (mut collapsed_cts, gpu_time, reshape_time, ntt_extract_time, collapse_time) = {
             if let Some(ref gpu_ctx) = self.gpu_context {
                 Self::commit_gpu_batched_with_ctx(
                     gpu_ctx,
@@ -2323,6 +2424,10 @@ impl JVProver {
             }
         };
         self.total_gpu_time_ms += gpu_time;
+        self.timing_commit_gpu_ms += gpu_time;
+        self.timing_commit_reshape_ms += reshape_time;
+        self.timing_commit_ntt_extract_ms += ntt_extract_time;
+        self.timing_commit_collapse_ms += collapse_time;
         self.timing_collapse_ms += collapse_time;
 
         if collapsed_cts.len() % 2 != 0 {

@@ -325,7 +325,7 @@ fn record_for_prover<const R: usize>(
 
 /// Pre-initialized GPU context type for sharing across iterations.
 #[cfg(feature = "gpu")]
-type SharedGpuContext = Option<std::sync::Arc<bgv_webgpu::RnsSlotMulGpu>>;
+type SharedGpuContext = Option<std::sync::Arc<bgv_webgpu::RnsSlotMulGpuRadix4>>;
 #[cfg(not(feature = "gpu"))]
 type SharedGpuContext = ();
 

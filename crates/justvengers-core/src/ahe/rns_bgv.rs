@@ -1027,6 +1027,47 @@ impl RnsCiphertext {
         }
     }
 
+    /// Subtracts plaintext slot values using a cached encoder.
+    ///
+    /// This is more efficient than `sub_plaintext_slots` when performing
+    /// multiple operations with the same parameters, as it avoids
+    /// recreating the encoder each time.
+    pub fn sub_plaintext_slots_with_encoder(
+        &self,
+        plaintext_slots: &[u64],
+        encoder: &SlotEncoder,
+    ) -> Self {
+        assert!(
+            self.bgv_params.supports_slots,
+            "slot packing not supported"
+        );
+        assert!(
+            plaintext_slots.len() <= self.bgv_params.num_slots,
+            "too many slots"
+        );
+
+        // Pad slots to full size
+        let t = self.bgv_params.t;
+        let mut full_slots = vec![0u64; self.bgv_params.num_slots];
+        for (i, &s) in plaintext_slots.iter().enumerate() {
+            full_slots[i] = s % t;
+        }
+
+        // Encode plaintext slots into polynomial coefficients via inverse NTT
+        let pt_coeffs = encoder.encode(&full_slots);
+
+        // Scale by delta and create RNS polynomial
+        let pt_poly = self.coeffs_to_scaled_rns_poly(&pt_coeffs);
+
+        // Subtract from c0 only (c1 unchanged for plaintext operations)
+        Self {
+            c0: self.c0.sub(&pt_poly),
+            c1: self.c1.clone(),
+            rns_params: self.rns_params.clone(),
+            bgv_params: self.bgv_params.clone(),
+        }
+    }
+
     /// Adds plaintext slot values to ciphertext (SIMD).
     ///
     /// Given a ciphertext encrypting slot values [s_0, ..., s_{n-1}]
