@@ -495,7 +495,7 @@ async fn run_prover_iteration(
     inputs_per_rep: &[Vec<u64>],
     soldering_constraints: &[SolderingConstraint],
     recorded: &JVRecordedMessages,
-    gpu_ctx: &std::sync::Arc<bgv_webgpu::RnsSlotMulGpuRadix4>,
+    gpu_ctx: &std::sync::Arc<bgv_webgpu::RnsSlotMulGpuV3>,
     ntt_gpu_ctx: &std::sync::Arc<bgv_webgpu::GoldilocksNttGpu>,
 ) -> (f64, TimingBreakdown) {
     let performance = web_sys::window().unwrap().performance().unwrap();

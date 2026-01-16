@@ -4277,9 +4277,9 @@ fn slot_encode_batched(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
-            let new_u = math::addmod(u, tw_v, q);
-            let new_v = math::submod(u, tw_v, q);
+            let tw_v = math::goldilocks_mul(v, twiddle);
+            let new_u = math::goldilocks_add(u, tw_v);
+            let new_v = math::goldilocks_sub(u, tw_v);
 
             shared_lo[ii] = new_u.x;
             shared_hi[ii] = new_u.y;
@@ -4294,7 +4294,7 @@ fn slot_encode_batched(
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::mulmod(val, n_inv, q);
+        val = math::goldilocks_mul(val, n_inv);
         let out_base = (batch_offset + idx) * 2u;
         coeffs[out_base] = val.x;
         coeffs[out_base + 1u] = val.y;
@@ -4358,7 +4358,7 @@ fn forward_ntt_batched(
         // Twist: multiply by psi^idx
         let psi_base = idx * 2u;
         let psi_power = vec2<u32>(twiddles[psi_base], twiddles[psi_base + 1u]);
-        val = math::mulmod(val, psi_power, q);
+        val = math::mulmod_60bit(val, psi_power, q);
 
         let rev_idx = math::bit_reverse(idx, log_n);
         shared_lo[rev_idx] = val.x;
@@ -4387,7 +4387,7 @@ fn forward_ntt_batched(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -4458,8 +4458,8 @@ fn pointwise_mul_batched(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let c1 = vec2<u32>(ct_c1_ntt[base_ct], ct_c1_ntt[base_ct + 1u]);
     let pt = vec2<u32>(pt_ntt[base_pt], pt_ntt[base_pt + 1u]);
 
-    let out0 = math::mulmod(c0, pt, q);
-    let out1 = math::mulmod(c1, pt, q);
+    let out0 = math::mulmod_60bit(c0, pt, q);
+    let out1 = math::mulmod_60bit(c1, pt, q);
 
     out_c0[base_pt] = out0.x;
     out_c0[base_pt + 1u] = out0.y;
@@ -4533,8 +4533,8 @@ fn pointwise_mul_multi_ct(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let c1 = vec2<u32>(cts_c1_ntt[base_ct], cts_c1_ntt[base_ct + 1u]);
     let pt = vec2<u32>(pt_ntt[base_pt], pt_ntt[base_pt + 1u]);
 
-    let out0 = math::mulmod(c0, pt, q);
-    let out1 = math::mulmod(c1, pt, q);
+    let out0 = math::mulmod_60bit(c0, pt, q);
+    let out1 = math::mulmod_60bit(c1, pt, q);
 
     out_c0[base_pt] = out0.x;
     out_c0[base_pt + 1u] = out0.y;
@@ -4624,7 +4624,7 @@ fn inverse_ntt_batched(
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
             // CT DIT butterfly: new_u = u + w*v, new_v = u - w*v
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -4643,12 +4643,12 @@ fn inverse_ntt_batched(
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
 
         // Scale by n^-1
-        val = math::mulmod(val, n_inv, q);
+        val = math::mulmod_60bit(val, n_inv, q);
 
         // Untwist: multiply by psi_inv^idx
         let psi_inv_base = idx * 2u;
         let psi_inv_power = vec2<u32>(inv_twiddles[psi_inv_base], inv_twiddles[psi_inv_base + 1u]);
-        val = math::mulmod(val, psi_inv_power, q);
+        val = math::mulmod_60bit(val, psi_inv_power, q);
 
         let out_base = (batch_offset + idx) * 2u;
         c0_data[out_base] = val.x;
@@ -4688,7 +4688,7 @@ fn inverse_ntt_batched(
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
             // CT DIT butterfly: new_u = u + w*v, new_v = u - w*v
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -4705,12 +4705,12 @@ fn inverse_ntt_batched(
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
 
         // Scale by n^-1
-        val = math::mulmod(val, n_inv, q);
+        val = math::mulmod_60bit(val, n_inv, q);
 
         // Untwist: multiply by psi_inv^idx
         let psi_inv_base2 = idx * 2u;
         let psi_inv_power = vec2<u32>(inv_twiddles[psi_inv_base2], inv_twiddles[psi_inv_base2 + 1u]);
-        val = math::mulmod(val, psi_inv_power, q);
+        val = math::mulmod_60bit(val, psi_inv_power, q);
 
         let out_base2 = (batch_offset + idx) * 2u;
         c1_data[out_base2] = val.x;

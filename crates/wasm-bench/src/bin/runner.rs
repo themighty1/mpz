@@ -250,12 +250,12 @@ async fn run_benchmarks_with_concurrency(
 
     page.wait_for_navigation().await?;
 
-    let timeout = Duration::from_secs(300);
+    let timeout = Duration::from_secs(1200);
     let start = std::time::Instant::now();
     let mut last_status = String::new();
     let result: BenchOutput = loop {
         if start.elapsed() > timeout {
-            return Err("Benchmark timed out after 5 minutes".into());
+            return Err("Benchmark timed out after 20 minutes".into());
         }
 
         // Check for errors
@@ -563,7 +563,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--headless=new")  // New headless mode supports GPU
         .arg("--enable-unsafe-webgpu")  // Enable WebGPU
         .arg("--enable-features=Vulkan,UseSkiaRenderer")  // GPU backend
-        .window_size(1200, 800);
+        .window_size(1200, 800)
+        // Increase CDP request timeout to match benchmark timeout (20 min)
+        // Default is 30s which causes "Timeout" errors during long CPU operations
+        .request_timeout(Duration::from_secs(1200));
 
     let config = builder.build()?;
 

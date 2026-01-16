@@ -1202,8 +1202,8 @@ fn radix4_intt_butterfly(
     q: vec2<u32>
 ) -> array<vec2<u32>, 4> {
     // Inner radix-2 stage: butterflies on (a0, a1) and (a2, a3)
-    let tw_a1 = math::mulmod(a1, w_inner, q);
-    let tw_a3 = math::mulmod(a3, w_inner, q);
+    let tw_a1 = math::mulmod_60bit(a1, w_inner, q);
+    let tw_a3 = math::mulmod_60bit(a3, w_inner, q);
 
     let t0 = math::addmod(a0, tw_a1, q);
     let t1 = math::submod(a0, tw_a1, q);
@@ -1211,8 +1211,8 @@ fn radix4_intt_butterfly(
     let t3 = math::submod(a2, tw_a3, q);
 
     // Outer radix-2 stage: butterflies on (t0, t2) and (t1, t3)
-    let tw_t2 = math::mulmod(t2, w_even, q);
-    let tw_t3 = math::mulmod(t3, w_odd, q);
+    let tw_t2 = math::mulmod_60bit(t2, w_even, q);
+    let tw_t3 = math::mulmod_60bit(t3, w_odd, q);
 
     let b0 = math::addmod(t0, tw_t2, q);
     let b2 = math::submod(t0, tw_t2, q);
@@ -1328,7 +1328,7 @@ fn slot_encode_batched(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -1345,7 +1345,7 @@ fn slot_encode_batched(
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::mulmod(val, n_inv, q);
+        val = math::mulmod_60bit(val, n_inv, q);
         let out_base = (batch_offset + idx) * 2u;
         coeffs[out_base] = val.x;
         coeffs[out_base + 1u] = val.y;
@@ -1398,8 +1398,8 @@ fn radix4_ntt_butterfly(
     q: vec2<u32>
 ) -> array<vec2<u32>, 4> {
     // Inner radix-2 stage: butterflies on (a0, a1) and (a2, a3)
-    let tw_a1 = math::mulmod(a1, w_inner, q);
-    let tw_a3 = math::mulmod(a3, w_inner, q);
+    let tw_a1 = math::mulmod_60bit(a1, w_inner, q);
+    let tw_a3 = math::mulmod_60bit(a3, w_inner, q);
 
     let t0 = math::addmod(a0, tw_a1, q);
     let t1 = math::submod(a0, tw_a1, q);
@@ -1407,8 +1407,8 @@ fn radix4_ntt_butterfly(
     let t3 = math::submod(a2, tw_a3, q);
 
     // Outer radix-2 stage: butterflies on (t0, t2) and (t1, t3)
-    let tw_t2 = math::mulmod(t2, w_even, q);
-    let tw_t3 = math::mulmod(t3, w_odd, q);
+    let tw_t2 = math::mulmod_60bit(t2, w_even, q);
+    let tw_t3 = math::mulmod_60bit(t3, w_odd, q);
 
     let b0 = math::addmod(t0, tw_t2, q);
     let b2 = math::submod(t0, tw_t2, q);
@@ -1451,7 +1451,7 @@ fn forward_ntt_batched(
         // Twist by psi^idx
         let psi_base = twiddle_base_offset + idx * 2u;
         let psi_power = vec2<u32>(twiddles[psi_base], twiddles[psi_base + 1u]);
-        val = math::mulmod(val, psi_power, q);
+        val = math::mulmod_60bit(val, psi_power, q);
 
         let rev_idx = math::bit_reverse(idx, log_n);
         shared_lo[rev_idx] = val.x;
@@ -1533,7 +1533,7 @@ fn forward_ntt_batched(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -1607,8 +1607,8 @@ fn radix4_intt_butterfly(
     q: vec2<u32>
 ) -> array<vec2<u32>, 4> {
     // Inner radix-2 stage: butterflies on (a0, a1) and (a2, a3)
-    let tw_a1 = math::mulmod(a1, w_inner, q);
-    let tw_a3 = math::mulmod(a3, w_inner, q);
+    let tw_a1 = math::mulmod_60bit(a1, w_inner, q);
+    let tw_a3 = math::mulmod_60bit(a3, w_inner, q);
 
     let t0 = math::addmod(a0, tw_a1, q);
     let t1 = math::submod(a0, tw_a1, q);
@@ -1616,8 +1616,8 @@ fn radix4_intt_butterfly(
     let t3 = math::submod(a2, tw_a3, q);
 
     // Outer radix-2 stage: butterflies on (t0, t2) and (t1, t3)
-    let tw_t2 = math::mulmod(t2, w_even, q);
-    let tw_t3 = math::mulmod(t3, w_odd, q);
+    let tw_t2 = math::mulmod_60bit(t2, w_even, q);
+    let tw_t3 = math::mulmod_60bit(t3, w_odd, q);
 
     let b0 = math::addmod(t0, tw_t2, q);
     let b2 = math::submod(t0, tw_t2, q);
@@ -1666,7 +1666,7 @@ fn fused_mul_intt(
         let ct_base = (ct_base_offset + idx) * 2u;
         let c0 = vec2<u32>(ct_c0[ct_base], ct_c0[ct_base + 1u]);
 
-        let prod = math::mulmod(c0, pt, q);
+        let prod = math::mulmod_60bit(c0, pt, q);
 
         let rev_idx = math::bit_reverse(idx, log_n);
         shared_lo[rev_idx] = prod.x;
@@ -1745,7 +1745,7 @@ fn fused_mul_intt(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -1761,10 +1761,10 @@ fn fused_mul_intt(
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::mulmod(val, n_inv, q);
+        val = math::mulmod_60bit(val, n_inv, q);
         let psi_inv_base = twiddle_base_offset + idx * 2u;
         let psi_inv = vec2<u32>(inv_twiddles[psi_inv_base], inv_twiddles[psi_inv_base + 1u]);
-        val = math::mulmod(val, psi_inv, q);
+        val = math::mulmod_60bit(val, psi_inv, q);
 
         let out_base = (out_base_offset + idx) * 2u;
         out_c0[out_base] = val.x;
@@ -1783,7 +1783,7 @@ fn fused_mul_intt(
         let ct_base = (ct_base_offset + idx) * 2u;
         let c1 = vec2<u32>(ct_c1[ct_base], ct_c1[ct_base + 1u]);
 
-        let prod = math::mulmod(c1, pt, q);
+        let prod = math::mulmod_60bit(c1, pt, q);
 
         let rev_idx = math::bit_reverse(idx, log_n);
         shared_lo[rev_idx] = prod.x;
@@ -1860,7 +1860,7 @@ fn fused_mul_intt(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -1876,10 +1876,10 @@ fn fused_mul_intt(
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::mulmod(val, n_inv, q);
+        val = math::mulmod_60bit(val, n_inv, q);
         let psi_inv_base = twiddle_base_offset + idx * 2u;
         let psi_inv = vec2<u32>(inv_twiddles[psi_inv_base], inv_twiddles[psi_inv_base + 1u]);
-        val = math::mulmod(val, psi_inv, q);
+        val = math::mulmod_60bit(val, psi_inv, q);
 
         let out_base = (out_base_offset + idx) * 2u;
         out_c1[out_base] = val.x;

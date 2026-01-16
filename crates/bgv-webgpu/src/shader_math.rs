@@ -158,8 +158,8 @@ fn ge128(a: vec4<u32>, b: vec4<u32>) -> bool {
 }
 
 // Modular multiplication using shift-and-subtract reduction
-// For 60-bit modulus: a * b mod q where a, b < q
-fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
+// For 60-bit modulus: a * b mod q where a, b < q (both inputs must be < 2^60)
+fn mulmod_60bit(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
     let prod = mul64(a, b);
     let q128 = vec4<u32>(q.x, q.y, 0u, 0u);
     var r = prod;
@@ -192,6 +192,32 @@ fn mulmod(a: vec2<u32>, b: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
 
     // Final reductions
     for (var i = 0u; i < 3u; i++) {
+        if !ge128(r, q128) { break; }
+        r = sub128(r, q128);
+    }
+
+    return vec2<u32>(r.x, r.y);
+}
+
+// Reduce a 64-bit value mod a 60-bit modulus q.
+// Used when the input can exceed 60 bits (e.g., Goldilocks values up to 2^64).
+// For 64-bit input and 60-bit q, quotient is at most 2^64/2^59 = 32, so we need 5-bit shifts.
+fn reduce_mod_64(x: vec2<u32>, q: vec2<u32>) -> vec2<u32> {
+    let x128 = vec4<u32>(x.x, x.y, 0u, 0u);
+    let q128 = vec4<u32>(q.x, q.y, 0u, 0u);
+    var r = x128;
+
+    // Shift-and-subtract for small quotient (up to 32)
+    // Do shifts 4, 3, 2, 1, 0 (handles quotient up to 31)
+    for (var shift = 4u; shift > 0u; shift = shift - 1u) {
+        var q_shifted = vec4<u32>(q.x << shift, (q.y << shift) | (q.x >> (32u - shift)), q.y >> (32u - shift), 0u);
+        if ge128(r, q_shifted) {
+            r = sub128(r, q_shifted);
+        }
+    }
+
+    // Final reductions (shift = 0)
+    for (var i = 0u; i < 4u; i++) {
         if !ge128(r, q128) { break; }
         r = sub128(r, q128);
     }
@@ -778,7 +804,7 @@ fn test_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let q = vec2<u32>(0xFFFFFFFFu, 0u);
     let sum = math::addmod(a, b, q);
     let diff = math::submod(a, b, q);
-    let prod = math::mulmod(a, b, q);
+    let prod = math::mulmod_60bit(a, b, q);
 }
 "#;
         let result = compose_shader(test_shader, "test.wgsl");
