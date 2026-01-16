@@ -1,6 +1,32 @@
 # mpz-wasm-bench
 
-WASM benchmarks for mpz libraries. Runs in headless Chrome via chromiumoxide to measure real browser performance with Web Workers and SharedArrayBuffer.
+WASM benchmarks for mpz libraries. Runs in Chrome via chromiumoxide to measure real browser performance with Web Workers and SharedArrayBuffer.
+
+---
+
+## ⚠️ IMPORTANT: GPU/WebGPU Requires Xvfb ⚠️
+
+**Headless Chrome does NOT expose WebGPU (`navigator.gpu` is undefined).** To run benchmarks with GPU acceleration, you MUST use `xvfb-run` to provide a virtual display:
+
+```bash
+# CORRECT - GPU will work:
+xvfb-run -a ../../target/release/wasm-bench-runner --reps 4000 --iterations 1 --samples 1 -v
+
+# WRONG - GPU will NOT work (no WebGPU in headless mode):
+../../target/release/wasm-bench-runner --reps 4000 --iterations 1 --samples 1 -v
+```
+
+### Installing Xvfb
+
+```bash
+# Fedora/RHEL
+sudo dnf install xorg-x11-server-Xvfb
+
+# Ubuntu/Debian
+sudo apt install xvfb
+```
+
+---
 
 ## Prerequisites
 

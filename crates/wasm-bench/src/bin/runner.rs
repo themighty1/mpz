@@ -1,13 +1,28 @@
 //! Chromiumoxide-based WASM benchmark runner.
 //!
-//! Launches headless Chrome and runs benchmarks.
+//! Launches Chrome and runs benchmarks.
 //! Requires WASM to be built first with ./build-wasm.sh
 //!
-//! Usage:
-//!   ./build-wasm.sh
-//!   cargo run --release --bin wasm-bench-runner -- [OPTIONS]
+//! # ⚠️ IMPORTANT: GPU/WebGPU Requires Xvfb ⚠️
 //!
-//! Options:
+//! Headless Chrome does NOT expose WebGPU (`navigator.gpu` is undefined).
+//! To run benchmarks with GPU acceleration, you MUST use `xvfb-run`:
+//!
+//! ```bash
+//! # CORRECT - GPU will work:
+//! xvfb-run -a ../../target/release/wasm-bench-runner --reps 4000 --iterations 1 --samples 1 -v
+//!
+//! # WRONG - GPU will NOT work:
+//! ../../target/release/wasm-bench-runner --reps 4000 --iterations 1 --samples 1 -v
+//! ```
+//!
+//! # Usage
+//!
+//!   ./build-wasm.sh
+//!   xvfb-run -a cargo run --release --bin wasm-bench-runner -- [OPTIONS]
+//!
+//! # Options
+//!
 //!   --iterations <N>   Number of iterations per benchmark (default: 100)
 //!   --samples <N>      Number of samples per benchmark (default: 10)
 //!   --verbose, -v      Print browser console logs to terminal
@@ -664,6 +679,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         i += 1;
     }
+
+    // Print GPU/Xvfb warning banner
+    eprintln!();
+    eprintln!("╔══════════════════════════════════════════════════════════════════════════════╗");
+    eprintln!("║  ⚠️  WARNING: GPU/WebGPU requires xvfb-run!                                   ║");
+    eprintln!("║                                                                              ║");
+    eprintln!("║  Headless Chrome does NOT expose WebGPU. You MUST run with:                  ║");
+    eprintln!("║                                                                              ║");
+    eprintln!("║    xvfb-run -a ../../target/release/wasm-bench-runner [OPTIONS]              ║");
+    eprintln!("║                                                                              ║");
+    eprintln!("║  If you see 'WebGPU not available' errors, you forgot xvfb-run!              ║");
+    eprintln!("╚══════════════════════════════════════════════════════════════════════════════╝");
+    eprintln!();
 
     // If no benchmarks specified, run all
     let benchmarks: Vec<String> = if selected_benchmarks.is_empty() {
