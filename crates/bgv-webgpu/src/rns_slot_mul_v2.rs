@@ -1455,9 +1455,9 @@ fn slot_encode_batched(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
-            let new_u = math::addmod(u, tw_v, q);
-            let new_v = math::submod(u, tw_v, q);
+            let tw_v = math::goldilocks_mul(v, twiddle);
+            let new_u = math::goldilocks_add(u, tw_v);
+            let new_v = math::goldilocks_sub(u, tw_v);
 
             shared_lo[ii] = new_u.x;
             shared_hi[ii] = new_u.y;
@@ -1472,7 +1472,7 @@ fn slot_encode_batched(
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::mulmod(val, n_inv, q);
+        val = math::goldilocks_mul(val, n_inv);
         let out_base = (batch_offset + idx) * 2u;
         coeffs[out_base] = val.x;
         coeffs[out_base + 1u] = val.y;
@@ -1545,10 +1545,13 @@ fn forward_ntt_batched(
         let coeff_base = (batch_offset + idx) * 2u;
         var val = vec2<u32>(coeffs[coeff_base], coeffs[coeff_base + 1u]);
 
+        // Reduce 64-bit Goldilocks value mod q (required because encoded values can be up to 2^64)
+        val = math::reduce_mod_64(val, q);
+
         // Twist: multiply by psi^idx (psi at offset 0 within this modulus's twiddles)
         let psi_base = twiddle_base_offset + idx * 2u;
         let psi_power = vec2<u32>(twiddles[psi_base], twiddles[psi_base + 1u]);
-        val = math::mulmod(val, psi_power, q);
+        val = math::mulmod_60bit(val, psi_power, q);
 
         let rev_idx = math::bit_reverse(idx, log_n);
         shared_lo[rev_idx] = val.x;
@@ -1577,7 +1580,7 @@ fn forward_ntt_batched(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -1694,7 +1697,7 @@ fn fused_mul_intt(
         let c0 = vec2<u32>(ct_c0[ct_base], ct_c0[ct_base + 1u]);
 
         // Pointwise multiply
-        let prod = math::mulmod(c0, pt, q);
+        let prod = math::mulmod_60bit(c0, pt, q);
 
         // Store in shared memory with bit-reversal for INTT
         let rev_idx = math::bit_reverse(idx, log_n);
@@ -1723,7 +1726,7 @@ fn fused_mul_intt(
 
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
             shared_lo[ii] = new_u.x;
@@ -1738,11 +1741,11 @@ fn fused_mul_intt(
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::mulmod(val, n_inv, q);
+        val = math::mulmod_60bit(val, n_inv, q);
         // psi_inv at offset 0 within this modulus's twiddles
         let psi_inv_base = twiddle_base_offset + idx * 2u;
         let psi_inv = vec2<u32>(inv_twiddles[psi_inv_base], inv_twiddles[psi_inv_base + 1u]);
-        val = math::mulmod(val, psi_inv, q);
+        val = math::mulmod_60bit(val, psi_inv, q);
 
         let out_base = (out_base_offset + idx) * 2u;
         out_c0[out_base] = val.x;
@@ -1764,7 +1767,7 @@ fn fused_mul_intt(
         let c1 = vec2<u32>(ct_c1[ct_base], ct_c1[ct_base + 1u]);
 
         // Pointwise multiply
-        let prod = math::mulmod(c1, pt, q);
+        let prod = math::mulmod_60bit(c1, pt, q);
 
         // Store in shared memory with bit-reversal for INTT
         let rev_idx = math::bit_reverse(idx, log_n);
@@ -1792,7 +1795,7 @@ fn fused_mul_intt(
 
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
             shared_lo[ii] = new_u.x;
@@ -1807,10 +1810,10 @@ fn fused_mul_intt(
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::mulmod(val, n_inv, q);
+        val = math::mulmod_60bit(val, n_inv, q);
         let psi_inv_base = twiddle_base_offset + idx * 2u;
         let psi_inv = vec2<u32>(inv_twiddles[psi_inv_base], inv_twiddles[psi_inv_base + 1u]);
-        val = math::mulmod(val, psi_inv, q);
+        val = math::mulmod_60bit(val, psi_inv, q);
 
         let out_base = (out_base_offset + idx) * 2u;
         out_c1[out_base] = val.x;
@@ -2355,6 +2358,82 @@ mod tests {
                     break;
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_v2_full_pipeline_with_identity_ct() {
+        // Test V2 with identity ciphertext (all 1s in NTT domain)
+        // Result should equal the slot_encode output
+        let params = match RnsBatchParams::goldilocks(8192) {
+            Some(p) => p,
+            None => {
+                println!("Skipping test: goldilocks params not available");
+                return;
+            }
+        };
+        let n = params.n;
+        let k = params.k;
+        let t = params.plaintext_data.t;
+
+        let v2_ctx = match RnsSlotMulGpuV2::new(params.clone()) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                println!("Skipping test: V2 GPU not available ({})", e);
+                return;
+            }
+        };
+
+        println!("Testing V2 full pipeline with identity ciphertext");
+
+        // Create test slots
+        let slots: Vec<Vec<u64>> = vec![(0..n).map(|i| (i as u64) % t).collect()];
+
+        // Create identity ciphertext: all 1s in NTT domain
+        // When multiplied, result = pt_ntt * 1 = pt_ntt
+        // After INTT, we should get the original encoded values
+        let cts_c0: Vec<Vec<Vec<u64>>> = vec![(0..k)
+            .map(|_| vec![1u64; n])
+            .collect()];
+        let cts_c1: Vec<Vec<Vec<u64>>> = vec![(0..k)
+            .map(|_| vec![1u64; n])
+            .collect()];
+        let batches_per_ct = vec![1];
+
+        // Get slot_encode output for reference
+        let encoded = v2_ctx.test_slot_encode(&slots).expect("slot encode failed");
+        println!("  slot_encode produced {} values", encoded[0].len());
+
+        // Run full pipeline
+        let (v2_c0, _v2_c1) = v2_ctx.mul_batched_multi_ct(&slots, &cts_c0, &cts_c1, &batches_per_ct)
+            .expect("V2 mul_batched_multi_ct failed");
+        println!("  Full pipeline completed");
+
+        // Compare with slot_encode output
+        let mod_idx = 0;
+        let q = params.rns_data[mod_idx].modulus;
+        let mut mismatches = 0;
+        let mut first_mismatch: Option<(usize, u64, u64)> = None;
+        for i in 0..n {
+            let expected = encoded[0][i] % q;
+            let actual = v2_c0[0][mod_idx][i];
+            if expected != actual {
+                mismatches += 1;
+                if first_mismatch.is_none() {
+                    first_mismatch = Some((i, expected, actual));
+                }
+            }
+        }
+
+        if mismatches == 0 {
+            println!("  ✓ Full pipeline with ct=1 matches slot_encode: all {} elements correct", n);
+        } else {
+            println!("  ✗ Full pipeline with ct=1: {} mismatches out of {}", mismatches, n);
+            if let Some((i, exp, act)) = first_mismatch {
+                println!("    First mismatch at i={}: expected {} (encoded mod q), got {}", i, exp, act);
+            }
+            println!("    encoded[0..5] mod q: {:?}", &encoded[0][0..5].iter().map(|&x| x % q).collect::<Vec<_>>());
+            println!("    v2_c0[0..5]:         {:?}", &v2_c0[0][mod_idx][0..5]);
         }
     }
 }

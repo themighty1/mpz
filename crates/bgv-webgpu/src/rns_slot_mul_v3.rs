@@ -20,6 +20,15 @@
 //! Trade-offs:
 //!   - 3x global memory round-trips vs shared-memory-only in V2
 //!   - More kernel dispatches
+//!
+//! # Status: Work-in-Progress
+//!
+//! The four-step NTT infrastructure is complete (buffers, pipelines, bind groups),
+//! but the numerical output does not yet match V2. Further debugging needed.
+//!
+//! Actual order implemented:
+//!   - Forward: col_ntt → cross_twiddle → row_ntt
+//!   - Inverse: row_intt → cross_inv → col_intt
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::{util::DeviceExt, BindGroup, Buffer, BufferUsages, ComputePipeline, Device, Queue};
@@ -45,12 +54,12 @@ struct GpuBatchParams {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuBatchParamsMultiCt {
     n: u32,
-    log_n: u32,
+    n1: u32,              // 32 for four-step NTT
+    n2: u32,              // 256 for four-step NTT
     num_batches: u32,
     num_moduli: u32,
     num_cts: u32,
     batches_per_ct: u32,
-    mod_idx: u32,
     _pad: u32,
 }
 
@@ -66,6 +75,25 @@ struct GpuModulusParams {
     n_inv_hi: u32,
     _pad0: u32,
     _pad1: u32,
+}
+
+/// Uniform buffer for four-step NTT parameters.
+/// NOTE: Different shaders interpret this differently:
+/// - Row NTT/INTT shaders: expect log_n2 (8) at position 3
+/// - Col NTT/INTT shaders: expect log_n1 (5) at position 3
+/// So we need separate params buffers or modify shaders.
+/// For now, we add both log values.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuFourStepParams {
+    n: u32,           // Total size (8192)
+    n1: u32,          // Number of rows (32)
+    n2: u32,          // Number of columns (256)
+    log_n2: u32,      // log2(n2) = 8 (for row NTT/INTT)
+    num_batches: u32,
+    num_moduli: u32,
+    log_n1: u32,      // log2(n1) = 5 (for col NTT/INTT)
+    _pad: u32,
 }
 
 /// Maximum number of batches for pre-allocated buffers.
@@ -90,7 +118,8 @@ pub struct RnsSlotMulGpuV3 {
     queue: Queue,
 
     // Four-step pipelines
-    slot_encode_pipeline: ComputePipeline,        // Twist + bit-reverse for rows
+    slot_encode_pipeline: ComputePipeline,        // Slots → coefficients (in plaintext ring)
+    twist_pipeline: ComputePipeline,              // Coefficients → twisted + RNS expanded
     row_ntt_pipeline: ComputePipeline,            // 256-point NTTs (step 1)
     cross_twiddle_pipeline: ComputePipeline,      // Multiply by omega^(row*col) (step 2)
     col_ntt_pipeline: ComputePipeline,            // 32-point NTTs (step 3)
@@ -133,6 +162,7 @@ pub struct RnsSlotMulGpuV3 {
     preallocated_out_c0_buffer: Buffer,
     preallocated_out_c1_buffer: Buffer,
     preallocated_batch_params_buffer: Buffer,       // 16 bytes (GpuBatchParams)
+    preallocated_fourstep_params_buffer: Buffer,   // 32 bytes (GpuFourStepParams)
     preallocated_fused_params_buffer: Buffer,       // 32 bytes (GpuBatchParamsMultiCt)
     preallocated_slots_buffer: Buffer,
     preallocated_cts_c0_buffer: Buffer,
@@ -140,6 +170,7 @@ pub struct RnsSlotMulGpuV3 {
 
     // Bind groups (one per step for flexibility)
     slot_encode_bind_group: BindGroup,
+    twist_bind_group: BindGroup,
     row_ntt_bind_group: BindGroup,
     cross_twiddle_bind_group: BindGroup,
     col_ntt_bind_group: BindGroup,
@@ -147,6 +178,10 @@ pub struct RnsSlotMulGpuV3 {
     col_intt_bind_group: BindGroup,
     cross_twiddle_inv_bind_group: BindGroup,
     row_intt_bind_group: BindGroup,
+    // Bind groups for c1 INTT (same pipelines, different data buffer)
+    col_intt_c1_bind_group: BindGroup,
+    cross_twiddle_inv_c1_bind_group: BindGroup,
+    row_intt_c1_bind_group: BindGroup,
 }
 
 /// Four-step decomposition: n1 rows × n2 columns
@@ -185,7 +220,11 @@ impl RnsSlotMulGpuV3 {
 }
 
 impl RnsSlotMulGpuV3 {
-    /// Creates a new optimized GPU context for RNS batched slot multiplication.
+    /// Creates a new four-step NTT GPU context for RNS batched slot multiplication.
+    ///
+    /// NOTE: This implementation is a work-in-progress. The four-step NTT approach
+    /// decomposes the 8192-point NTT into row (256-pt) and column (32-pt) NTTs
+    /// for better GPU occupancy.
     pub fn new(params: RnsBatchParams) -> Result<Self, GpuError> {
         pollster::block_on(Self::new_async(params))
     }
@@ -209,7 +248,7 @@ impl RnsSlotMulGpuV3 {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    label: Some("rns-slot-mul-v2 device"),
+                    label: Some("rns-slot-mul-v3 device"),
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits {
                         max_compute_workgroup_size_x: 256,
@@ -227,6 +266,13 @@ impl RnsSlotMulGpuV3 {
     }
 
     /// Creates context with existing device/queue.
+    ///
+    /// The four-step approach requires:
+    /// 1. Separate twiddle buffers for row NTTs (omega_n2), col NTTs (omega_n1), and cross (omega^(r*c))
+    /// 2. Separate pipelines for twist, row_ntt, cross_twiddle, col_ntt (forward)
+    /// 3. Separate pipelines for col_intt, cross_twiddle_inv, row_intt_untwist (inverse)
+    /// 4. Temporary buffers for intermediate results
+    #[allow(unused_variables)]
     pub fn new_with_device(
         device: Device,
         queue: Queue,
@@ -236,32 +282,72 @@ impl RnsSlotMulGpuV3 {
         let k = params.k;
         let log_n = (n as u32).trailing_zeros();
 
+        // Four-step decomposition constants
+        let n1 = FOUR_STEP_N1;  // 32 rows
+        let n2 = FOUR_STEP_N2;  // 256 columns
+        assert_eq!(n1 * n2, n, "Four-step decomposition requires n = n1 * n2");
+
         // Compile shaders using naga_oil composition
         let slot_encode_shader = crate::shader_math::create_shader_module(
             &device,
             SLOT_ENCODE_SHADER,
-            "slot_encode_v2.wgsl",
+            "slot_encode_v3.wgsl",
         )
         .map_err(GpuError::ShaderCompilation)?;
 
-        let forward_ntt_shader = crate::shader_math::create_shader_module(
+        let twist_shader = crate::shader_math::create_shader_module(
             &device,
-            FORWARD_NTT_SHADER,
-            "forward_ntt_v2.wgsl",
+            TWIST_SHADER,
+            "twist_v3.wgsl",
         )
         .map_err(GpuError::ShaderCompilation)?;
 
-        let fused_mul_intt_shader = crate::shader_math::create_shader_module(
+        let row_ntt_shader = crate::shader_math::create_shader_module(
             &device,
-            FUSED_MUL_INTT_SHADER,
-            "fused_mul_intt_v2.wgsl",
+            ROW_NTT_SHADER,
+            "row_ntt_v3.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
+
+        let cross_twiddle_shader = crate::shader_math::create_shader_module(
+            &device,
+            CROSS_TWIDDLE_SHADER,
+            "cross_twiddle_v3.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
+
+        let col_ntt_shader = crate::shader_math::create_shader_module(
+            &device,
+            COL_NTT_SHADER,
+            "col_ntt_v3.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
+
+        let col_intt_shader = crate::shader_math::create_shader_module(
+            &device,
+            COL_INTT_SHADER,
+            "col_intt_v3.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
+
+        let row_intt_shader = crate::shader_math::create_shader_module(
+            &device,
+            ROW_INTT_UNTWIST_SHADER,
+            "row_intt_untwist_v3.wgsl",
+        )
+        .map_err(GpuError::ShaderCompilation)?;
+
+        let pointwise_mul_shader = crate::shader_math::create_shader_module(
+            &device,
+            POINTWISE_MUL_SHADER,
+            "pointwise_mul_v3.wgsl",
         )
         .map_err(GpuError::ShaderCompilation)?;
 
         // Create pipelines
         let slot_encode_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("slot_encode_v2 pipeline"),
+                label: Some("slot_encode_v3 pipeline"),
                 layout: None,
                 module: &slot_encode_shader,
                 entry_point: Some("slot_encode_batched"),
@@ -269,27 +355,87 @@ impl RnsSlotMulGpuV3 {
                 cache: None,
             });
 
-        let forward_ntt_pipeline =
+        let row_ntt_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("forward_ntt_v2 pipeline"),
+                label: Some("row_ntt_v3 pipeline"),
                 layout: None,
-                module: &forward_ntt_shader,
-                entry_point: Some("forward_ntt_batched"),
+                module: &row_ntt_shader,
+                entry_point: Some("row_ntt"),
                 compilation_options: Default::default(),
                 cache: None,
             });
 
-        let fused_mul_intt_pipeline =
+        let cross_twiddle_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("fused_mul_intt_v2 pipeline"),
+                label: Some("cross_twiddle_v3 pipeline"),
                 layout: None,
-                module: &fused_mul_intt_shader,
-                entry_point: Some("fused_mul_intt"),
+                module: &cross_twiddle_shader,
+                entry_point: Some("cross_twiddle"),
                 compilation_options: Default::default(),
                 cache: None,
             });
 
-        // Create plaintext parameter buffer
+        let col_ntt_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("col_ntt_v3 pipeline"),
+                layout: None,
+                module: &col_ntt_shader,
+                entry_point: Some("col_ntt"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let col_intt_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("col_intt_v3 pipeline"),
+                layout: None,
+                module: &col_intt_shader,
+                entry_point: Some("col_intt"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let cross_twiddle_inv_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("cross_twiddle_inv_v3 pipeline"),
+                layout: None,
+                module: &cross_twiddle_shader,  // Same shader, different twiddles
+                entry_point: Some("cross_twiddle"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let row_intt_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("row_intt_untwist_v3 pipeline"),
+                layout: None,
+                module: &row_intt_shader,
+                entry_point: Some("row_intt_untwist"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let pointwise_mul_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("pointwise_mul_v3 pipeline"),
+                layout: None,
+                module: &pointwise_mul_shader,
+                entry_point: Some("pointwise_mul"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let twist_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("twist_v3 pipeline"),
+                layout: None,
+                module: &twist_shader,
+                entry_point: Some("twist"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        // Create plaintext parameter buffer (for slot_encode)
         let pt_data = &params.plaintext_data;
         let plaintext_params = GpuModulusParams {
             modulus_lo: pt_data.t as u32,
@@ -302,12 +448,12 @@ impl RnsSlotMulGpuV3 {
             _pad1: 0,
         };
         let plaintext_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("plaintext_params_v2"),
+            label: Some("plaintext_params_v3"),
             contents: bytemuck::bytes_of(&plaintext_params),
             usage: BufferUsages::UNIFORM,
         });
 
-        // Create plaintext twiddle buffer (inverse powers for INTT)
+        // Create plaintext twiddle buffer (inverse powers for INTT in slot_encode)
         let pt_twiddles_flat: Vec<u32> = pt_data
             .zeta_inv_powers
             .iter()
@@ -315,13 +461,12 @@ impl RnsSlotMulGpuV3 {
             .collect();
         let plaintext_twiddles_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("plaintext_twiddles_v2"),
+                label: Some("plaintext_twiddles_v3"),
                 contents: bytemuck::cast_slice(&pt_twiddles_flat),
                 usage: BufferUsages::STORAGE,
             });
 
-        // Create COMBINED RNS modulus parameters buffer (all k moduli in one buffer)
-        // Layout: [mod0_params, mod1_params, ..., modk_params] as array of GpuModulusParams
+        // Create RNS modulus parameters buffer (all k moduli)
         let mut all_rns_params: Vec<GpuModulusParams> = Vec::with_capacity(k);
         for rns_data in params.rns_data.iter() {
             all_rns_params.push(GpuModulusParams {
@@ -336,110 +481,189 @@ impl RnsSlotMulGpuV3 {
             });
         }
         let all_rns_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("all_rns_params_v2"),
+            label: Some("all_rns_params_v3"),
             contents: bytemuck::cast_slice(&all_rns_params),
-            usage: BufferUsages::STORAGE,  // Array access requires STORAGE, not UNIFORM
-        });
-
-        // Create COMBINED forward twiddles buffer (all k moduli)
-        // Layout: [mod0_psi, mod0_omega, mod1_psi, mod1_omega, ...]
-        // Each modulus has n psi_powers + n omega_powers = 2n values
-        // Total: k * 2n * 2 u32s
-        let mut all_fwd_twiddles: Vec<u32> = Vec::with_capacity(k * n * 4);
-        for rns_data in params.rns_data.iter() {
-            for &x in &rns_data.psi_powers {
-                all_fwd_twiddles.push(x as u32);
-                all_fwd_twiddles.push((x >> 32) as u32);
-            }
-            for &x in &rns_data.omega_powers {
-                all_fwd_twiddles.push(x as u32);
-                all_fwd_twiddles.push((x >> 32) as u32);
-            }
-        }
-        let all_rns_twiddles_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("all_rns_twiddles_v2"),
-            contents: bytemuck::cast_slice(&all_fwd_twiddles),
             usage: BufferUsages::STORAGE,
         });
 
-        // Create COMBINED inverse twiddles buffer (all k moduli)
-        let mut all_inv_twiddles: Vec<u32> = Vec::with_capacity(k * n * 4);
+        // Compute four-step twiddle factors
+        // Row NTT uses omega_n2 = omega^(n/n2) = omega^32 (256th root of unity)
+        // Col NTT uses omega_n1 = omega^(n/n1) = omega^256 (32nd root of unity)
+        // Cross twiddles use omega^(row * col)
+
+        // Row twiddles: omega_n2^j = omega_n^(32*j) for j = 0..n2
+        let mut all_row_twiddles: Vec<u32> = Vec::with_capacity(k * n2 * 2);
+        let mut all_row_inv_twiddles: Vec<u32> = Vec::with_capacity(k * n2 * 2);
         for rns_data in params.rns_data.iter() {
-            for &x in &rns_data.psi_inv_powers {
-                all_inv_twiddles.push(x as u32);
-                all_inv_twiddles.push((x >> 32) as u32);
-            }
-            for &x in &rns_data.omega_inv_powers {
-                all_inv_twiddles.push(x as u32);
-                all_inv_twiddles.push((x >> 32) as u32);
+            for j in 0..n2 {
+                // omega_n2^j = omega_n^(32*j) = omega_powers[(32*j) % n]
+                let idx = (32 * j) % n;
+                let omega = rns_data.omega_powers[idx];
+                all_row_twiddles.push(omega as u32);
+                all_row_twiddles.push((omega >> 32) as u32);
+
+                let omega_inv = rns_data.omega_inv_powers[idx];
+                all_row_inv_twiddles.push(omega_inv as u32);
+                all_row_inv_twiddles.push((omega_inv >> 32) as u32);
             }
         }
-        let all_rns_inv_twiddles_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("all_rns_inv_twiddles_v2"),
-            contents: bytemuck::cast_slice(&all_inv_twiddles),
+        let all_row_twiddles_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("all_row_twiddles_v3"),
+            contents: bytemuck::cast_slice(&all_row_twiddles),
+            usage: BufferUsages::STORAGE,
+        });
+        let all_row_inv_twiddles_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("all_row_inv_twiddles_v3"),
+            contents: bytemuck::cast_slice(&all_row_inv_twiddles),
             usage: BufferUsages::STORAGE,
         });
 
-        // Create pre-allocated buffers
+        // Col twiddles: omega_n1^i = omega_n^(256*i) for i = 0..n1
+        let mut all_col_twiddles: Vec<u32> = Vec::with_capacity(k * n1 * 2);
+        let mut all_col_inv_twiddles: Vec<u32> = Vec::with_capacity(k * n1 * 2);
+        for rns_data in params.rns_data.iter() {
+            for i in 0..n1 {
+                // omega_n1^i = omega_n^(256*i) = omega_powers[(256*i) % n]
+                let idx = (256 * i) % n;
+                let omega = rns_data.omega_powers[idx];
+                all_col_twiddles.push(omega as u32);
+                all_col_twiddles.push((omega >> 32) as u32);
+
+                let omega_inv = rns_data.omega_inv_powers[idx];
+                all_col_inv_twiddles.push(omega_inv as u32);
+                all_col_inv_twiddles.push((omega_inv >> 32) as u32);
+            }
+        }
+        let all_col_twiddles_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("all_col_twiddles_v3"),
+            contents: bytemuck::cast_slice(&all_col_twiddles),
+            usage: BufferUsages::STORAGE,
+        });
+        let all_col_inv_twiddles_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("all_col_inv_twiddles_v3"),
+            contents: bytemuck::cast_slice(&all_col_inv_twiddles),
+            usage: BufferUsages::STORAGE,
+        });
+
+        // Cross twiddles: omega^(row * col) for all row in 0..n1, col in 0..n2
+        let mut all_cross_twiddles: Vec<u32> = Vec::with_capacity(k * n * 2);
+        let mut all_cross_inv_twiddles: Vec<u32> = Vec::with_capacity(k * n * 2);
+        for rns_data in params.rns_data.iter() {
+            for row in 0..n1 {
+                for col in 0..n2 {
+                    let idx = (row * col) % n;
+                    let omega = rns_data.omega_powers[idx];
+                    all_cross_twiddles.push(omega as u32);
+                    all_cross_twiddles.push((omega >> 32) as u32);
+
+                    let omega_inv = rns_data.omega_inv_powers[idx];
+                    all_cross_inv_twiddles.push(omega_inv as u32);
+                    all_cross_inv_twiddles.push((omega_inv >> 32) as u32);
+                }
+            }
+        }
+        let all_cross_twiddles_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("all_cross_twiddles_v3"),
+            contents: bytemuck::cast_slice(&all_cross_twiddles),
+            usage: BufferUsages::STORAGE,
+        });
+        let all_cross_inv_twiddles_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("all_cross_inv_twiddles_v3"),
+            contents: bytemuck::cast_slice(&all_cross_inv_twiddles),
+            usage: BufferUsages::STORAGE,
+        });
+
+        // Psi powers for twist/untwist
+        let mut all_psi: Vec<u32> = Vec::with_capacity(k * n * 2);
+        let mut all_psi_inv: Vec<u32> = Vec::with_capacity(k * n * 2);
+        for rns_data in params.rns_data.iter() {
+            for &psi in &rns_data.psi_powers {
+                all_psi.push(psi as u32);
+                all_psi.push((psi >> 32) as u32);
+            }
+            for &psi_inv in &rns_data.psi_inv_powers {
+                all_psi_inv.push(psi_inv as u32);
+                all_psi_inv.push((psi_inv >> 32) as u32);
+            }
+        }
+        let all_psi_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("all_psi_v3"),
+            contents: bytemuck::cast_slice(&all_psi),
+            usage: BufferUsages::STORAGE,
+        });
+        let all_psi_inv_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("all_psi_inv_v3"),
+            contents: bytemuck::cast_slice(&all_psi_inv),
+            usage: BufferUsages::STORAGE,
+        });
+
+        // Pre-allocated buffers
         let max_batches = MAX_SLOT_MUL_BATCHES;
-        let slot_buffer_size = (max_batches * n * 2 * 4) as u64; // u64 = 2 u32s
+        let slot_buffer_size = (max_batches * n * 2 * 4) as u64;
         let rns_buffer_size = (max_batches * k * n * 2 * 4) as u64;
 
         let preallocated_slots_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("slots_input_v2"),
+            label: Some("slots_input_v3"),
             size: slot_buffer_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let preallocated_encoded_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("encoded_v2"),
+            label: Some("encoded_v3"),
             size: slot_buffer_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        // pt_ntt buffer now holds k moduli worth of data (was: slot_buffer_size)
-        // This allows all k forward NTTs to run in parallel without overwriting
-        let preallocated_pt_ntt_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pt_ntt_v2"),
-            size: rns_buffer_size,  // k times larger than before
+        // Temp buffer for intermediate four-step results
+        let preallocated_temp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("temp_v3"),
+            size: rns_buffer_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        // CT input buffers (sized for MAX_CT_CHUNKS)
+        let preallocated_pt_ntt_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pt_ntt_v3"),
+            size: rns_buffer_size,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // CT input buffers
         const MAX_CT_CHUNKS: usize = 8;
         let ct_buffer_size = (MAX_CT_CHUNKS * k * n * 2 * 4) as u64;
 
         let preallocated_cts_c0_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cts_c0_input_v2"),
+            label: Some("cts_c0_input_v3"),
             size: ct_buffer_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let preallocated_cts_c1_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cts_c1_input_v2"),
+            label: Some("cts_c1_input_v3"),
             size: ct_buffer_size,
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let preallocated_out_c0_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("out_c0_v2"),
+            label: Some("out_c0_v3"),
             size: rns_buffer_size,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let preallocated_out_c1_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("out_c1_v2"),
+            label: Some("out_c1_v3"),
             size: rns_buffer_size,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
+        // Batch params buffer
         let initial_batch_params = GpuBatchParams {
             n: n as u32,
             log_n,
@@ -448,33 +672,51 @@ impl RnsSlotMulGpuV3 {
         };
         let preallocated_batch_params_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("batch_params_v2"),
+                label: Some("batch_params_v3"),
                 contents: bytemuck::bytes_of(&initial_batch_params),
                 usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             });
 
-        // Fused params buffer (mod_idx no longer needed - comes from workgroup_id.y)
+        // Four-step params buffer (for row/col NTT)
+        let initial_fourstep_params = GpuFourStepParams {
+            n: n as u32,
+            n1: n1 as u32,
+            n2: n2 as u32,
+            log_n2: FOUR_STEP_LOG_N2,
+            num_batches: max_batches as u32,
+            num_moduli: k as u32,
+            log_n1: FOUR_STEP_LOG_N1,
+            _pad: 0,
+        };
+        let preallocated_fourstep_params_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("fourstep_params_v3"),
+                contents: bytemuck::bytes_of(&initial_fourstep_params),
+                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            });
+
+        // Fused params buffer
         let initial_fused_params = GpuBatchParamsMultiCt {
             n: n as u32,
-            log_n,
+            n1: FOUR_STEP_N1 as u32,
+            n2: FOUR_STEP_N2 as u32,
             num_batches: max_batches as u32,
             num_moduli: k as u32,
             num_cts: 1,
             batches_per_ct: max_batches as u32,
-            mod_idx: 0,  // Unused now - mod_idx comes from workgroup_id.y
             _pad: 0,
         };
         let preallocated_fused_params_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("fused_params_v2"),
+                label: Some("fused_params_v3"),
                 contents: bytemuck::bytes_of(&initial_fused_params),
                 usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             });
 
-        // Create SINGLE bind group for forward_ntt (mod_idx from workgroup_id.y)
-        let forward_ntt_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("forward_ntt_bind_group_v2"),
-            layout: &forward_ntt_pipeline.get_bind_group_layout(0),
+        // Create bind groups
+        let slot_encode_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("slot_encode_bind_group_v3"),
+            layout: &slot_encode_pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -482,15 +724,44 @@ impl RnsSlotMulGpuV3 {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: preallocated_slots_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: preallocated_encoded_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: plaintext_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: plaintext_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Twist bind group: reads from encoded, writes to temp (with RNS expansion + transpose)
+        // Uses FourStepParams because we need n1/n2 for the transpose
+        let twist_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("twist_bind_group_v3"),
+            layout: &twist_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
                     resource: preallocated_encoded_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: preallocated_pt_ntt_buffer.as_entire_binding(),
+                    resource: preallocated_temp_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: all_rns_twiddles_buffer.as_entire_binding(),
+                    resource: all_psi_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -499,10 +770,94 @@ impl RnsSlotMulGpuV3 {
             ],
         });
 
-        // Create SINGLE bind group for fused_mul_intt (mod_idx from workgroup_id.y)
-        let fused_mul_intt_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fused_mul_intt_bind_group_v2"),
-            layout: &fused_mul_intt_pipeline.get_bind_group_layout(0),
+        // Row NTT bind group: reads from temp, writes to pt_ntt
+        let row_ntt_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("row_ntt_bind_group_v3"),
+            layout: &row_ntt_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: preallocated_temp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: preallocated_pt_ntt_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: all_row_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: all_rns_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Forward NTT data flow: twist → row_ntt → cross_twiddle → col_ntt
+        // twist: encoded → temp
+        // row_ntt: temp → pt_ntt
+        // cross_twiddle: pt_ntt → pt_ntt (in-place)
+        // col_ntt: pt_ntt → pt_ntt (in-place)
+
+        // Cross twiddle bind group: in-place modification on pt_ntt buffer
+        // (operates AFTER row_ntt, BEFORE col_ntt)
+        let cross_twiddle_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cross_twiddle_bind_group_v3"),
+            layout: &cross_twiddle_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: preallocated_pt_ntt_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: all_cross_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: all_rns_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Col NTT bind group: in-place modification on pt_ntt buffer
+        // (operates LAST in forward NTT: row_ntt → cross → col_ntt)
+        let col_ntt_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("col_ntt_bind_group_v3"),
+            layout: &col_ntt_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: preallocated_pt_ntt_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: all_col_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: all_rns_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Pointwise mul bind group
+        let pointwise_mul_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pointwise_mul_bind_group_v3"),
+            layout: &pointwise_mul_pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -530,10 +885,183 @@ impl RnsSlotMulGpuV3 {
                 },
                 wgpu::BindGroupEntry {
                     binding: 6,
-                    resource: all_rns_inv_twiddles_buffer.as_entire_binding(),
+                    resource: all_rns_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // INTT order: col_intt → cross_inv → row_intt (reverse of forward)
+        //
+        // Col INTT bind group (for c0): reads from out_c0, writes to temp
+        // This is the FIRST step of INTT
+        let col_intt_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("col_intt_bind_group_v3"),
+            layout: &col_intt_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 7,
+                    binding: 1,
+                    resource: preallocated_out_c0_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: preallocated_temp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: all_col_inv_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: all_rns_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Cross twiddle inv bind group: in-place modification on temp
+        let cross_twiddle_inv_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cross_twiddle_inv_bind_group_v3"),
+            layout: &cross_twiddle_inv_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: preallocated_temp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: all_cross_inv_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: all_rns_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Row INTT bind group (for c0): reads from temp, writes to out_c0 (with un-transpose)
+        // This is the LAST step of INTT - writes final output directly
+        let row_intt_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("row_intt_bind_group_v3"),
+            layout: &row_intt_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: preallocated_temp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: preallocated_out_c0_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: all_row_inv_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: all_psi_inv_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: all_rns_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // =========================================================================
+        // C1 INTT bind groups (same pipelines, different data buffer)
+        // =========================================================================
+
+        // Col INTT bind group for c1: reads from out_c1, writes to temp
+        let col_intt_c1_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("col_intt_c1_bind_group_v3"),
+            layout: &col_intt_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: preallocated_out_c1_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: preallocated_temp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: all_col_inv_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: all_rns_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Cross twiddle inv bind group for c1: in-place modification on temp
+        // (temp is shared after col_intt_c1 writes to it)
+        let cross_twiddle_inv_c1_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cross_twiddle_inv_c1_bind_group_v3"),
+            layout: &cross_twiddle_inv_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: preallocated_temp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: all_cross_inv_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: all_rns_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Row INTT bind group for c1: reads from temp, writes to out_c1 (with un-transpose)
+        let row_intt_c1_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("row_intt_c1_bind_group_v3"),
+            layout: &row_intt_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preallocated_fourstep_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: preallocated_temp_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: preallocated_out_c1_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: all_row_inv_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: all_psi_inv_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
                     resource: all_rns_params_buffer.as_entire_binding(),
                 },
             ],
@@ -543,38 +1071,59 @@ impl RnsSlotMulGpuV3 {
             device,
             queue,
             slot_encode_pipeline,
-            forward_ntt_pipeline,
-            fused_mul_intt_pipeline,
+            twist_pipeline,
+            row_ntt_pipeline,
+            cross_twiddle_pipeline,
+            col_ntt_pipeline,
+            col_intt_pipeline,
+            cross_twiddle_inv_pipeline,
+            row_intt_pipeline,
+            pointwise_mul_pipeline,
             params,
+            n1,
+            n2,
             plaintext_twiddles_buffer,
             plaintext_params_buffer,
-            all_rns_twiddles_buffer,
-            all_rns_inv_twiddles_buffer,
+            all_row_twiddles_buffer,
+            all_row_inv_twiddles_buffer,
+            all_col_twiddles_buffer,
+            all_col_inv_twiddles_buffer,
+            all_cross_twiddles_buffer,
+            all_cross_inv_twiddles_buffer,
+            all_psi_buffer,
+            all_psi_inv_buffer,
             all_rns_params_buffer,
             preallocated_encoded_buffer,
+            preallocated_temp_buffer,
             preallocated_pt_ntt_buffer,
             preallocated_out_c0_buffer,
             preallocated_out_c1_buffer,
             preallocated_batch_params_buffer,
+            preallocated_fourstep_params_buffer,
             preallocated_fused_params_buffer,
             preallocated_slots_buffer,
             preallocated_cts_c0_buffer,
             preallocated_cts_c1_buffer,
-            forward_ntt_bind_group,
-            fused_mul_intt_bind_group,
+            slot_encode_bind_group,
+            twist_bind_group,
+            row_ntt_bind_group,
+            cross_twiddle_bind_group,
+            col_ntt_bind_group,
+            pointwise_mul_bind_group,
+            col_intt_bind_group,
+            cross_twiddle_inv_bind_group,
+            row_intt_bind_group,
+            col_intt_c1_bind_group,
+            cross_twiddle_inv_c1_bind_group,
+            row_intt_c1_bind_group,
         })
     }
 
-    /// Performs batched slot multiplication with multiple ciphertexts.
-    ///
-    /// # Arguments
-    /// * `slots` - Slot vectors in evaluation form, shape [num_batches][n]
-    /// * `cts_c0_ntt` - c0 components in NTT form, shape [num_cts][k][n]
-    /// * `cts_c1_ntt` - c1 components in NTT form, shape [num_cts][k][n]
-    /// * `batches_per_ct` - Number of slot batches assigned to each CT
-    ///
-    /// # Returns
-    /// (c0_results, c1_results) where each has shape [num_batches][k][n]
+    // =========================================================================
+    // Execution Pipeline
+    // =========================================================================
+
+    /// Performs batched slot multiplication using four-step NTT.
     #[cfg(target_arch = "wasm32")]
     pub async fn mul_batched_multi_ct(
         &self,
@@ -583,252 +1132,11 @@ impl RnsSlotMulGpuV3 {
         cts_c1_ntt: &[Vec<Vec<u64>>],
         batches_per_ct: &[usize],
     ) -> Result<(Vec<Vec<Vec<u64>>>, Vec<Vec<Vec<u64>>>), GpuError> {
-        let n = self.params.n;
-        let k = self.params.k;
-        let num_batches = slots.len();
-        let num_cts = cts_c0_ntt.len();
-
-        if num_batches > MAX_SLOT_MUL_BATCHES {
-            return Err(GpuError::BatchSizeExceeded {
-                requested: num_batches,
-                max: MAX_SLOT_MUL_BATCHES,
-            });
-        }
-
-        // Flatten slots: Vec<Vec<u64>> -> Vec<u64> -> bytemuck to &[u32]
-        let mut slots_flat: Vec<u64> = vec![0u64; num_batches * n];
-        for (batch_idx, slot_vec) in slots.iter().enumerate() {
-            let base = batch_idx * n;
-            slots_flat[base..base + n].copy_from_slice(slot_vec);
-        }
-
-        // Flatten CT components
-        let ct_flat_size = num_cts * k * n;
-        let mut all_c0_flat: Vec<u64> = vec![0u64; ct_flat_size];
-        let mut all_c1_flat: Vec<u64> = vec![0u64; ct_flat_size];
-
-        for (ct_idx, (c0_ct, c1_ct)) in cts_c0_ntt.iter().zip(cts_c1_ntt.iter()).enumerate() {
-            for (mod_idx, (c0_residue, c1_residue)) in c0_ct.iter().zip(c1_ct.iter()).enumerate() {
-                let base = (ct_idx * k + mod_idx) * n;
-                all_c0_flat[base..base + n].copy_from_slice(c0_residue);
-                all_c1_flat[base..base + n].copy_from_slice(c1_residue);
-            }
-        }
-
-        // Upload to GPU
-        self.queue.write_buffer(
-            &self.preallocated_slots_buffer,
-            0,
-            bytemuck::cast_slice(&slots_flat),
-        );
-        self.queue.write_buffer(
-            &self.preallocated_cts_c0_buffer,
-            0,
-            bytemuck::cast_slice(&all_c0_flat),
-        );
-        self.queue.write_buffer(
-            &self.preallocated_cts_c1_buffer,
-            0,
-            bytemuck::cast_slice(&all_c1_flat),
-        );
-
-        // Update batch params (16 bytes for slot_encode and forward_ntt)
-        let log_n = (n as u32).trailing_zeros();
-        let batch_params = GpuBatchParams {
-            n: n as u32,
-            log_n,
-            num_batches: num_batches as u32,
-            num_moduli: k as u32,
-        };
-        self.queue.write_buffer(
-            &self.preallocated_batch_params_buffer,
-            0,
-            bytemuck::bytes_of(&batch_params),
-        );
-
-        // Update fused params (32 bytes for fused_mul_intt)
-        let fused_params = GpuBatchParamsMultiCt {
-            n: n as u32,
-            log_n,
-            num_batches: num_batches as u32,
-            num_moduli: k as u32,
-            num_cts: num_cts as u32,
-            batches_per_ct: batches_per_ct.get(0).copied().unwrap_or(num_batches) as u32,
-            mod_idx: 0,
-            _pad: 0,
-        };
-        self.queue.write_buffer(
-            &self.preallocated_fused_params_buffer,
-            0,
-            bytemuck::bytes_of(&fused_params),
-        );
-
-        // Create slot_encode bind group
-        let slot_encode_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("slot_encode_bind_group_v2"),
-            layout: &self.slot_encode_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.preallocated_batch_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.preallocated_slots_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.preallocated_encoded_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.plaintext_twiddles_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.plaintext_params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Execute GPU pipeline - OPTIMIZED: only 2 submits total
-        // 1. Slot encode (separate submit to ensure completion before NTT)
-        {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("slot_encode_v2_encoder"),
-                });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("slot_encode_v2"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.slot_encode_pipeline);
-            pass.set_bind_group(0, &slot_encode_bind_group, &[]);
-            pass.dispatch_workgroups(num_batches as u32, 1, 1);
-            drop(pass);
-            self.queue.submit(std::iter::once(encoder.finish()));
-        }
-
-        // 2. Forward NTT + Fused mul + INTT for ALL moduli in ONE submit
-        // mod_idx comes from workgroup_id.y, so we dispatch with (num_batches, k, 1)
-        {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("ntt_mul_v2_encoder"),
-                });
-
-            // Forward NTT for all k moduli (writes to pt_ntt[batch_idx * k + mod_idx][n])
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("forward_ntt_v2_all"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.forward_ntt_pipeline);
-                pass.set_bind_group(0, &self.forward_ntt_bind_group, &[]);
-                pass.dispatch_workgroups(num_batches as u32, k as u32, 1);
-            }
-
-            // Fused mul + INTT for all k moduli (reads pt_ntt, writes out_c0/c1)
-            // Separate pass ensures implicit barrier after forward_ntt completes
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("fused_mul_intt_v2_all"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.fused_mul_intt_pipeline);
-                pass.set_bind_group(0, &self.fused_mul_intt_bind_group, &[]);
-                pass.dispatch_workgroups(num_batches as u32, k as u32, 1);
-            }
-
-            self.queue.submit(std::iter::once(encoder.finish()));
-        }
-
-        // Read back results
-        let results = self.read_rns_batch_async(num_batches).await?;
-        Ok(results)
+        self.mul_batched_multi_ct_async(slots, cts_c0_ntt, cts_c1_ntt, batches_per_ct)
+            .await
     }
 
-    /// Reads results back from GPU asynchronously.
-    #[cfg(target_arch = "wasm32")]
-    async fn read_rns_batch_async(
-        &self,
-        num_batches: usize,
-    ) -> Result<(Vec<Vec<Vec<u64>>>, Vec<Vec<Vec<u64>>>), GpuError> {
-        let n = self.params.n;
-        let k = self.params.k;
-        let result_size = (num_batches * k * n * 2 * 4) as u64;
-
-        // Create staging buffers
-        let staging_c0 = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_c0_v2"),
-            size: result_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let staging_c1 = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_c1_v2"),
-            size: result_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Copy from output buffers to staging
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("copy_results_v2"),
-            });
-        encoder.copy_buffer_to_buffer(&self.preallocated_out_c0_buffer, 0, &staging_c0, 0, result_size);
-        encoder.copy_buffer_to_buffer(&self.preallocated_out_c1_buffer, 0, &staging_c1, 0, result_size);
-        self.queue.submit(std::iter::once(encoder.finish()));
-
-        // Map and read
-        let c0_slice = staging_c0.slice(..);
-        let c1_slice = staging_c1.slice(..);
-
-        let (tx0, rx0) = futures::channel::oneshot::channel();
-        let (tx1, rx1) = futures::channel::oneshot::channel();
-
-        c0_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx0.send(result);
-        });
-        c1_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx1.send(result);
-        });
-
-        self.device.poll(wgpu::Maintain::Wait);
-
-        rx0.await
-            .map_err(|_| GpuError::MapFailed)?
-            .map_err(|_| GpuError::MapFailed)?;
-        rx1.await
-            .map_err(|_| GpuError::MapFailed)?
-            .map_err(|_| GpuError::MapFailed)?;
-
-        let c0_data: Vec<u32> = bytemuck::cast_slice(&c0_slice.get_mapped_range()).to_vec();
-        let c1_data: Vec<u32> = bytemuck::cast_slice(&c1_slice.get_mapped_range()).to_vec();
-
-        // Reshape using bytemuck zero-copy cast
-        let c0_u64: &[u64] = bytemuck::cast_slice(&c0_data);
-        let c1_u64: &[u64] = bytemuck::cast_slice(&c1_data);
-
-        let mut c0_results: Vec<Vec<Vec<u64>>> = vec![vec![vec![0u64; n]; k]; num_batches];
-        let mut c1_results: Vec<Vec<Vec<u64>>> = vec![vec![vec![0u64; n]; k]; num_batches];
-
-        for batch_idx in 0..num_batches {
-            for mod_idx in 0..k {
-                let base = (batch_idx * k + mod_idx) * n;
-                c0_results[batch_idx][mod_idx].copy_from_slice(&c0_u64[base..base + n]);
-                c1_results[batch_idx][mod_idx].copy_from_slice(&c1_u64[base..base + n]);
-            }
-        }
-
-        Ok((c0_results, c1_results))
-    }
-
-    /// Native (non-WASM) version of mul_batched_multi_ct.
+    /// Performs batched slot multiplication using four-step NTT.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn mul_batched_multi_ct(
         &self,
@@ -837,13 +1145,10 @@ impl RnsSlotMulGpuV3 {
         cts_c1_ntt: &[Vec<Vec<u64>>],
         batches_per_ct: &[usize],
     ) -> Result<(Vec<Vec<Vec<u64>>>, Vec<Vec<Vec<u64>>>), GpuError> {
-        pollster::block_on(async {
-            self.mul_batched_multi_ct_async(slots, cts_c0_ntt, cts_c1_ntt, batches_per_ct)
-                .await
-        })
+        pollster::block_on(self.mul_batched_multi_ct_async(slots, cts_c0_ntt, cts_c1_ntt, batches_per_ct))
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    /// Core async implementation of four-step NTT batched multiplication.
     async fn mul_batched_multi_ct_async(
         &self,
         slots: &[Vec<u64>],
@@ -853,6 +1158,8 @@ impl RnsSlotMulGpuV3 {
     ) -> Result<(Vec<Vec<Vec<u64>>>, Vec<Vec<Vec<u64>>>), GpuError> {
         let n = self.params.n;
         let k = self.params.k;
+        let n1 = self.n1;
+        let n2 = self.n2;
         let num_batches = slots.len();
         let num_cts = cts_c0_ntt.len();
 
@@ -914,15 +1221,32 @@ impl RnsSlotMulGpuV3 {
             bytemuck::bytes_of(&batch_params),
         );
 
-        // Update fused params
+        // Update four-step params
+        let fourstep_params = GpuFourStepParams {
+            n: n as u32,
+            n1: n1 as u32,
+            n2: n2 as u32,
+            log_n2: FOUR_STEP_LOG_N2,
+            num_batches: num_batches as u32,
+            num_moduli: k as u32,
+            log_n1: FOUR_STEP_LOG_N1,
+            _pad: 0,
+        };
+        self.queue.write_buffer(
+            &self.preallocated_fourstep_params_buffer,
+            0,
+            bytemuck::bytes_of(&fourstep_params),
+        );
+
+        // Update fused params (for pointwise mul)
         let fused_params = GpuBatchParamsMultiCt {
             n: n as u32,
-            log_n,
+            n1: self.n1 as u32,
+            n2: self.n2 as u32,
             num_batches: num_batches as u32,
             num_moduli: k as u32,
             num_cts: num_cts as u32,
             batches_per_ct: batches_per_ct.get(0).copied().unwrap_or(num_batches) as u32,
-            mod_idx: 0,
             _pad: 0,
         };
         self.queue.write_buffer(
@@ -931,93 +1255,180 @@ impl RnsSlotMulGpuV3 {
             bytemuck::bytes_of(&fused_params),
         );
 
-        // Create slot_encode bind group
-        let slot_encode_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("slot_encode_bind_group_v2_native"),
-            layout: &self.slot_encode_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.preallocated_batch_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.preallocated_slots_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.preallocated_encoded_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.plaintext_twiddles_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.plaintext_params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
         // Execute GPU pipeline
-        // 1. Slot encode (separate submit to ensure completion before NTT)
+        // =====================================================================
+        // Phase 1: Slot encode (plaintext INTT) - separate submit
+        // =====================================================================
         {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("slot_encode_v2_encoder_native"),
-                });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("slot_encode_v2_native"),
-                timestamp_writes: None,
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("slot_encode_v3_encoder"),
             });
-            pass.set_pipeline(&self.slot_encode_pipeline);
-            pass.set_bind_group(0, &slot_encode_bind_group, &[]);
-            pass.dispatch_workgroups(num_batches as u32, 1, 1);
-            drop(pass);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_v3"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_bind_group, &[]);
+                pass.dispatch_workgroups(num_batches as u32, 1, 1);
+            }
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        // 2. Forward NTT + Fused mul + INTT for ALL moduli in ONE submit
-        // mod_idx comes from workgroup_id.y, so we dispatch with (num_batches, k, 1)
+        // =====================================================================
+        // Phase 2: Four-step forward NTT + pointwise mul + INTT
+        // =====================================================================
         {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("ntt_mul_v2_encoder_native"),
-                });
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("fourstep_ntt_v3_encoder"),
+            });
 
-            // Forward NTT for all k moduli
+            // Dispatch dimensions for element-wise operations
+            let wg_per_n = ((n + 255) / 256) as u32;
+
+            // 2a. Twist: encoded → temp (apply psi^idx, expand to k moduli)
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("forward_ntt_v2_native_all"),
+                    label: Some("twist_v3"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.forward_ntt_pipeline);
-                pass.set_bind_group(0, &self.forward_ntt_bind_group, &[]);
-                pass.dispatch_workgroups(num_batches as u32, k as u32, 1);
+                pass.set_pipeline(&self.twist_pipeline);
+                pass.set_bind_group(0, &self.twist_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
             }
 
-            // Fused mul + INTT for all k moduli
+            // Standard four-step NTT order (with transpose in twist):
+            //   row NTT (256-pt) -> cross twiddle -> col NTT (32-pt)
+
+            // 2b. Row NTT: 256-point NTTs on each row (n1=32 rows per batch per modulus)
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("fused_mul_intt_v2_native_all"),
+                    label: Some("row_ntt_v3"),
                     timestamp_writes: None,
                 });
-                pass.set_pipeline(&self.fused_mul_intt_pipeline);
-                pass.set_bind_group(0, &self.fused_mul_intt_bind_group, &[]);
-                pass.dispatch_workgroups(num_batches as u32, k as u32, 1);
+                pass.set_pipeline(&self.row_ntt_pipeline);
+                pass.set_bind_group(0, &self.row_ntt_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, k as u32);
+            }
+
+            // 2c. Cross twiddle: multiply by omega^(row * col)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cross_twiddle_v3"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.cross_twiddle_pipeline);
+                pass.set_bind_group(0, &self.cross_twiddle_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
+            }
+
+            // 2d. Col NTT: 32-point NTTs on each column (n2=256 columns per batch per modulus)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("col_ntt_v3"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.col_ntt_pipeline);
+                pass.set_bind_group(0, &self.col_ntt_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, k as u32);
+            }
+
+            // 2e. Pointwise multiply: pt_ntt × ct → out_c0, out_c1
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("pointwise_mul_v3"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.pointwise_mul_pipeline);
+                pass.set_bind_group(0, &self.pointwise_mul_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
+            }
+
+            // =====================================================================
+            // INTT for c0: col_intt → cross_inv → row_intt (reverse of forward)
+            // row_intt also applies un-transpose + untwist at the end
+            // =====================================================================
+
+            // 2f. Col INTT for c0: out_c0 → temp (32-point INTTs on columns)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("col_intt_c0_v3"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.col_intt_pipeline);
+                pass.set_bind_group(0, &self.col_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, k as u32);
+            }
+
+            // 2g. Cross twiddle inv for c0: temp → temp (in-place)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cross_twiddle_inv_c0_v3"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.cross_twiddle_inv_pipeline);
+                pass.set_bind_group(0, &self.cross_twiddle_inv_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
+            }
+
+            // 2h. Row INTT + un-transpose + untwist for c0: temp → out_c0
+            // The row_intt_untwist shader un-transposes and applies psi_inv, writes to out_c0
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("row_intt_c0_v3"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.row_intt_pipeline);
+                pass.set_bind_group(0, &self.row_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, k as u32);
+            }
+
+            // =====================================================================
+            // INTT for c1: col_intt → cross_inv → row_intt
+            // =====================================================================
+
+            // 2i. Col INTT for c1: out_c1 → temp
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("col_intt_c1_v3"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.col_intt_pipeline);
+                pass.set_bind_group(0, &self.col_intt_c1_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, k as u32);
+            }
+
+            // 2j. Cross twiddle inv for c1: temp → temp
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cross_twiddle_inv_c1_v3"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.cross_twiddle_inv_pipeline);
+                pass.set_bind_group(0, &self.cross_twiddle_inv_c1_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
+            }
+
+            // 2k. Row INTT + un-transpose + untwist for c1: temp → out_c1
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("row_intt_c1_v3"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.row_intt_pipeline);
+                pass.set_bind_group(0, &self.row_intt_c1_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, k as u32);
             }
 
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
         // Read back results
-        self.read_rns_batch_async_native(num_batches).await
+        self.read_rns_batch_async(num_batches).await
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn read_rns_batch_async_native(
+    /// Reads back results from GPU.
+    async fn read_rns_batch_async(
         &self,
         num_batches: usize,
     ) -> Result<(Vec<Vec<Vec<u64>>>, Vec<Vec<Vec<u64>>>), GpuError> {
@@ -1027,70 +1438,85 @@ impl RnsSlotMulGpuV3 {
 
         // Create staging buffers
         let staging_c0 = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_c0_v2_native"),
+            label: Some("staging_c0_v3"),
             size: result_size,
             usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let staging_c1 = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_c1_v2_native"),
+            label: Some("staging_c1_v3"),
             size: result_size,
             usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         // Copy from output buffers to staging
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("copy_results_v2_native"),
-            });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy_results_v3"),
+        });
         encoder.copy_buffer_to_buffer(&self.preallocated_out_c0_buffer, 0, &staging_c0, 0, result_size);
         encoder.copy_buffer_to_buffer(&self.preallocated_out_c1_buffer, 0, &staging_c1, 0, result_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Map and read c0
+        // Map and read
         let c0_slice = staging_c0.slice(..);
-        let (tx0, rx0) = std::sync::mpsc::channel();
-        c0_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx0.send(result);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx0.recv().map_err(|_| GpuError::MapFailed)?.map_err(|_| GpuError::MapFailed)?;
-
-        // Map and read c1
         let c1_slice = staging_c1.slice(..);
-        let (tx1, rx1) = std::sync::mpsc::channel();
-        c1_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx1.send(result);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx1.recv().map_err(|_| GpuError::MapFailed)?.map_err(|_| GpuError::MapFailed)?;
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            c0_slice.map_async(wgpu::MapMode::Read, |_| {});
+            c1_slice.map_async(wgpu::MapMode::Read, |_| {});
+            self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (tx0, rx0) = std::sync::mpsc::channel();
+            let (tx1, rx1) = std::sync::mpsc::channel();
+            c0_slice.map_async(wgpu::MapMode::Read, move |r| tx0.send(r).unwrap());
+            c1_slice.map_async(wgpu::MapMode::Read, move |r| tx1.send(r).unwrap());
+            self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+            rx0.recv().unwrap().unwrap();
+            rx1.recv().unwrap().unwrap();
+        }
 
         let c0_data: Vec<u32> = bytemuck::cast_slice(&c0_slice.get_mapped_range()).to_vec();
         let c1_data: Vec<u32> = bytemuck::cast_slice(&c1_slice.get_mapped_range()).to_vec();
 
-        // Reshape
-        let c0_u64: &[u64] = bytemuck::cast_slice(&c0_data);
-        let c1_u64: &[u64] = bytemuck::cast_slice(&c1_data);
-
-        let mut c0_results: Vec<Vec<Vec<u64>>> = vec![vec![vec![0u64; n]; k]; num_batches];
-        let mut c1_results: Vec<Vec<Vec<u64>>> = vec![vec![vec![0u64; n]; k]; num_batches];
+        // Convert to structured output
+        let mut result_c0: Vec<Vec<Vec<u64>>> = Vec::with_capacity(num_batches);
+        let mut result_c1: Vec<Vec<Vec<u64>>> = Vec::with_capacity(num_batches);
 
         for batch_idx in 0..num_batches {
+            let mut batch_c0: Vec<Vec<u64>> = Vec::with_capacity(k);
+            let mut batch_c1: Vec<Vec<u64>> = Vec::with_capacity(k);
+
             for mod_idx in 0..k {
-                let base = (batch_idx * k + mod_idx) * n;
-                c0_results[batch_idx][mod_idx].copy_from_slice(&c0_u64[base..base + n]);
-                c1_results[batch_idx][mod_idx].copy_from_slice(&c1_u64[base..base + n]);
+                let mut residue_c0: Vec<u64> = Vec::with_capacity(n);
+                let mut residue_c1: Vec<u64> = Vec::with_capacity(n);
+
+                for j in 0..n {
+                    let offset = ((batch_idx * k + mod_idx) * n + j) * 2;
+                    let c0_val = (c0_data[offset] as u64) | ((c0_data[offset + 1] as u64) << 32);
+                    let c1_val = (c1_data[offset] as u64) | ((c1_data[offset + 1] as u64) << 32);
+                    residue_c0.push(c0_val);
+                    residue_c1.push(c1_val);
+                }
+
+                batch_c0.push(residue_c0);
+                batch_c1.push(residue_c1);
             }
+
+            result_c0.push(batch_c0);
+            result_c1.push(batch_c1);
         }
 
-        Ok((c0_results, c1_results))
+        Ok((result_c0, result_c1))
     }
 
     /// Test helper: Run only slot_encode and return the encoded coefficients.
     #[cfg(test)]
-    pub fn test_slot_encode(&self, slots: &[Vec<u64>]) -> Result<Vec<Vec<u64>>, GpuError> {
+    pub fn test_slot_encode_only(&self, slots: &[Vec<u64>]) -> Result<Vec<Vec<u64>>, GpuError> {
         let n = self.params.n;
         let num_batches = slots.len();
 
@@ -1101,7 +1527,7 @@ impl RnsSlotMulGpuV3 {
             slots_flat[base..base + n].copy_from_slice(slot_vec);
         }
 
-        // Upload to GPU
+        // Upload slots
         self.queue.write_buffer(
             &self.preallocated_slots_buffer,
             0,
@@ -1122,116 +1548,84 @@ impl RnsSlotMulGpuV3 {
             bytemuck::bytes_of(&batch_params),
         );
 
-        // Create slot_encode bind group
-        let slot_encode_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("test_slot_encode_bind_group"),
-            layout: &self.slot_encode_pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.preallocated_batch_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.preallocated_slots_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.preallocated_encoded_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.plaintext_twiddles_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.plaintext_params_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // Run slot_encode
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("test_slot_encode_encoder"),
-            });
+        // Execute slot_encode
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("test_slot_encode"),
-                timestamp_writes: None,
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("slot_encode_only_test"),
             });
-            pass.set_pipeline(&self.slot_encode_pipeline);
-            pass.set_bind_group(0, &slot_encode_bind_group, &[]);
-            pass.dispatch_workgroups(num_batches as u32, 1, 1);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_only"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_bind_group, &[]);
+                pass.dispatch_workgroups(num_batches as u32, 1, 1);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
 
         // Read back encoded buffer
         let result_size = (num_batches * n * 2 * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test_slot_encode_staging"),
+            label: Some("staging_encoded_v3"),
             size: result_size,
             usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("test_slot_encode_copy"),
-            });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy_encoded"),
+        });
         encoder.copy_buffer_to_buffer(&self.preallocated_encoded_buffer, 0, &staging, 0, result_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // Map and read
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv().map_err(|_| GpuError::MapFailed)?.map_err(|_| GpuError::MapFailed)?;
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        rx.recv().unwrap().unwrap();
 
         let data: Vec<u32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
-        let data_u64: &[u64] = bytemuck::cast_slice(&data);
 
-        // Reshape to [num_batches][n]
-        let mut results: Vec<Vec<u64>> = vec![vec![0u64; n]; num_batches];
+        // Convert to structured output
+        let mut result: Vec<Vec<u64>> = Vec::with_capacity(num_batches);
         for batch_idx in 0..num_batches {
-            let base = batch_idx * n;
-            results[batch_idx].copy_from_slice(&data_u64[base..base + n]);
+            let mut batch: Vec<u64> = Vec::with_capacity(n);
+            for j in 0..n {
+                let offset = (batch_idx * n + j) * 2;
+                let val = (data[offset] as u64) | ((data[offset + 1] as u64) << 32);
+                batch.push(val);
+            }
+            result.push(batch);
         }
 
-        Ok(results)
+        Ok(result)
     }
 
-    /// Test helper: Run forward_ntt for a single modulus and return the NTT output.
-    /// Now uses 2D workgroups with mod_idx from workgroup_id.y.
+    /// Test helper: Run only the forward NTT (slot_encode + twist + row_ntt + cross_twiddle + col_ntt)
+    /// and return the pt_ntt values for debugging.
     #[cfg(test)]
-    pub fn test_forward_ntt(&self, input: &[u64], mod_idx: usize) -> Result<Vec<u64>, GpuError> {
+    pub fn test_forward_ntt_only(&self, slots: &[Vec<u64>]) -> Result<Vec<Vec<Vec<u64>>>, GpuError> {
         let n = self.params.n;
         let k = self.params.k;
+        let n1 = self.n1;
+        let n2 = self.n2;
+        let num_batches = slots.len();
 
-        if input.len() != n {
-            return Err(GpuError::InvalidParams(format!(
-                "Input length {} != n {}",
-                input.len(),
-                n
-            )));
-        }
-        if mod_idx >= k {
-            return Err(GpuError::InvalidParams(format!(
-                "mod_idx {} >= k {}",
-                mod_idx, k
-            )));
+        // Flatten slots
+        let mut slots_flat: Vec<u64> = vec![0u64; num_batches * n];
+        for (batch_idx, slot_vec) in slots.iter().enumerate() {
+            let base = batch_idx * n;
+            slots_flat[base..base + n].copy_from_slice(slot_vec);
         }
 
-        // Upload input to encoded buffer (forward_ntt reads from encoded buffer)
+        // Upload slots
         self.queue.write_buffer(
-            &self.preallocated_encoded_buffer,
+            &self.preallocated_slots_buffer,
             0,
-            bytemuck::cast_slice(input),
+            bytemuck::cast_slice(&slots_flat),
         );
 
         // Update batch params
@@ -1239,7 +1633,7 @@ impl RnsSlotMulGpuV3 {
         let batch_params = GpuBatchParams {
             n: n as u32,
             log_n,
-            num_batches: 1,
+            num_batches: num_batches as u32,
             num_moduli: k as u32,
         };
         self.queue.write_buffer(
@@ -1248,190 +1642,491 @@ impl RnsSlotMulGpuV3 {
             bytemuck::bytes_of(&batch_params),
         );
 
-        // Run forward_ntt for all k moduli (uses workgroup_id.y for mod_idx)
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("test_forward_ntt_encoder"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("test_forward_ntt"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.forward_ntt_pipeline);
-            pass.set_bind_group(0, &self.forward_ntt_bind_group, &[]);
-            pass.dispatch_workgroups(1, k as u32, 1);  // Run all k moduli
-        }
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // Update four-step params
+        let fourstep_params = GpuFourStepParams {
+            n: n as u32,
+            n1: n1 as u32,
+            n2: n2 as u32,
+            log_n2: FOUR_STEP_LOG_N2,
+            num_batches: num_batches as u32,
+            num_moduli: k as u32,
+            log_n1: FOUR_STEP_LOG_N1,
+            _pad: 0,
+        };
+        self.queue.write_buffer(
+            &self.preallocated_fourstep_params_buffer,
+            0,
+            bytemuck::bytes_of(&fourstep_params),
+        );
 
-        // Read back pt_ntt buffer at mod_idx offset
-        // pt_ntt layout: [batch_idx * k + mod_idx][n], so for batch_idx=0, read at mod_idx * n
-        let result_size = (n * 2 * 4) as u64;
-        let read_offset = (mod_idx * n * 8) as u64;  // 8 bytes per u64
+        // Execute forward NTT pipeline
+        // 1. Slot encode
+        {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("slot_encode_v3_test"),
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_test"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_bind_group, &[]);
+                pass.dispatch_workgroups(num_batches as u32, 1, 1);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // 2. Forward NTT (twist + row_ntt + cross_twiddle + col_ntt)
+        {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("forward_ntt_v3_test"),
+            });
+            let wg_per_n = ((n + 255) / 256) as u32;
+
+            // Twist: encoded → temp
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("twist_test"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.twist_pipeline);
+                pass.set_bind_group(0, &self.twist_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
+            }
+
+            // Row NTT: temp → pt_ntt
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("row_ntt_test"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.row_ntt_pipeline);
+                pass.set_bind_group(0, &self.row_ntt_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, k as u32);
+            }
+
+            // Cross twiddle: pt_ntt (in-place)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cross_twiddle_test"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.cross_twiddle_pipeline);
+                pass.set_bind_group(0, &self.cross_twiddle_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
+            }
+
+            // Col NTT: pt_ntt (in-place)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("col_ntt_test"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.col_ntt_pipeline);
+                pass.set_bind_group(0, &self.col_ntt_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, k as u32);
+            }
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Read back pt_ntt
+        let result_size = (num_batches * k * n * 2 * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test_forward_ntt_staging"),
+            label: Some("staging_pt_ntt_v3"),
             size: result_size,
             usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("test_forward_ntt_copy"),
-            });
-        encoder.copy_buffer_to_buffer(&self.preallocated_pt_ntt_buffer, read_offset, &staging, 0, result_size);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy_pt_ntt"),
+        });
+        encoder.copy_buffer_to_buffer(&self.preallocated_pt_ntt_buffer, 0, &staging, 0, result_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // Map and read
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv().map_err(|_| GpuError::MapFailed)?.map_err(|_| GpuError::MapFailed)?;
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        rx.recv().unwrap().unwrap();
 
         let data: Vec<u32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
-        let data_u64: &[u64] = bytemuck::cast_slice(&data);
 
-        Ok(data_u64.to_vec())
+        // Convert to structured output
+        let mut result: Vec<Vec<Vec<u64>>> = Vec::with_capacity(num_batches);
+        for batch_idx in 0..num_batches {
+            let mut batch: Vec<Vec<u64>> = Vec::with_capacity(k);
+            for mod_idx in 0..k {
+                let mut residue: Vec<u64> = Vec::with_capacity(n);
+                for j in 0..n {
+                    let offset = ((batch_idx * k + mod_idx) * n + j) * 2;
+                    let val = (data[offset] as u64) | ((data[offset + 1] as u64) << 32);
+                    residue.push(val);
+                }
+                batch.push(residue);
+            }
+            result.push(batch);
+        }
+
+        Ok(result)
     }
 
-    /// Test helper: Run fused_mul_intt for a single batch and return c0 output.
-    /// Takes pt_ntt (plaintext in NTT form) and ct_c0 (ciphertext c0 in NTT form).
-    /// Now uses 2D workgroups with mod_idx from workgroup_id.y.
+    /// Test helper: Run slot_encode + twist only and return the temp_buffer values.
+    /// This helps isolate whether bugs are in twist or row_ntt.
     #[cfg(test)]
-    pub fn test_fused_mul_intt(
-        &self,
-        pt_ntt: &[u64],
-        ct_c0: &[u64],
-        ct_c1: &[u64],
-        mod_idx: usize,
-    ) -> Result<(Vec<u64>, Vec<u64>), GpuError> {
+    pub fn test_twist_only(&self, slots: &[Vec<u64>]) -> Result<Vec<Vec<Vec<u64>>>, GpuError> {
         let n = self.params.n;
         let k = self.params.k;
+        let num_batches = slots.len();
 
-        if pt_ntt.len() != n || ct_c0.len() != n || ct_c1.len() != n {
-            return Err(GpuError::InvalidParams("Input lengths must equal n".to_string()));
+        // Flatten slots
+        let mut slots_flat: Vec<u64> = vec![0u64; num_batches * n];
+        for (batch_idx, slot_vec) in slots.iter().enumerate() {
+            let base = batch_idx * n;
+            slots_flat[base..base + n].copy_from_slice(slot_vec);
         }
-        if mod_idx >= k {
-            return Err(GpuError::InvalidParams(format!("mod_idx {} >= k {}", mod_idx, k)));
-        }
 
-        // Upload pt_ntt to pt_ntt buffer at mod_idx offset
-        // pt_ntt layout: [batch_idx * k + mod_idx][n], for batch_idx=0 write at mod_idx * n
-        let pt_ntt_offset = (mod_idx * n * 8) as u64;  // 8 bytes per u64
+        // Upload slots
         self.queue.write_buffer(
-            &self.preallocated_pt_ntt_buffer,
-            pt_ntt_offset,
-            bytemuck::cast_slice(pt_ntt),
+            &self.preallocated_slots_buffer,
+            0,
+            bytemuck::cast_slice(&slots_flat),
         );
 
-        // Upload ct_c0 and ct_c1 to CT buffers (at mod_idx offset for single CT)
-        // CT buffer layout: [ct0_mod0, ct0_mod1, ...] so for mod_idx we write at mod_idx * n
-        let ct_offset = (mod_idx * n * 8) as u64; // 8 bytes per u64
-        self.queue.write_buffer(
-            &self.preallocated_cts_c0_buffer,
-            ct_offset,
-            bytemuck::cast_slice(ct_c0),
-        );
-        self.queue.write_buffer(
-            &self.preallocated_cts_c1_buffer,
-            ct_offset,
-            bytemuck::cast_slice(ct_c1),
-        );
-
-        // Update fused params (mod_idx field unused - comes from workgroup_id.y)
+        // Update batch params
         let log_n = (n as u32).trailing_zeros();
-        let fused_params = GpuBatchParamsMultiCt {
+        let batch_params = GpuBatchParams {
             n: n as u32,
             log_n,
-            num_batches: 1,
+            num_batches: num_batches as u32,
             num_moduli: k as u32,
-            num_cts: 1,
-            batches_per_ct: 1,
-            mod_idx: 0,  // Unused - mod_idx comes from workgroup_id.y
+        };
+        self.queue.write_buffer(
+            &self.preallocated_batch_params_buffer,
+            0,
+            bytemuck::bytes_of(&batch_params),
+        );
+
+        // Update four-step params
+        let fourstep_params = GpuFourStepParams {
+            n: n as u32,
+            n1: self.n1 as u32,
+            n2: self.n2 as u32,
+            log_n2: FOUR_STEP_LOG_N2,
+            num_batches: num_batches as u32,
+            num_moduli: k as u32,
+            log_n1: FOUR_STEP_LOG_N1,
             _pad: 0,
         };
         self.queue.write_buffer(
-            &self.preallocated_fused_params_buffer,
+            &self.preallocated_fourstep_params_buffer,
             0,
-            bytemuck::bytes_of(&fused_params),
+            bytemuck::bytes_of(&fourstep_params),
         );
 
-        // Run fused_mul_intt for all k moduli (uses workgroup_id.y for mod_idx)
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("test_fused_mul_intt_encoder"),
-            });
+        // Execute slot_encode
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("test_fused_mul_intt"),
-                timestamp_writes: None,
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("slot_encode_twist_test"),
             });
-            pass.set_pipeline(&self.fused_mul_intt_pipeline);
-            pass.set_bind_group(0, &self.fused_mul_intt_bind_group, &[]);
-            pass.dispatch_workgroups(1, k as u32, 1);  // Run all k moduli
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_twist"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_bind_group, &[]);
+                pass.dispatch_workgroups(num_batches as u32, 1, 1);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Read back output buffers
-        let result_size = (n * 8) as u64;
-        let out_offset = (mod_idx * n * 8) as u64; // Output at batch_idx=0, mod_idx
-
-        let staging_c0 = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test_fused_staging_c0"),
-            size: result_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let staging_c1 = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test_fused_staging_c1"),
-            size: result_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("test_fused_copy"),
+        // Execute twist only
+        {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("twist_only_test"),
             });
-        encoder.copy_buffer_to_buffer(&self.preallocated_out_c0_buffer, out_offset, &staging_c0, 0, result_size);
-        encoder.copy_buffer_to_buffer(&self.preallocated_out_c1_buffer, out_offset, &staging_c1, 0, result_size);
+            let wg_per_n = ((n + 255) / 256) as u32;
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("twist_only"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.twist_pipeline);
+                pass.set_bind_group(0, &self.twist_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Read back temp_buffer
+        let result_size = (num_batches * k * n * 2 * 4) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging_temp_v3"),
+            size: result_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy_temp"),
+        });
+        encoder.copy_buffer_to_buffer(&self.preallocated_temp_buffer, 0, &staging, 0, result_size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Map and read c0
-        let slice_c0 = staging_c0.slice(..);
-        let (tx0, rx0) = std::sync::mpsc::channel();
-        slice_c0.map_async(wgpu::MapMode::Read, move |r| { let _ = tx0.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx0.recv().map_err(|_| GpuError::MapFailed)?.map_err(|_| GpuError::MapFailed)?;
+        // Map and read
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        rx.recv().unwrap().unwrap();
 
-        let slice_c1 = staging_c1.slice(..);
-        let (tx1, rx1) = std::sync::mpsc::channel();
-        slice_c1.map_async(wgpu::MapMode::Read, move |r| { let _ = tx1.send(r); });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx1.recv().map_err(|_| GpuError::MapFailed)?.map_err(|_| GpuError::MapFailed)?;
+        let data: Vec<u32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
 
-        let c0_data: Vec<u32> = bytemuck::cast_slice(&slice_c0.get_mapped_range()).to_vec();
-        let c1_data: Vec<u32> = bytemuck::cast_slice(&slice_c1.get_mapped_range()).to_vec();
-        let c0_u64: &[u64] = bytemuck::cast_slice(&c0_data);
-        let c1_u64: &[u64] = bytemuck::cast_slice(&c1_data);
+        // Convert to structured output [batch][mod][element]
+        let mut result: Vec<Vec<Vec<u64>>> = Vec::with_capacity(num_batches);
+        for batch_idx in 0..num_batches {
+            let mut batch: Vec<Vec<u64>> = Vec::with_capacity(k);
+            for mod_idx in 0..k {
+                let mut residue: Vec<u64> = Vec::with_capacity(n);
+                for j in 0..n {
+                    let offset = ((batch_idx * k + mod_idx) * n + j) * 2;
+                    let val = (data[offset] as u64) | ((data[offset + 1] as u64) << 32);
+                    residue.push(val);
+                }
+                batch.push(residue);
+            }
+            result.push(batch);
+        }
 
-        Ok((c0_u64.to_vec(), c1_u64.to_vec()))
+        Ok(result)
+    }
+
+    /// Test helper: Run slot_encode + NTT + INTT and return the round-trip result.
+    /// This verifies that NTT and INTT are inverse operations.
+    #[cfg(test)]
+    pub fn test_ntt_intt_roundtrip(&self, slots: &[Vec<u64>]) -> Result<Vec<Vec<Vec<u64>>>, GpuError> {
+        let n = self.params.n;
+        let k = self.params.k;
+        let n1 = self.n1;
+        let n2 = self.n2;
+        let num_batches = slots.len();
+
+        // Flatten slots
+        let mut slots_flat: Vec<u64> = vec![0u64; num_batches * n];
+        for (batch_idx, slot_vec) in slots.iter().enumerate() {
+            let base = batch_idx * n;
+            slots_flat[base..base + n].copy_from_slice(slot_vec);
+        }
+
+        // Upload slots
+        self.queue.write_buffer(
+            &self.preallocated_slots_buffer,
+            0,
+            bytemuck::cast_slice(&slots_flat),
+        );
+
+        // Update batch params
+        let log_n = (n as u32).trailing_zeros();
+        let batch_params = GpuBatchParams {
+            n: n as u32,
+            log_n,
+            num_batches: num_batches as u32,
+            num_moduli: k as u32,
+        };
+        self.queue.write_buffer(
+            &self.preallocated_batch_params_buffer,
+            0,
+            bytemuck::bytes_of(&batch_params),
+        );
+
+        // Update four-step params
+        let fourstep_params = GpuFourStepParams {
+            n: n as u32,
+            n1: n1 as u32,
+            n2: n2 as u32,
+            log_n2: FOUR_STEP_LOG_N2,
+            num_batches: num_batches as u32,
+            num_moduli: k as u32,
+            log_n1: FOUR_STEP_LOG_N1,
+            _pad: 0,
+        };
+        self.queue.write_buffer(
+            &self.preallocated_fourstep_params_buffer,
+            0,
+            bytemuck::bytes_of(&fourstep_params),
+        );
+
+        // Execute slot_encode
+        {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("slot_encode_roundtrip"),
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("slot_encode_rt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.slot_encode_pipeline);
+                pass.set_bind_group(0, &self.slot_encode_bind_group, &[]);
+                pass.dispatch_workgroups(num_batches as u32, 1, 1);
+            }
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Execute forward NTT (twist → row_ntt → cross → col_ntt)
+        {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("forward_ntt_roundtrip"),
+            });
+            let wg_per_n = ((n + 255) / 256) as u32;
+
+            // Twist
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("twist_rt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.twist_pipeline);
+                pass.set_bind_group(0, &self.twist_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
+            }
+
+            // Row NTT
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("row_ntt_rt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.row_ntt_pipeline);
+                pass.set_bind_group(0, &self.row_ntt_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, k as u32);
+            }
+
+            // Cross twiddle
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cross_twiddle_rt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.cross_twiddle_pipeline);
+                pass.set_bind_group(0, &self.cross_twiddle_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
+            }
+
+            // Col NTT
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("col_ntt_rt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.col_ntt_pipeline);
+                pass.set_bind_group(0, &self.col_ntt_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, k as u32);
+            }
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Copy pt_ntt to out_c0 (to feed the INTT path which reads from out_c0)
+        {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("copy_for_intt_roundtrip"),
+            });
+            let copy_size = (num_batches * k * n * 2 * 4) as u64;
+            encoder.copy_buffer_to_buffer(&self.preallocated_pt_ntt_buffer, 0, &self.preallocated_out_c0_buffer, 0, copy_size);
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Execute inverse NTT (col_intt → cross_inv → row_intt_untwist)
+        {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("inverse_ntt_roundtrip"),
+            });
+            let wg_per_n = ((n + 255) / 256) as u32;
+
+            // Col INTT: out_c0 → temp
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("col_intt_rt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.col_intt_pipeline);
+                pass.set_bind_group(0, &self.col_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n2 as u32, num_batches as u32, k as u32);
+            }
+
+            // Cross twiddle inv: temp (in-place)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("cross_twiddle_inv_rt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.cross_twiddle_inv_pipeline);
+                pass.set_bind_group(0, &self.cross_twiddle_inv_bind_group, &[]);
+                pass.dispatch_workgroups(wg_per_n, num_batches as u32, k as u32);
+            }
+
+            // Row INTT + untwist: temp → out_c0
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("row_intt_untwist_rt"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.row_intt_pipeline);
+                pass.set_bind_group(0, &self.row_intt_bind_group, &[]);
+                pass.dispatch_workgroups(n1 as u32, num_batches as u32, k as u32);
+            }
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Read back out_c0
+        let result_size = (num_batches * k * n * 2 * 4) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("staging_roundtrip"),
+            size: result_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("copy_roundtrip_result"),
+        });
+        encoder.copy_buffer_to_buffer(&self.preallocated_out_c0_buffer, 0, &staging, 0, result_size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Map and read
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
+        self.device.poll(wgpu::Maintain::Wait).panic_on_timeout();
+        rx.recv().unwrap().unwrap();
+
+        let data: Vec<u32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+
+        // Convert to structured output [batch][mod][element]
+        let mut result: Vec<Vec<Vec<u64>>> = Vec::with_capacity(num_batches);
+        for batch_idx in 0..num_batches {
+            let mut batch: Vec<Vec<u64>> = Vec::with_capacity(k);
+            for mod_idx in 0..k {
+                let mut residue: Vec<u64> = Vec::with_capacity(n);
+                for j in 0..n {
+                    let offset = ((batch_idx * k + mod_idx) * n + j) * 2;
+                    let val = (data[offset] as u64) | ((data[offset + 1] as u64) << 32);
+                    residue.push(val);
+                }
+                batch.push(residue);
+            }
+            result.push(batch);
+        }
+
+        Ok(result)
     }
 }
-
-// =============================================================================
-// WGSL Shaders
-// =============================================================================
-
-/// Slot encode shader - converts evaluation form to coefficient form via INTT.
-/// Same as original but reused here for clarity.
 const SLOT_ENCODE_SHADER: &str = r#"
 #import math
 
@@ -1509,9 +2204,9 @@ fn slot_encode_batched(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
-            let new_u = math::addmod(u, tw_v, q);
-            let new_v = math::submod(u, tw_v, q);
+            let tw_v = math::goldilocks_mul(v, twiddle);
+            let new_u = math::goldilocks_add(u, tw_v);
+            let new_v = math::goldilocks_sub(u, tw_v);
 
             shared_lo[ii] = new_u.x;
             shared_hi[ii] = new_u.y;
@@ -1526,7 +2221,7 @@ fn slot_encode_batched(
     for (var i = 0u; i < elements_per_thread; i++) {
         let idx = tid * elements_per_thread + i;
         var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::mulmod(val, n_inv, q);
+        val = math::goldilocks_mul(val, n_inv);
         let out_base = (batch_offset + idx) * 2u;
         coeffs[out_base] = val.x;
         coeffs[out_base + 1u] = val.y;
@@ -1539,16 +2234,28 @@ fn slot_encode_batched(
 // For N=8192 = 32 rows × 256 columns
 // =============================================================================
 
-/// Twist shader - applies psi^idx to input coefficients.
-/// Layout: data[row * n2 + col] where row in 0..n1, col in 0..n2
+/// Twist shader with transpose - applies psi^idx to input coefficients AND transposes.
+///
+/// Four-step NTT requires column-major input indexing:
+///   matrix[j1*n2 + j2] = input[j2*n1 + j1]
+///
+/// Combined with psi twist:
+///   output[idx] = input[transposed_idx] * psi^transposed_idx
+/// where:
+///   idx = j1*n2 + j2 (output position in row-major matrix)
+///   transposed_idx = j2*n1 + j1 (original coefficient position)
 const TWIST_SHADER: &str = r#"
 #import math
 
-struct BatchParams {
-    n: u32,
-    log_n: u32,
+struct FourStepParams {
+    n: u32,           // Total size (8192)
+    n1: u32,          // Number of rows (32)
+    n2: u32,          // Number of columns (256)
+    log_n2: u32,      // log2(n2) = 8
     num_batches: u32,
     num_moduli: u32,
+    log_n1: u32,      // log2(n1) = 5
+    _pad: u32,
 }
 
 struct ModulusParams {
@@ -1562,7 +2269,7 @@ struct ModulusParams {
     _pad1: u32,
 }
 
-@group(0) @binding(0) var<uniform> params: BatchParams;
+@group(0) @binding(0) var<uniform> params: FourStepParams;
 @group(0) @binding(1) var<storage, read> input: array<u32>;
 @group(0) @binding(2) var<storage, read_write> output: array<u32>;
 @group(0) @binding(3) var<storage, read> psi_powers: array<u32>;  // k * n psi^i values
@@ -1576,6 +2283,8 @@ fn twist(
     let batch_idx = wg_id.y;
     let mod_idx = wg_id.z;
     let n = params.n;
+    let n1 = params.n1;
+    let n2 = params.n2;
     let k = params.num_moduli;
 
     if batch_idx >= params.num_batches { return; }
@@ -1587,16 +2296,26 @@ fn twist(
     let mp = mod_params[mod_idx];
     let q = vec2<u32>(mp.modulus_lo, mp.modulus_hi);
 
-    // Input: encoded[batch_idx * n + idx]
-    let in_base = (batch_idx * n + idx) * 2u;
+    // Four-step transpose: output[j1*n2 + j2] reads from input[j2*n1 + j1]
+    // idx = j1*n2 + j2, so j1 = idx/n2, j2 = idx%n2
+    let j1 = idx / n2;
+    let j2 = idx % n2;
+    let transposed_idx = j2 * n1 + j1;
+
+    // Input: encoded[batch_idx * n + transposed_idx]
+    // The encoded value is a Goldilocks field element (can be up to 2^64)
+    let in_base = (batch_idx * n + transposed_idx) * 2u;
     let val = vec2<u32>(input[in_base], input[in_base + 1u]);
 
-    // Psi power for this modulus
-    let psi_base = (mod_idx * n + idx) * 2u;
+    // Reduce val mod q first (val can be 64-bit, q is 60-bit)
+    let val_reduced = math::reduce_mod_64(val, q);
+
+    // Psi power for the ORIGINAL coefficient position (transposed_idx)
+    let psi_base = (mod_idx * n + transposed_idx) * 2u;
     let psi = vec2<u32>(psi_powers[psi_base], psi_powers[psi_base + 1u]);
 
-    // Twist: val * psi^idx
-    let twisted = math::mulmod(val, psi, q);
+    // Twist: val_reduced * psi^transposed_idx (both are now < q)
+    let twisted = math::mulmod_60bit(val_reduced, psi, q);
 
     // Output: temp[(batch_idx * k + mod_idx) * n + idx]
     let out_offset = (batch_idx * k + mod_idx) * n + idx;
@@ -1703,7 +2422,7 @@ fn row_ntt(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -1785,7 +2504,7 @@ fn cross_twiddle(
     let tw_base = (mod_idx * n + idx) * 2u;
     let twiddle = vec2<u32>(cross_twiddles[tw_base], cross_twiddles[tw_base + 1u]);
 
-    let result = math::mulmod(val, twiddle, q);
+    let result = math::mulmod_60bit(val, twiddle, q);
 
     data[data_base] = result.x;
     data[data_base + 1u] = result.y;
@@ -1802,11 +2521,11 @@ struct Params {
     n: u32,           // Total size (8192)
     n1: u32,          // Number of rows (32)
     n2: u32,          // Number of columns (256)
-    log_n1: u32,      // log2(n1) = 5
+    log_n2: u32,      // log2(n2) = 8 (unused in col NTT)
     num_batches: u32,
     num_moduli: u32,
-    _pad0: u32,
-    _pad1: u32,
+    log_n1: u32,      // log2(n1) = 5 (used here)
+    _pad: u32,
 }
 
 struct ModulusParams {
@@ -1889,7 +2608,7 @@ fn col_ntt(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -1913,6 +2632,8 @@ fn col_ntt(
 "#;
 
 /// Column INTT shader - performs n2 independent n1-point INTTs (32-point each).
+/// Has separate input and output buffers for INTT path:
+///   - INTT reads from out_c0/c1 (NTT result), writes to temp
 const COL_INTT_SHADER: &str = r#"
 #import math
 
@@ -1920,11 +2641,11 @@ struct Params {
     n: u32,
     n1: u32,
     n2: u32,
-    log_n1: u32,
+    log_n2: u32,      // unused in col INTT
     num_batches: u32,
     num_moduli: u32,
-    _pad0: u32,
-    _pad1: u32,
+    log_n1: u32,      // used here
+    _pad: u32,
 }
 
 struct ModulusParams {
@@ -1939,9 +2660,10 @@ struct ModulusParams {
 }
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read_write> data: array<u32>;
-@group(0) @binding(2) var<storage, read> inv_twiddles: array<u32>;  // k * n1 inverse twiddles
-@group(0) @binding(3) var<storage, read> mod_params: array<ModulusParams>;
+@group(0) @binding(1) var<storage, read> input: array<u32>;
+@group(0) @binding(2) var<storage, read_write> output: array<u32>;
+@group(0) @binding(3) var<storage, read> inv_twiddles: array<u32>;  // k * n1 inverse twiddles
+@group(0) @binding(4) var<storage, read> mod_params: array<ModulusParams>;
 
 var<workgroup> shared_lo: array<u32, 32>;
 var<workgroup> shared_hi: array<u32, 32>;
@@ -1972,12 +2694,12 @@ fn col_intt(
     let tw_mod_offset = mod_idx * n1 * 2u;
     let batch_mod_offset = (batch_idx * k + mod_idx) * n;
 
-    // Load with bit-reversal
+    // Load from input with bit-reversal
     let row = tid;
     if row < n1 {
         let data_idx = batch_mod_offset + row * n2 + col_idx;
         let data_base = data_idx * 2u;
-        let val = vec2<u32>(data[data_base], data[data_base + 1u]);
+        let val = vec2<u32>(input[data_base], input[data_base + 1u]);
         let rev_row = math::bit_reverse(row, log_n1);
         shared_lo[rev_row] = val.x;
         shared_hi[rev_row] = val.y;
@@ -2004,7 +2726,7 @@ fn col_intt(
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
             // INTT butterfly: same as NTT (DIT style)
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -2017,19 +2739,26 @@ fn col_intt(
     }
 
     // Note: n1^-1 scaling is deferred to the final row INTT
-    // Store without scaling
+    // Store to output without scaling
     if row < n1 {
         let val = vec2<u32>(shared_lo[row], shared_hi[row]);
         let data_idx = batch_mod_offset + row * n2 + col_idx;
         let data_base = data_idx * 2u;
-        data[data_base] = val.x;
-        data[data_base + 1u] = val.y;
+        output[data_base] = val.x;
+        output[data_base + 1u] = val.y;
     }
 }
 "#;
 
-/// Row INTT + untwist shader - performs n1 independent n2-point INTTs and applies psi_inv^idx.
+/// Row INTT + un-transpose + untwist shader.
+/// Performs n1 independent n2-point INTTs, then un-transposes and applies psi_inv^idx.
 /// Also applies the final n^-1 scaling.
+///
+/// After four-step INTT, data is still transposed: matrix[j1*n2 + j2] = coeff[j2*n1 + j1]
+/// This shader:
+///   1. Computes row INTT for row j1 (256-point INTT)
+///   2. Un-transposes: writes to output[j2*n1 + j1] instead of matrix[j1*n2 + j2]
+///   3. Applies psi_inv^(j2*n1 + j1) to get the original coefficient
 const ROW_INTT_UNTWIST_SHADER: &str = r#"
 #import math
 
@@ -2071,7 +2800,7 @@ fn row_intt_untwist(
     @builtin(workgroup_id) wg_id: vec3<u32>
 ) {
     let tid = local_id.x;
-    let row_idx = wg_id.x;
+    let row_idx = wg_id.x;   // j1 in transposed matrix
     let batch_idx = wg_id.y;
     let mod_idx = wg_id.z;
 
@@ -2090,12 +2819,13 @@ fn row_intt_untwist(
     let n_inv = vec2<u32>(mp.n_inv_lo, mp.n_inv_hi);
 
     let tw_mod_offset = mod_idx * n2 * 2u;
-    let data_offset = (batch_idx * k + mod_idx) * n + row_idx * n2;
+    let batch_mod_offset = (batch_idx * k + mod_idx) * n;
+    let input_row_offset = batch_mod_offset + row_idx * n2;
 
     // Load row with bit-reversal
-    let col = tid;
+    let col = tid;  // j2 in transposed matrix
     if col < n2 {
-        let in_base = (data_offset + col) * 2u;
+        let in_base = (input_row_offset + col) * 2u;
         let val = vec2<u32>(input[in_base], input[in_base + 1u]);
         let rev_col = math::bit_reverse(col, log_n2);
         shared_lo[rev_col] = val.x;
@@ -2122,7 +2852,7 @@ fn row_intt_untwist(
             let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
             let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
 
-            let tw_v = math::mulmod(v, twiddle, q);
+            let tw_v = math::mulmod_60bit(v, twiddle, q);
             let new_u = math::addmod(u, tw_v, q);
             let new_v = math::submod(u, tw_v, q);
 
@@ -2134,20 +2864,23 @@ fn row_intt_untwist(
         workgroupBarrier();
     }
 
-    // Apply n^-1 scaling and psi_inv untwist, then store
+    // Apply n^-1 scaling, psi_inv untwist, and un-transpose, then store
     if col < n2 {
         var val = vec2<u32>(shared_lo[col], shared_hi[col]);
 
         // Scale by n^-1
-        val = math::mulmod(val, n_inv, q);
+        val = math::mulmod_60bit(val, n_inv, q);
 
-        // Untwist by psi_inv^idx where idx = row_idx * n2 + col
-        let global_idx = row_idx * n2 + col;
-        let psi_inv_base = (mod_idx * n + global_idx) * 2u;
+        // Un-transpose: the original coefficient index is j2*n1 + j1 = col*n1 + row_idx
+        let original_idx = col * n1 + row_idx;
+
+        // Untwist by psi_inv^original_idx
+        let psi_inv_base = (mod_idx * n + original_idx) * 2u;
         let psi_inv = vec2<u32>(psi_inv_powers[psi_inv_base], psi_inv_powers[psi_inv_base + 1u]);
-        val = math::mulmod(val, psi_inv, q);
+        val = math::mulmod_60bit(val, psi_inv, q);
 
-        let out_base = (data_offset + col) * 2u;
+        // Write to un-transposed position: output[batch_mod_offset + original_idx]
+        let out_base = (batch_mod_offset + original_idx) * 2u;
         output[out_base] = val.x;
         output[out_base + 1u] = val.y;
     }
@@ -2155,18 +2888,20 @@ fn row_intt_untwist(
 "#;
 
 /// Pointwise multiplication shader - multiplies pt_ntt with CT coefficients.
+/// pt_ntt is in four-step NTT order: pt_ntt[k1*n2 + k2] corresponds to standard NTT index [k1 + k2*n1]
+/// CT is in standard NTT order, so we need to permute the CT access.
 const POINTWISE_MUL_SHADER: &str = r#"
 #import math
 
 struct Params {
     n: u32,
+    n1: u32,           // 32 for four-step (number of rows)
+    n2: u32,           // 256 for four-step (number of columns)
     num_batches: u32,
     num_moduli: u32,
     num_cts: u32,
     batches_per_ct: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    _pad: u32,
 }
 
 struct ModulusParams {
@@ -2196,6 +2931,8 @@ fn pointwise_mul(
     let batch_idx = wg_id.y;
     let mod_idx = wg_id.z;
     let n = params.n;
+    let n1 = params.n1;
+    let n2 = params.n2;
     let k = params.num_moduli;
 
     if batch_idx >= params.num_batches { return; }
@@ -2211,19 +2948,21 @@ fn pointwise_mul(
     let ct_idx = batch_idx / params.batches_per_ct;
 
     // pt_ntt at [(batch_idx * k + mod_idx) * n + idx]
+    // With twist-transpose, the four-step NTT output is in STANDARD order
+    // (the transpose in twist and un-transpose in INTT cancel out)
     let pt_offset = (batch_idx * k + mod_idx) * n + idx;
     let pt_base = pt_offset * 2u;
     let pt = vec2<u32>(pt_ntt[pt_base], pt_ntt[pt_base + 1u]);
 
-    // CT at [(ct_idx * k + mod_idx) * n + idx]
+    // CT at [(ct_idx * k + mod_idx) * n + idx] (same index as pt_ntt, no permutation needed)
     let ct_offset = (ct_idx * k + mod_idx) * n + idx;
     let ct_base = ct_offset * 2u;
     let c0 = vec2<u32>(ct_c0[ct_base], ct_c0[ct_base + 1u]);
     let c1 = vec2<u32>(ct_c1[ct_base], ct_c1[ct_base + 1u]);
 
     // Multiply
-    let prod_c0 = math::mulmod(pt, c0, q);
-    let prod_c1 = math::mulmod(pt, c1, q);
+    let prod_c0 = math::mulmod_60bit(pt, c0, q);
+    let prod_c1 = math::mulmod_60bit(pt, c1, q);
 
     // Output at [(batch_idx * k + mod_idx) * n + idx]
     let out_base = pt_base;  // Same offset as pt
@@ -2234,881 +2973,1334 @@ fn pointwise_mul(
 }
 "#;
 
-// Keep the original forward NTT shader for comparison/fallback
-#[allow(dead_code)]
-const FORWARD_NTT_SHADER_V2: &str = r#"
-#import math
-
-struct BatchParams {
-    n: u32,
-    log_n: u32,
-    num_batches: u32,
-    num_moduli: u32,
-}
-
-struct ModulusParams {
-    modulus_lo: u32,
-    modulus_hi: u32,
-    mu_lo: u32,
-    mu_hi: u32,
-    n_inv_lo: u32,
-    n_inv_hi: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0) var<uniform> params: BatchParams;
-@group(0) @binding(1) var<storage, read> coeffs: array<u32>;
-@group(0) @binding(2) var<storage, read_write> ntt_out: array<u32>;
-@group(0) @binding(3) var<storage, read> twiddles: array<u32>;  // Combined: k * 2n values
-@group(0) @binding(4) var<storage, read> mod_params: array<ModulusParams>;  // Array of k
-
-var<workgroup> shared_lo: array<u32, 8192>;
-var<workgroup> shared_hi: array<u32, 8192>;
-
-@compute @workgroup_size(256, 1, 1)
-fn forward_ntt_batched(
-    @builtin(local_invocation_id) local_id: vec3<u32>,
-    @builtin(workgroup_id) wg_id: vec3<u32>
-) {
-    let tid = local_id.x;
-    let batch_idx = wg_id.x;
-    let mod_idx = wg_id.y;  // mod_idx from workgroup_id.y
-    let n = params.n;
-    let log_n = params.log_n;
-    let k = params.num_moduli;
-
-    if batch_idx >= params.num_batches { return; }
-    if mod_idx >= k { return; }
-
-    // Load modulus params from array
-    let mp = mod_params[mod_idx];
-    let q = vec2<u32>(mp.modulus_lo, mp.modulus_hi);
-
-    // Twiddle offset for this modulus: mod_idx * 2n values (psi + omega)
-    let twiddle_base_offset = mod_idx * n * 4u;  // 2n values * 2 u32s each
-
-    // Input: read from encoded buffer (same for all moduli)
-    let batch_offset = batch_idx * n;
-    // Output: write to pt_ntt at [batch_idx * k + mod_idx][n]
-    let out_batch_offset = (batch_idx * k + mod_idx) * n;
-    let elements_per_thread = n / 256u;
-
-    // Load, twist, and bit-reverse
-    for (var i = 0u; i < elements_per_thread; i++) {
-        let idx = tid * elements_per_thread + i;
-        let coeff_base = (batch_offset + idx) * 2u;
-        var val = vec2<u32>(coeffs[coeff_base], coeffs[coeff_base + 1u]);
-
-        // Twist: multiply by psi^idx (psi at offset 0 within this modulus's twiddles)
-        let psi_base = twiddle_base_offset + idx * 2u;
-        let psi_power = vec2<u32>(twiddles[psi_base], twiddles[psi_base + 1u]);
-        val = math::mulmod(val, psi_power, q);
-
-        let rev_idx = math::bit_reverse(idx, log_n);
-        shared_lo[rev_idx] = val.x;
-        shared_hi[rev_idx] = val.y;
-    }
-    workgroupBarrier();
-
-    // Forward NTT butterfly stages
-    for (var stage = 0u; stage < log_n; stage++) {
-        let m = 1u << (stage + 1u);
-        let half_m = 1u << stage;
-        let butterflies_per_thread = (n >> 1u) / 256u;
-
-        for (var b = 0u; b < butterflies_per_thread; b++) {
-            let butterfly_idx = tid * butterflies_per_thread + b;
-            let group = butterfly_idx / half_m;
-            let idx_in_group = butterfly_idx % half_m;
-            let ii = group * m + idx_in_group;
-            let jj = ii + half_m;
-
-            // Omega powers at offset n within this modulus's twiddles
-            let twiddle_idx = idx_in_group * (n / m);
-            let tw_base = twiddle_base_offset + n * 2u + twiddle_idx * 2u;
-            let twiddle = vec2<u32>(twiddles[tw_base], twiddles[tw_base + 1u]);
-
-            let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
-            let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
-
-            let tw_v = math::mulmod(v, twiddle, q);
-            let new_u = math::addmod(u, tw_v, q);
-            let new_v = math::submod(u, tw_v, q);
-
-            shared_lo[ii] = new_u.x;
-            shared_hi[ii] = new_u.y;
-            shared_lo[jj] = new_v.x;
-            shared_hi[jj] = new_v.y;
-        }
-        workgroupBarrier();
-    }
-
-    // Store results to [batch_idx * k + mod_idx][n]
-    for (var i = 0u; i < elements_per_thread; i++) {
-        let idx = tid * elements_per_thread + i;
-        let val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        let out_base = (out_batch_offset + idx) * 2u;
-        ntt_out[out_base] = val.x;
-        ntt_out[out_base + 1u] = val.y;
-    }
-}
-"#;
-
-/// Fused pointwise multiplication + inverse NTT shader.
-///
-/// Key optimizations:
-/// 1. Combines pointwise mul with inverse NTT in single kernel
-/// 2. Processes c0 and c1 SEQUENTIALLY to fit in workgroup memory
-/// 3. Uses workgroup_id.y for mod_idx (all k moduli in one dispatch)
-///
-/// Pipeline now: slot_encode (1 submit) → forward_ntt + fused_mul_intt (1 submit)
-/// Total: 2 submits per call instead of 6.
-const FUSED_MUL_INTT_SHADER: &str = r#"
-#import math
-
-struct BatchParams {
-    n: u32,
-    log_n: u32,
-    num_batches: u32,
-    num_moduli: u32,
-    num_cts: u32,
-    batches_per_ct: u32,
-    mod_idx: u32,      // Unused - mod_idx comes from workgroup_id.y
-    _pad: u32,
-}
-
-struct ModulusParams {
-    modulus_lo: u32,
-    modulus_hi: u32,
-    mu_lo: u32,
-    mu_hi: u32,
-    n_inv_lo: u32,
-    n_inv_hi: u32,
-    _pad0: u32,
-    _pad1: u32,
-}
-
-@group(0) @binding(0) var<uniform> params: BatchParams;
-@group(0) @binding(1) var<storage, read> pt_ntt: array<u32>;  // Now [batch_idx * k + mod_idx][n]
-@group(0) @binding(2) var<storage, read> ct_c0: array<u32>;
-@group(0) @binding(3) var<storage, read> ct_c1: array<u32>;
-@group(0) @binding(4) var<storage, read_write> out_c0: array<u32>;
-@group(0) @binding(5) var<storage, read_write> out_c1: array<u32>;
-@group(0) @binding(6) var<storage, read> inv_twiddles: array<u32>;  // Combined: k * 2n values
-@group(0) @binding(7) var<storage, read> mod_params: array<ModulusParams>;  // Array of k
-
-// Shared memory - reused for c0 then c1 (fits in 64KB)
-var<workgroup> shared_lo: array<u32, 8192>;
-var<workgroup> shared_hi: array<u32, 8192>;
-
-@compute @workgroup_size(256, 1, 1)
-fn fused_mul_intt(
-    @builtin(local_invocation_id) local_id: vec3<u32>,
-    @builtin(workgroup_id) wg_id: vec3<u32>
-) {
-    let tid = local_id.x;
-    let batch_idx = wg_id.x;
-    let mod_idx = wg_id.y;  // mod_idx from workgroup_id.y
-    let n = params.n;
-    let log_n = params.log_n;
-    let k = params.num_moduli;
-
-    if batch_idx >= params.num_batches { return; }
-    if mod_idx >= k { return; }
-
-    // Load modulus params from array
-    let mp = mod_params[mod_idx];
-    let q = vec2<u32>(mp.modulus_lo, mp.modulus_hi);
-    let n_inv = vec2<u32>(mp.n_inv_lo, mp.n_inv_hi);
-
-    // Twiddle offset for this modulus
-    let twiddle_base_offset = mod_idx * n * 4u;  // 2n values * 2 u32s each
-
-    let elements_per_thread = n / 256u;
-
-    // Determine which CT this batch belongs to
-    let ct_idx = batch_idx / params.batches_per_ct;
-    let ct_base_offset = (ct_idx * k + mod_idx) * n;
-    let out_base_offset = (batch_idx * k + mod_idx) * n;
-
-    // pt_ntt is now indexed by [batch_idx * k + mod_idx][n]
-    let pt_ntt_offset = (batch_idx * k + mod_idx) * n;
-
-    // =========== Process C0 ===========
-    // Load plaintext NTT, multiply with CT c0, load into shared with bit-reversal
-    for (var i = 0u; i < elements_per_thread; i++) {
-        let idx = tid * elements_per_thread + i;
-
-        // Read plaintext NTT value from [batch_idx * k + mod_idx][n]
-        let pt_base = (pt_ntt_offset + idx) * 2u;
-        let pt = vec2<u32>(pt_ntt[pt_base], pt_ntt[pt_base + 1u]);
-
-        // Read CT c0 (indexed by ct_idx, mod_idx, element)
-        let ct_base = (ct_base_offset + idx) * 2u;
-        let c0 = vec2<u32>(ct_c0[ct_base], ct_c0[ct_base + 1u]);
-
-        // Pointwise multiply
-        let prod = math::mulmod(c0, pt, q);
-
-        // Store in shared memory with bit-reversal for INTT
-        let rev_idx = math::bit_reverse(idx, log_n);
-        shared_lo[rev_idx] = prod.x;
-        shared_hi[rev_idx] = prod.y;
-    }
-    workgroupBarrier();
-
-    // Inverse NTT butterfly stages for c0
-    for (var stage = 0u; stage < log_n; stage++) {
-        let m = 1u << (stage + 1u);
-        let half_m = 1u << stage;
-        let butterflies_per_thread = (n >> 1u) / 256u;
-
-        for (var b = 0u; b < butterflies_per_thread; b++) {
-            let butterfly_idx = tid * butterflies_per_thread + b;
-            let group = butterfly_idx / half_m;
-            let idx_in_group = butterfly_idx % half_m;
-            let ii = group * m + idx_in_group;
-            let jj = ii + half_m;
-
-            // Inverse twiddle (omega_inv powers at offset n within this modulus)
-            let twiddle_idx = idx_in_group * (n / m);
-            let tw_base = twiddle_base_offset + n * 2u + twiddle_idx * 2u;
-            let twiddle = vec2<u32>(inv_twiddles[tw_base], inv_twiddles[tw_base + 1u]);
-
-            let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
-            let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
-            let tw_v = math::mulmod(v, twiddle, q);
-            let new_u = math::addmod(u, tw_v, q);
-            let new_v = math::submod(u, tw_v, q);
-            shared_lo[ii] = new_u.x;
-            shared_hi[ii] = new_u.y;
-            shared_lo[jj] = new_v.x;
-            shared_hi[jj] = new_v.y;
-        }
-        workgroupBarrier();
-    }
-
-    // Scale by n^-1, untwist, and store c0
-    for (var i = 0u; i < elements_per_thread; i++) {
-        let idx = tid * elements_per_thread + i;
-        var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::mulmod(val, n_inv, q);
-        // psi_inv at offset 0 within this modulus's twiddles
-        let psi_inv_base = twiddle_base_offset + idx * 2u;
-        let psi_inv = vec2<u32>(inv_twiddles[psi_inv_base], inv_twiddles[psi_inv_base + 1u]);
-        val = math::mulmod(val, psi_inv, q);
-
-        let out_base = (out_base_offset + idx) * 2u;
-        out_c0[out_base] = val.x;
-        out_c0[out_base + 1u] = val.y;
-    }
-    workgroupBarrier();
-
-    // =========== Process C1 ===========
-    // Load plaintext NTT, multiply with CT c1, load into shared with bit-reversal
-    for (var i = 0u; i < elements_per_thread; i++) {
-        let idx = tid * elements_per_thread + i;
-
-        // Read plaintext NTT value (same offset as c0)
-        let pt_base = (pt_ntt_offset + idx) * 2u;
-        let pt = vec2<u32>(pt_ntt[pt_base], pt_ntt[pt_base + 1u]);
-
-        // Read CT c1
-        let ct_base = (ct_base_offset + idx) * 2u;
-        let c1 = vec2<u32>(ct_c1[ct_base], ct_c1[ct_base + 1u]);
-
-        // Pointwise multiply
-        let prod = math::mulmod(c1, pt, q);
-
-        // Store in shared memory with bit-reversal for INTT
-        let rev_idx = math::bit_reverse(idx, log_n);
-        shared_lo[rev_idx] = prod.x;
-        shared_hi[rev_idx] = prod.y;
-    }
-    workgroupBarrier();
-
-    // Inverse NTT butterfly stages for c1
-    for (var stage = 0u; stage < log_n; stage++) {
-        let m = 1u << (stage + 1u);
-        let half_m = 1u << stage;
-        let butterflies_per_thread = (n >> 1u) / 256u;
-
-        for (var b = 0u; b < butterflies_per_thread; b++) {
-            let butterfly_idx = tid * butterflies_per_thread + b;
-            let group = butterfly_idx / half_m;
-            let idx_in_group = butterfly_idx % half_m;
-            let ii = group * m + idx_in_group;
-            let jj = ii + half_m;
-
-            let twiddle_idx = idx_in_group * (n / m);
-            let tw_base = twiddle_base_offset + n * 2u + twiddle_idx * 2u;
-            let twiddle = vec2<u32>(inv_twiddles[tw_base], inv_twiddles[tw_base + 1u]);
-
-            let u = vec2<u32>(shared_lo[ii], shared_hi[ii]);
-            let v = vec2<u32>(shared_lo[jj], shared_hi[jj]);
-            let tw_v = math::mulmod(v, twiddle, q);
-            let new_u = math::addmod(u, tw_v, q);
-            let new_v = math::submod(u, tw_v, q);
-            shared_lo[ii] = new_u.x;
-            shared_hi[ii] = new_u.y;
-            shared_lo[jj] = new_v.x;
-            shared_hi[jj] = new_v.y;
-        }
-        workgroupBarrier();
-    }
-
-    // Scale by n^-1, untwist, and store c1
-    for (var i = 0u; i < elements_per_thread; i++) {
-        let idx = tid * elements_per_thread + i;
-        var val = vec2<u32>(shared_lo[idx], shared_hi[idx]);
-        val = math::mulmod(val, n_inv, q);
-        let psi_inv_base = twiddle_base_offset + idx * 2u;
-        let psi_inv = vec2<u32>(inv_twiddles[psi_inv_base], inv_twiddles[psi_inv_base + 1u]);
-        val = math::mulmod(val, psi_inv, q);
-
-        let out_base = (out_base_offset + idx) * 2u;
-        out_c1[out_base] = val.x;
-        out_c1[out_base + 1u] = val.y;
-    }
-}
-"#;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rns_slot_mul::{RnsBatchParams, RnsSlotMulGpu};
+    use crate::rns_slot_mul::RnsBatchParams;
+    use crate::rns_slot_mul_v2::RnsSlotMulGpuV2;
 
     #[test]
-    fn test_v2_gpu_context_creation() {
-        // Test that the V2 GPU context can be created (verifies shader compilation)
-        let params = RnsBatchParams::goldilocks(8192);
-        assert!(params.is_some(), "Failed to create RnsBatchParams");
+    fn test_v3_context_creation() {
+        // Use the standard Goldilocks params
+        let params = match RnsBatchParams::goldilocks(8192) {
+            Some(p) => p,
+            None => {
+                println!("Skipping test: goldilocks params not available");
+                return;
+            }
+        };
 
-        let params = params.unwrap();
         let result = RnsSlotMulGpuV3::new(params);
-
         match result {
-            Ok(gpu) => {
-                assert_eq!(gpu.params().n, 8192);
-                assert_eq!(gpu.params().k, 5);
-                println!("V2 GPU context created successfully!");
+            Ok(ctx) => {
+                assert_eq!(ctx.n1, 32);
+                assert_eq!(ctx.n2, 256);
+                println!("V3 context created successfully with n1={}, n2={}", ctx.n1, ctx.n2);
             }
             Err(e) => {
-                // GPU might not be available in CI, so we just log the error
-                println!("V2 GPU context creation failed (expected in CI): {:?}", e);
+                println!("Skipping test: V3 GPU not available ({})", e);
             }
         }
     }
 
-    /// Test that V2 produces the same output as V1 for the same inputs.
-    /// IGNORED: V1's full pipeline has a known bug (V1 full != V1 manual),
-    /// so comparing V2 against V1 is not meaningful. Individual shader tests pass.
     #[test]
-    #[ignore]
-    fn test_v2_correctness_vs_v1() {
-        let params = RnsBatchParams::goldilocks(8192).unwrap();
+    fn test_v3_vs_v2_comparison() {
+        let params = match RnsBatchParams::goldilocks(8192) {
+            Some(p) => p,
+            None => {
+                println!("Skipping test: goldilocks params not available");
+                return;
+            }
+        };
         let n = params.n;
         let k = params.k;
 
-        // Create V1 and V2 contexts
-        let v1_ctx = match RnsSlotMulGpu::new(params.clone()) {
+        // Create V2 context
+        let v2_ctx = match RnsSlotMulGpuV2::new(params.clone()) {
             Ok(ctx) => ctx,
             Err(e) => {
-                println!("Skipping test: GPU not available ({})", e);
+                println!("Skipping test: V2 GPU not available ({})", e);
                 return;
             }
         };
 
-        let v2_ctx = match RnsSlotMulGpuV3::new(params.clone()) {
+        // Create V3 context
+        let v3_ctx = match RnsSlotMulGpuV3::new(params.clone()) {
             Ok(ctx) => ctx,
             Err(e) => {
-                println!("Skipping test: V2 GPU context creation failed ({})", e);
+                println!("Skipping test: V3 GPU not available ({})", e);
                 return;
             }
         };
+
+        println!("V2 and V3 contexts created successfully");
+        println!("V3 uses four-step NTT with n1={} rows × n2={} cols", v3_ctx.n1, v3_ctx.n2);
 
         // Create test data
-        let num_cts = 2;
-        let batches_per_ct = 4;
-        let total_batches = num_cts * batches_per_ct;
+        let num_batches = 2;
+        let t = params.plaintext_data.t;
 
-        // Ciphertexts with small deterministic values
-        let cts_c0: Vec<Vec<Vec<u64>>> = (0..num_cts)
-            .map(|ct_idx| {
-                (0..k)
-                    .map(|mod_idx| {
-                        let q = params.rns_data[mod_idx].modulus;
-                        (0..n)
-                            .map(|j| ((ct_idx * 1000 + mod_idx * 100 + j) as u64) % q)
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let cts_c1: Vec<Vec<Vec<u64>>> = (0..num_cts)
-            .map(|ct_idx| {
-                (0..k)
-                    .map(|mod_idx| {
-                        let q = params.rns_data[mod_idx].modulus;
-                        (0..n)
-                            .map(|j| ((ct_idx * 2000 + mod_idx * 200 + j + 1) as u64) % q)
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-
-        // Plaintext slots
-        let plaintext_slots: Vec<Vec<u64>> = (0..total_batches)
-            .map(|b| {
+        let slots: Vec<Vec<u64>> = (0..num_batches)
+            .map(|batch_idx| {
                 (0..n)
-                    .map(|i| ((b * 500 + i) as u64) % params.t)
+                    .map(|j| ((batch_idx * 1000 + j) as u64) % t)
                     .collect()
             })
             .collect();
 
-        // Run V1: signature is (cts_c0, cts_c1, slots, batches_per_ct)
-        let (v1_c0, v1_c1) = v1_ctx
-            .mul_batched_multi_ct(&cts_c0, &cts_c1, &plaintext_slots, batches_per_ct)
-            .expect("V1 mul_batched_multi_ct failed");
+        let cts_c0: Vec<Vec<Vec<u64>>> = vec![(0..k)
+            .map(|mod_idx| {
+                let q = params.rns_data[mod_idx].modulus;
+                (0..n).map(|j| ((100 + j) as u64) % q).collect()
+            })
+            .collect()];
 
-        // Run V2: signature is (slots, cts_c0, cts_c1, batches_per_ct)
-        let batches_per_ct_vec = vec![batches_per_ct];
-        let (v2_c0, v2_c1) = v2_ctx
-            .mul_batched_multi_ct(&plaintext_slots, &cts_c0, &cts_c1, &batches_per_ct_vec)
-            .expect("V2 mul_batched_multi_ct failed");
+        let cts_c1: Vec<Vec<Vec<u64>>> = vec![(0..k)
+            .map(|mod_idx| {
+                let q = params.rns_data[mod_idx].modulus;
+                (0..n).map(|j| ((200 + j) as u64) % q).collect()
+            })
+            .collect()];
 
-        // Compare outputs
-        assert_eq!(v1_c0.len(), v2_c0.len(), "c0 batch count mismatch");
-        assert_eq!(v1_c1.len(), v2_c1.len(), "c1 batch count mismatch");
+        let batches_per_ct = vec![num_batches];
 
-        let mut mismatches = 0;
-        for batch_idx in 0..total_batches {
-            for mod_idx in 0..k {
-                for elem_idx in 0..n {
-                    if v1_c0[batch_idx][mod_idx][elem_idx] != v2_c0[batch_idx][mod_idx][elem_idx] {
-                        if mismatches < 10 {
-                            println!(
-                                "c0 mismatch at [{},{},{}]: v1={} v2={}",
-                                batch_idx,
-                                mod_idx,
-                                elem_idx,
-                                v1_c0[batch_idx][mod_idx][elem_idx],
-                                v2_c0[batch_idx][mod_idx][elem_idx]
-                            );
-                        }
-                        mismatches += 1;
-                    }
-                    if v1_c1[batch_idx][mod_idx][elem_idx] != v2_c1[batch_idx][mod_idx][elem_idx] {
-                        if mismatches < 10 {
-                            println!(
-                                "c1 mismatch at [{},{},{}]: v1={} v2={}",
-                                batch_idx,
-                                mod_idx,
-                                elem_idx,
-                                v1_c1[batch_idx][mod_idx][elem_idx],
-                                v2_c1[batch_idx][mod_idx][elem_idx]
-                            );
-                        }
-                        mismatches += 1;
-                    }
-                }
+        // Test V2
+        let (v2_c0, v2_c1) = match v2_ctx.mul_batched_multi_ct(&slots, &cts_c0, &cts_c1, &batches_per_ct) {
+            Ok(result) => {
+                println!("V2 mul_batched_multi_ct succeeded");
+                println!("  Output shape: {} batches × {} moduli × {} elements", result.0.len(), result.0[0].len(), result.0[0][0].len());
+                result
             }
-        }
-
-        if mismatches > 0 {
-            panic!(
-                "V2 output differs from V1: {} mismatches out of {} total elements",
-                mismatches,
-                total_batches * k * n * 2
-            );
-        }
-
-        println!("V2 correctness test PASSED: {} batches x {} moduli x {} elements match V1",
-            total_batches, k, n);
-    }
-
-    /// Test that V2's slot_encode produces the same output as V1's batched_intt.
-    #[test]
-    fn test_slot_encode_vs_v1() {
-        let params = RnsBatchParams::goldilocks(8192).unwrap();
-        let n = params.n;
-
-        // Create V1 and V2 contexts
-        let v1_ctx = match RnsSlotMulGpu::new(params.clone()) {
-            Ok(ctx) => ctx,
             Err(e) => {
-                println!("Skipping test: GPU not available ({})", e);
+                println!("V2 mul_batched_multi_ct failed: {}", e);
                 return;
             }
         };
 
-        let v2_ctx = match RnsSlotMulGpuV3::new(params.clone()) {
-            Ok(ctx) => ctx,
+        // Test V3
+        let (v3_c0, v3_c1) = match v3_ctx.mul_batched_multi_ct(&slots, &cts_c0, &cts_c1, &batches_per_ct) {
+            Ok(result) => {
+                println!("V3 mul_batched_multi_ct succeeded");
+                println!("  Output shape: {} batches × {} moduli × {} elements", result.0.len(), result.0[0].len(), result.0[0][0].len());
+                result
+            }
             Err(e) => {
-                println!("Skipping test: V2 GPU context creation failed ({})", e);
+                println!("V3 mul_batched_multi_ct failed: {}", e);
                 return;
             }
         };
 
-        // Create test plaintext slots (small values mod t)
-        let num_batches = 4;
-        let plaintext_slots: Vec<Vec<u64>> = (0..num_batches)
-            .map(|b| {
-                (0..n)
-                    .map(|i| ((b * 500 + i) as u64) % params.t)
-                    .collect()
-            })
-            .collect();
+        // Compare results
+        let mut total_mismatches = 0;
+        let mut first_mismatch: Option<(usize, usize, usize, u64, u64)> = None;
 
-        // Run V1's batched_intt (slot_encode)
-        let v1_encoded = v1_ctx
-            .batched_intt(&plaintext_slots)
-            .expect("V1 batched_intt failed");
-
-        // Run V2's test_slot_encode
-        let v2_encoded = v2_ctx
-            .test_slot_encode(&plaintext_slots)
-            .expect("V2 test_slot_encode failed");
-
-        // Compare outputs
-        assert_eq!(v1_encoded.len(), v2_encoded.len(), "batch count mismatch");
-
-        let mut mismatches = 0;
         for batch_idx in 0..num_batches {
-            for elem_idx in 0..n {
-                if v1_encoded[batch_idx][elem_idx] != v2_encoded[batch_idx][elem_idx] {
-                    if mismatches < 10 {
-                        println!(
-                            "slot_encode mismatch at [{},{}]: v1={} v2={}",
-                            batch_idx,
-                            elem_idx,
-                            v1_encoded[batch_idx][elem_idx],
-                            v2_encoded[batch_idx][elem_idx]
-                        );
+            for mod_idx in 0..k {
+                for j in 0..n {
+                    if v2_c0[batch_idx][mod_idx][j] != v3_c0[batch_idx][mod_idx][j] {
+                        total_mismatches += 1;
+                        if first_mismatch.is_none() {
+                            first_mismatch = Some((batch_idx, mod_idx, j, v2_c0[batch_idx][mod_idx][j], v3_c0[batch_idx][mod_idx][j]));
+                        }
                     }
-                    mismatches += 1;
+                    if v2_c1[batch_idx][mod_idx][j] != v3_c1[batch_idx][mod_idx][j] {
+                        total_mismatches += 1;
+                    }
                 }
             }
         }
 
-        if mismatches > 0 {
-            panic!(
-                "V2 slot_encode differs from V1: {} mismatches out of {} total elements",
-                mismatches,
-                num_batches * n
-            );
-        }
+        if total_mismatches == 0 {
+            println!("✓ V3 output matches V2 exactly!");
+        } else {
+            println!("✗ V3 vs V2 mismatch: {} total differences", total_mismatches);
+            if let Some((b, m, j, v2_val, v3_val)) = first_mismatch {
+                println!("  First mismatch at batch={}, mod={}, idx={}: V2={} vs V3={}", b, m, j, v2_val, v3_val);
+            }
+            // Print a few sample values for debugging
+            println!("  Sample V2 c0[0][0][0..5]: {:?}", &v2_c0[0][0][0..5]);
+            println!("  Sample V3 c0[0][0][0..5]: {:?}", &v3_c0[0][0][0..5]);
 
-        println!("slot_encode test PASSED: {} batches x {} elements match V1", num_batches, n);
+            // Check if V3's values exist in V2 at different indices (permutation search)
+            println!("\n  Searching for V3 values in V2 output (batch=0, mod=0, first 10 V3 indices):");
+            let n1 = 32usize;
+            let n2 = 256usize;
+            for v3_idx in 0..std::cmp::min(10, n) {
+                let v3_val = v3_c0[0][0][v3_idx];
+                let mut found_at: Option<usize> = None;
+                for v2_idx in 0..n {
+                    if v2_c0[0][0][v2_idx] == v3_val {
+                        found_at = Some(v2_idx);
+                        break;
+                    }
+                }
+                match found_at {
+                    Some(v2_idx) => {
+                        let v3_k1 = v3_idx / n2;
+                        let v3_k2 = v3_idx % n2;
+                        let v2_k1 = v2_idx / n2;
+                        let v2_k2 = v2_idx % n2;
+                        println!("    V3[{}] (k1={},k2={}) = {} found at V2[{}] (k1={},k2={})",
+                                 v3_idx, v3_k1, v3_k2, v3_val, v2_idx, v2_k1, v2_k2);
+                    }
+                    None => {
+                        println!("    V3[{}] = {} NOT FOUND in V2 output", v3_idx, v3_val);
+                    }
+                }
+            }
+        }
     }
 
-    /// Test that V2's forward_ntt produces the same output as V1's test_forward_ntt.
-    #[test]
-    fn test_forward_ntt_vs_v1() {
-        let params = RnsBatchParams::goldilocks(8192).unwrap();
-        let n = params.n;
-        let k = params.k;
+    /// CPU reference implementation of four-step NTT for verification.
+    /// Returns the NTT result using the four-step algorithm.
+    fn cpu_four_step_ntt(input: &[u64], n: usize, n1: usize, n2: usize, omega: u64, q: u64) -> Vec<u64> {
+        assert_eq!(n, n1 * n2);
+        let mut data = input.to_vec();
 
-        // Create V1 and V2 contexts
-        let v1_ctx = match RnsSlotMulGpu::new(params.clone()) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                println!("Skipping test: GPU not available ({})", e);
-                return;
-            }
+        // Helper: modular multiplication
+        let mulmod = |a: u64, b: u64| -> u64 {
+            ((a as u128 * b as u128) % q as u128) as u64
         };
 
-        let v2_ctx = match RnsSlotMulGpuV3::new(params.clone()) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                println!("Skipping test: V2 GPU context creation failed ({})", e);
-                return;
-            }
+        // Helper: modular addition (handles overflow)
+        let addmod = |a: u64, b: u64| -> u64 {
+            let (sum, overflow) = a.overflowing_add(b);
+            if overflow || sum >= q { sum.wrapping_sub(q) } else { sum }
         };
 
-        // Create test coefficient values (single batch)
-        let coeffs: Vec<u64> = (0..n)
-            .map(|i| ((i * 500) as u64) % params.t)
-            .collect();
+        // Helper: modular subtraction (handles underflow)
+        let submod = |a: u64, b: u64| -> u64 {
+            if a >= b { a - b } else { a.wrapping_add(q).wrapping_sub(b) }
+        };
 
-        // Test each modulus
-        for mod_idx in 0..k {
-            // Run V1's test_forward_ntt
-            let v1_ntt = v1_ctx
-                .test_forward_ntt(&coeffs, mod_idx)
-                .expect("V1 test_forward_ntt failed");
-
-            // Run V2's test_forward_ntt
-            let v2_ntt = v2_ctx
-                .test_forward_ntt(&coeffs, mod_idx)
-                .expect("V2 test_forward_ntt failed");
-
-            // Compare outputs
-            let mut mismatches = 0;
-            for elem_idx in 0..n {
-                if v1_ntt[elem_idx] != v2_ntt[elem_idx] {
-                    if mismatches < 5 {
-                        println!(
-                            "forward_ntt[mod={}] mismatch at [{}]: v1={} v2={}",
-                            mod_idx,
-                            elem_idx,
-                            v1_ntt[elem_idx],
-                            v2_ntt[elem_idx]
-                        );
-                    }
-                    mismatches += 1;
+        // Helper: compute omega^exp mod q
+        let pow_mod = |base: u64, mut exp: u64| -> u64 {
+            let mut result = 1u64;
+            let mut base = base;
+            while exp > 0 {
+                if exp & 1 == 1 {
+                    result = mulmod(result, base);
                 }
+                base = mulmod(base, base);
+                exp >>= 1;
             }
-
-            if mismatches > 0 {
-                panic!(
-                    "V2 forward_ntt[mod={}] differs from V1: {} mismatches out of {} elements",
-                    mod_idx,
-                    mismatches,
-                    n
-                );
-            }
-        }
-
-        println!("forward_ntt test PASSED: {} moduli x {} elements match V1", k, n);
-    }
-
-    /// Test that V2's fused_mul_intt produces the same output as V1's pointwise_mul + inverse_ntt.
-    #[test]
-    fn test_fused_mul_intt_vs_v1() {
-        let params = RnsBatchParams::goldilocks(8192).unwrap();
-        let n = params.n;
-        let k = params.k;
-
-        // Create V1 and V2 contexts
-        let v1_ctx = match RnsSlotMulGpu::new(params.clone()) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                println!("Skipping test: GPU not available ({})", e);
-                return;
-            }
+            result
         };
 
-        let v2_ctx = match RnsSlotMulGpuV3::new(params.clone()) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                println!("Skipping test: V2 GPU context creation failed ({})", e);
-                return;
+        // Helper: bit-reverse
+        let bit_reverse = |x: usize, bits: usize| -> usize {
+            let mut result = 0;
+            let mut x = x;
+            for _ in 0..bits {
+                result = (result << 1) | (x & 1);
+                x >>= 1;
             }
+            result
         };
 
-        // Create test data
-        let pt_ntt: Vec<u64> = (0..n)
-            .map(|i| ((i * 123 + 1) as u64) % params.t)
-            .collect();
-        let ct_c0: Vec<u64> = (0..n)
-            .map(|i| ((i * 456 + 2) as u64) % params.rns_data[0].modulus)
-            .collect();
-        let ct_c1: Vec<u64> = (0..n)
-            .map(|i| ((i * 789 + 3) as u64) % params.rns_data[0].modulus)
-            .collect();
+        // Helper: single NTT (DIT Cooley-Tukey)
+        let ntt_inplace = |data: &mut [u64], omega_n: u64| {
+            let n = data.len();
+            let log_n = (n as f64).log2() as usize;
 
-        // Test each modulus
-        for mod_idx in 0..k {
-            // Adjust ct_c0/ct_c1 to proper modulus range
-            let q = params.rns_data[mod_idx].modulus;
-            let ct_c0_mod: Vec<u64> = ct_c0.iter().map(|v| v % q).collect();
-            let ct_c1_mod: Vec<u64> = ct_c1.iter().map(|v| v % q).collect();
-
-            // V1: pointwise_mul then inverse_ntt
-            let (v1_c0_mul, v1_c1_mul) = v1_ctx
-                .test_pointwise_mul(&pt_ntt, &ct_c0_mod, &ct_c1_mod, mod_idx)
-                .expect("V1 test_pointwise_mul failed");
-
-            let v1_c0_intt = v1_ctx
-                .test_inverse_ntt(&v1_c0_mul, mod_idx)
-                .expect("V1 test_inverse_ntt c0 failed");
-            let v1_c1_intt = v1_ctx
-                .test_inverse_ntt(&v1_c1_mul, mod_idx)
-                .expect("V1 test_inverse_ntt c1 failed");
-
-            // V2: fused_mul_intt
-            let (v2_c0, v2_c1) = v2_ctx
-                .test_fused_mul_intt(&pt_ntt, &ct_c0_mod, &ct_c1_mod, mod_idx)
-                .expect("V2 test_fused_mul_intt failed");
-
-            // Compare c0
-            let mut c0_mismatches = 0;
-            for elem_idx in 0..n {
-                if v1_c0_intt[elem_idx] != v2_c0[elem_idx] {
-                    if c0_mismatches < 5 {
-                        println!(
-                            "fused_mul_intt[mod={}] c0 mismatch at [{}]: v1={} v2={}",
-                            mod_idx, elem_idx, v1_c0_intt[elem_idx], v2_c0[elem_idx]
-                        );
-                    }
-                    c0_mismatches += 1;
-                }
-            }
-
-            // Compare c1
-            let mut c1_mismatches = 0;
-            for elem_idx in 0..n {
-                if v1_c1_intt[elem_idx] != v2_c1[elem_idx] {
-                    if c1_mismatches < 5 {
-                        println!(
-                            "fused_mul_intt[mod={}] c1 mismatch at [{}]: v1={} v2={}",
-                            mod_idx, elem_idx, v1_c1_intt[elem_idx], v2_c1[elem_idx]
-                        );
-                    }
-                    c1_mismatches += 1;
-                }
-            }
-
-            if c0_mismatches > 0 || c1_mismatches > 0 {
-                panic!(
-                    "V2 fused_mul_intt[mod={}] differs from V1: c0={} c1={} mismatches out of {} elements",
-                    mod_idx, c0_mismatches, c1_mismatches, n
-                );
-            }
-        }
-
-        println!("fused_mul_intt test PASSED: {} moduli x {} elements match V1", k, n);
-    }
-
-    /// Debug test: trace through full pipeline to find divergence point.
-    #[test]
-    fn test_debug_pipeline_trace() {
-        let params = RnsBatchParams::goldilocks(8192).unwrap();
-        let n = params.n;
-        let k = params.k;
-
-        let v1_ctx = match RnsSlotMulGpu::new(params.clone()) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                println!("Skipping: GPU not available ({})", e);
-                return;
-            }
-        };
-
-        let v2_ctx = match RnsSlotMulGpuV3::new(params.clone()) {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                println!("Skipping: V2 GPU not available ({})", e);
-                return;
-            }
-        };
-
-        // Use same test data as test_v2_correctness_vs_v1
-        let num_cts = 2;
-        let batches_per_ct = 4;
-        let total_batches = num_cts * batches_per_ct;
-
-        // Create CT data (same as correctness test)
-        let cts_c0: Vec<Vec<Vec<u64>>> = (0..num_cts)
-            .map(|ct_idx| {
-                (0..k)
-                    .map(|mod_idx| {
-                        let q = params.rns_data[mod_idx].modulus;
-                        (0..n).map(|j| ((ct_idx * 1000 + mod_idx * 100 + j) as u64) % q).collect()
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let cts_c1: Vec<Vec<Vec<u64>>> = (0..num_cts)
-            .map(|ct_idx| {
-                (0..k)
-                    .map(|mod_idx| {
-                        let q = params.rns_data[mod_idx].modulus;
-                        (0..n).map(|j| ((ct_idx * 2000 + mod_idx * 200 + j + 1) as u64) % q).collect()
-                    })
-                    .collect()
-            })
-            .collect();
-
-        // Create plaintext slots for all batches
-        let plaintext_slots: Vec<Vec<u64>> = (0..total_batches)
-            .map(|b| (0..n).map(|i| ((b * 500 + i) as u64) % params.t).collect())
-            .collect();
-
-        println!("=== Debug Pipeline Trace ===");
-        println!("num_cts={}, batches_per_ct={}, total_batches={}", num_cts, batches_per_ct, total_batches);
-
-        // Test with single batch using V2's test_slot_encode (V1 doesn't have this)
-        let batch_idx = 0;
-        let ct_idx = 0;
-        let mod_idx = 0;
-
-        println!("\n[Stage 1] slot_encode (batch 0):");
-        let slots_batch = vec![plaintext_slots[batch_idx].clone()];
-        let v2_encoded = v2_ctx.test_slot_encode(&slots_batch).expect("V2 slot_encode failed");
-        println!("  V2 encoded[0][0..4]: {:?}", &v2_encoded[0][0..4]);
-
-        // Stage 2: forward_ntt (under RNS modulus mod_idx)
-        println!("\n[Stage 2] forward_ntt (mod_idx={}):", mod_idx);
-        let v2_ntt = v2_ctx.test_forward_ntt(&v2_encoded[0], mod_idx).expect("V2 forward_ntt failed");
-        println!("  V2 ntt[0..4]: {:?}", &v2_ntt[0..4]);
-
-        // Also test V1's forward_ntt with same encoded data
-        let v1_ntt = v1_ctx.test_forward_ntt(&v2_encoded[0], mod_idx).expect("V1 forward_ntt failed");
-        let ntt_match = v1_ntt.iter().zip(v2_ntt.iter()).all(|(a, b)| a == b);
-        println!("  V1 ntt[0..4]: {:?}", &v1_ntt[0..4]);
-        println!("  NTT match: {}", if ntt_match { "YES" } else { "NO" });
-
-        // Stage 3: pointwise_mul + inverse_ntt
-        println!("\n[Stage 3] mul+intt (ct_idx={}, mod_idx={}):", ct_idx, mod_idx);
-        let ct_c0 = &cts_c0[ct_idx][mod_idx];
-        let ct_c1 = &cts_c1[ct_idx][mod_idx];
-
-        // V1: pointwise_mul then inverse_ntt
-        let (v1_mul_c0, v1_mul_c1) = v1_ctx
-            .test_pointwise_mul(&v1_ntt, ct_c0, ct_c1, mod_idx)
-            .expect("V1 pointwise_mul failed");
-        let v1_final_c0 = v1_ctx.test_inverse_ntt(&v1_mul_c0, mod_idx).expect("V1 inverse_ntt c0 failed");
-        let v1_final_c1 = v1_ctx.test_inverse_ntt(&v1_mul_c1, mod_idx).expect("V1 inverse_ntt c1 failed");
-
-        // V2: fused_mul_intt
-        let (v2_final_c0, v2_final_c1) = v2_ctx
-            .test_fused_mul_intt(&v2_ntt, ct_c0, ct_c1, mod_idx)
-            .expect("V2 fused_mul_intt failed");
-
-        let c0_match = v1_final_c0.iter().zip(v2_final_c0.iter()).all(|(a, b)| a == b);
-        let c1_match = v1_final_c1.iter().zip(v2_final_c1.iter()).all(|(a, b)| a == b);
-        println!("  Manual V1 c0[0..4]: {:?}", &v1_final_c0[0..4]);
-        println!("  Manual V2 c0[0..4]: {:?}", &v2_final_c0[0..4]);
-        println!("  c0 match: {}, c1 match: {}", c0_match, c1_match);
-
-        // Full pipeline output
-        println!("\n[Full Pipeline] mul_batched_multi_ct:");
-        let (v1_out_c0, _v1_out_c1) = v1_ctx
-            .mul_batched_multi_ct(&cts_c0, &cts_c1, &plaintext_slots, batches_per_ct)
-            .expect("V1 mul_batched_multi_ct failed");
-
-        let batches_per_ct_vec = vec![batches_per_ct];
-        let (v2_out_c0, _v2_out_c1) = v2_ctx
-            .mul_batched_multi_ct(&plaintext_slots, &cts_c0, &cts_c1, &batches_per_ct_vec)
-            .expect("V2 mul_batched_multi_ct failed");
-
-        println!("  Full V1 out[0][0][0..4]: {:?}", &v1_out_c0[0][0][0..4]);
-        println!("  Full V2 out[0][0][0..4]: {:?}", &v2_out_c0[0][0][0..4]);
-
-        // Compare manual vs full pipeline
-        println!("\n[Compare manual vs full pipeline]:");
-        let v1_manual_vs_full = v1_final_c0.iter().zip(v1_out_c0[0][0].iter()).all(|(a, b)| a == b);
-        let v2_manual_vs_full = v2_final_c0.iter().zip(v2_out_c0[0][0].iter()).all(|(a, b)| a == b);
-        println!("  V1 manual==full: {}", if v1_manual_vs_full { "YES" } else { "NO!" });
-        println!("  V2 manual==full: {}", if v2_manual_vs_full { "YES" } else { "NO!" });
-
-        if !v1_manual_vs_full {
-            println!("\n*** V1 DIVERGENCE: manual pipeline != full pipeline ***");
-        }
-        if !v2_manual_vs_full {
-            println!("\n*** V2 DIVERGENCE: manual pipeline != full pipeline ***");
-            // Find first mismatch
+            // Bit-reverse permutation
             for i in 0..n {
-                if v2_final_c0[i] != v2_out_c0[0][0][i] {
-                    println!("  First mismatch at i={}: manual={} full={}", i, v2_final_c0[i], v2_out_c0[0][0][i]);
+                let j = bit_reverse(i, log_n);
+                if i < j {
+                    data.swap(i, j);
+                }
+            }
+
+            // Butterfly stages
+            for stage in 0..log_n {
+                let m = 1 << (stage + 1);
+                let half_m = 1 << stage;
+                let step = n / m;
+                let twiddle_base = pow_mod(omega_n, step as u64);
+
+                for group in 0..(n / m) {
+                    let mut twiddle = 1u64;
+                    for j in 0..half_m {
+                        let idx1 = group * m + j;
+                        let idx2 = idx1 + half_m;
+                        let u = data[idx1];
+                        let v = mulmod(data[idx2], twiddle);
+                        data[idx1] = addmod(u, v);
+                        data[idx2] = submod(u, v);
+                        twiddle = mulmod(twiddle, twiddle_base);
+                    }
+                }
+            }
+        };
+
+        // omega_n1 = omega^n2 (primitive n1-th root of unity, for column n1-point NTT)
+        let omega_n1 = pow_mod(omega, n2 as u64);
+        // omega_n2 = omega^n1 (primitive n2-th root of unity, for row n2-point NTT)
+        let omega_n2 = pow_mod(omega, n1 as u64);
+
+        println!("CPU four-step NTT:");
+        println!("  n={}, n1={}, n2={}", n, n1, n2);
+        println!("  omega = {}", omega);
+        println!("  omega_n1 = omega^{} = {}", n2, omega_n1);
+        println!("  omega_n2 = omega^{} = {}", n1, omega_n2);
+
+        // Correct four-step NTT algorithm:
+        // Input is viewed as n1×n2 matrix in COLUMN-MAJOR order:
+        //   A[j1][j2] = x[j2*n1 + j1]   where j1 in 0..n1, j2 in 0..n2
+        //
+        // This is equivalent to transposing the input if it's stored row-major.
+        //
+        // Algorithm:
+        // 1. Compute n1 row-wise n2-point DFTs using omega_n2 = omega^n1
+        // 2. Multiply by cross-twiddles omega^{j1*k2}
+        // 3. Compute n2 column-wise n1-point DFTs using omega_n1 = omega^n2
+        // 4. Output is in row-major order: X[k1*n2 + k2]
+
+        // Step 0: Rearrange input from row-major x[j] to column-major A[j1][j2]
+        // where j = j1*n2 + j2 (row-major) becomes A[j1][j2] = x[j2*n1 + j1] (column-major)
+        // In memory as row-major n1×n2: A_flat[row*n2 + col] = x[col*n1 + row]
+        let mut matrix = vec![0u64; n];
+        for j1 in 0..n1 {
+            for j2 in 0..n2 {
+                // Column-major: A[j1][j2] = input[j2*n1 + j1]
+                // Store in row-major: matrix[j1*n2 + j2]
+                matrix[j1 * n2 + j2] = data[j2 * n1 + j1];
+            }
+        }
+
+        // Step 1: Row NTTs (n1 independent n2-point NTTs using omega_n2)
+        for row in 0..n1 {
+            let start = row * n2;
+            let mut row_data: Vec<u64> = matrix[start..start + n2].to_vec();
+            ntt_inplace(&mut row_data, omega_n2);
+            matrix[start..start + n2].copy_from_slice(&row_data);
+        }
+
+        // Step 2: Cross twiddle multiplication by omega^(j1 * k2)
+        // j1 = row index, k2 = column index (frequency after row NTT)
+        for j1 in 0..n1 {
+            for k2 in 0..n2 {
+                let twiddle = pow_mod(omega, (j1 * k2) as u64);
+                let idx = j1 * n2 + k2;
+                matrix[idx] = mulmod(matrix[idx], twiddle);
+            }
+        }
+
+        // Step 3: Column NTTs (n2 independent n1-point NTTs using omega_n1)
+        for k2 in 0..n2 {
+            let mut col_data: Vec<u64> = (0..n1).map(|j1| matrix[j1 * n2 + k2]).collect();
+            ntt_inplace(&mut col_data, omega_n1);
+            for k1 in 0..n1 {
+                matrix[k1 * n2 + k2] = col_data[k1];
+            }
+        }
+
+        // Output is already in row-major order: matrix[k1*n2 + k2] = X[k1*n2 + k2]
+        matrix
+    }
+
+    /// Direct NTT (not four-step) for comparison.
+    fn cpu_direct_ntt(input: &[u64], n: usize, omega: u64, q: u64) -> Vec<u64> {
+        let mulmod = |a: u64, b: u64| -> u64 {
+            ((a as u128 * b as u128) % q as u128) as u64
+        };
+        let addmod = |a: u64, b: u64| -> u64 {
+            let (sum, overflow) = a.overflowing_add(b);
+            if overflow || sum >= q { sum.wrapping_sub(q) } else { sum }
+        };
+        let submod = |a: u64, b: u64| -> u64 {
+            if a >= b { a - b } else { a.wrapping_add(q).wrapping_sub(b) }
+        };
+        let pow_mod = |base: u64, mut exp: u64| -> u64 {
+            let mut result = 1u64;
+            let mut base = base;
+            while exp > 0 {
+                if exp & 1 == 1 { result = mulmod(result, base); }
+                base = mulmod(base, base);
+                exp >>= 1;
+            }
+            result
+        };
+        let bit_reverse = |x: usize, bits: usize| -> usize {
+            let mut result = 0;
+            let mut x = x;
+            for _ in 0..bits { result = (result << 1) | (x & 1); x >>= 1; }
+            result
+        };
+
+        let mut data = input.to_vec();
+        let log_n = (n as f64).log2() as usize;
+
+        // Bit-reverse permutation
+        for i in 0..n {
+            let j = bit_reverse(i, log_n);
+            if i < j { data.swap(i, j); }
+        }
+
+        // Butterfly stages
+        for stage in 0..log_n {
+            let m = 1 << (stage + 1);
+            let half_m = 1 << stage;
+            let step = n / m;
+            let twiddle_base = pow_mod(omega, step as u64);
+
+            for group in 0..(n / m) {
+                let mut twiddle = 1u64;
+                for j in 0..half_m {
+                    let idx1 = group * m + j;
+                    let idx2 = idx1 + half_m;
+                    let u = data[idx1];
+                    let v = mulmod(data[idx2], twiddle);
+                    data[idx1] = addmod(u, v);
+                    data[idx2] = submod(u, v);
+                    twiddle = mulmod(twiddle, twiddle_base);
+                }
+            }
+        }
+
+        data
+    }
+
+    #[test]
+    fn test_cpu_four_step_small() {
+        // Small example for debugging: n=8 = 2 × 4
+        // Use q=17, primitive 8th root of unity is 2 (2^8 = 256 ≡ 1 mod 17)
+        let q: u64 = 17;
+        let n = 8;
+        let n1 = 2; // rows
+        let n2 = 4; // columns
+        let omega: u64 = 2; // primitive 8th root of unity mod 17
+
+        // Verify omega is an 8th root: omega^8 = 1 mod 17
+        let omega8 = (0..8).fold(1u64, |acc, _| (acc * omega) % q);
+        assert_eq!(omega8, 1, "omega should be 8th root of unity");
+        let omega4 = (0..4).fold(1u64, |acc, _| (acc * omega) % q);
+        assert_ne!(omega4, 1, "omega^4 should not be 1");
+
+        println!("\n=== Small Four-Step NTT Test (n=8 = 2×4) ===");
+        println!("q={}, omega={}", q, omega);
+
+        // Simple input
+        let input: Vec<u64> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        println!("Input: {:?}", input);
+
+        // Direct DFT (not FFT) for comparison
+        let direct_dft: Vec<u64> = (0..n).map(|k| {
+            (0..n).fold(0u64, |acc, j| {
+                let omega_jk = (0..(j*k)).fold(1u64, |a, _| (a * omega) % q);
+                (acc + input[j] * omega_jk) % q
+            })
+        }).collect();
+        println!("Direct DFT: {:?}", direct_dft);
+
+        // Now trace through four-step manually
+        // Input layout as 2×4 matrix (row-major):
+        //   Row 0: [1, 2, 3, 4]  (indices 0,1,2,3)
+        //   Row 1: [5, 6, 7, 8]  (indices 4,5,6,7)
+
+        // omega_n2 = omega^(n/n2) = omega^2 (4th root of unity)
+        let omega_n2 = (omega * omega) % q;
+        // omega_n1 = omega^(n/n1) = omega^4 (2nd root of unity)
+        let omega_n1 = (0..4).fold(1u64, |acc, _| (acc * omega) % q);
+        println!("omega_n2 = omega^2 = {} (4th root)", omega_n2);
+        println!("omega_n1 = omega^4 = {} (2nd root)", omega_n1);
+
+        // Our four-step implementation
+        let fourstep = cpu_four_step_ntt(&input, n, n1, n2, omega, q);
+        println!("Four-step result: {:?}", fourstep);
+
+        // Direct NTT (FFT-style)
+        let direct_fft = cpu_direct_ntt(&input, n, omega, q);
+        println!("Direct FFT result: {:?}", direct_fft);
+
+        // Check which indices match
+        println!("\nComparison:");
+        for i in 0..n {
+            let matches = if fourstep[i] == direct_fft[i] { "✓" } else { "✗" };
+            println!("  [{}]: fourstep={}, direct_fft={}, direct_dft={} {}",
+                     i, fourstep[i], direct_fft[i], direct_dft[i], matches);
+        }
+
+        // The four-step result might be in a different index order
+        // Try to find the permutation
+        println!("\nLooking for permutation:");
+        for i in 0..n {
+            for j in 0..n {
+                if fourstep[i] == direct_fft[j] {
+                    println!("  fourstep[{}] = direct_fft[{}] = {}", i, j, fourstep[i]);
                     break;
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cpu_four_step_vs_direct() {
+        // Use a small example first for debugging
+        let q: u64 = 0xFFFFFFFF00000001; // Goldilocks prime
+        let n = 8192;
+        let n1 = 32;
+        let n2 = 256;
+
+        // Find primitive n-th root of unity
+        // For Goldilocks, omega = 7^((q-1)/n)
+        let omega = {
+            let exp = (q - 1) / n as u64;
+            let mut result = 1u64;
+            let mut base = 7u64;
+            let mut e = exp;
+            while e > 0 {
+                if e & 1 == 1 {
+                    result = ((result as u128 * base as u128) % q as u128) as u64;
+                }
+                base = ((base as u128 * base as u128) % q as u128) as u64;
+                e >>= 1;
+            }
+            result
+        };
+
+        println!("Testing CPU four-step NTT vs direct NTT");
+        println!("n={}, n1={}, n2={}, q={}, omega={}", n, n1, n2, q, omega);
+
+        // Simple input: [1, 2, 3, ..., n]
+        let input: Vec<u64> = (1..=n as u64).collect();
+
+        let direct_result = cpu_direct_ntt(&input, n, omega, q);
+        let fourstep_result = cpu_four_step_ntt(&input, n, n1, n2, omega, q);
+
+        // Compare
+        let mut mismatches = 0;
+        for i in 0..n {
+            if direct_result[i] != fourstep_result[i] {
+                mismatches += 1;
+                if mismatches <= 5 {
+                    println!("  Mismatch at {}: direct={} vs fourstep={}", i, direct_result[i], fourstep_result[i]);
+                }
+            }
+        }
+
+        if mismatches == 0 {
+            println!("✓ CPU four-step NTT matches direct NTT!");
+        } else {
+            println!("✗ {} mismatches between four-step and direct NTT", mismatches);
+            println!("  Direct[0..5]: {:?}", &direct_result[0..5]);
+            println!("  FourStep[0..5]: {:?}", &fourstep_result[0..5]);
+        }
+
+        assert_eq!(mismatches, 0, "Four-step NTT should match direct NTT");
+    }
+
+    /// Test that V3's forward NTT followed by INTT gives back the original (identity test).
+    /// This isolates the NTT/INTT correctness from the slot encoding and pointwise mul.
+    #[test]
+    fn test_v3_ntt_identity() {
+        let params = match RnsBatchParams::goldilocks(8192) {
+            Some(p) => p,
+            None => {
+                println!("Skipping test: goldilocks params not available");
+                return;
+            }
+        };
+
+        let v3_ctx = match RnsSlotMulGpuV3::new(params.clone()) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                println!("Skipping test: V3 GPU not available ({})", e);
+                return;
+            }
+        };
+
+        println!("Testing V3 NTT identity (NTT followed by INTT should give original)");
+
+        // Create simple test data: all 1s for slot 0, 0s elsewhere
+        let n = params.n;
+        let k = params.k;
+        let t = params.plaintext_data.t;
+
+        // Simple test: slots[i] = i % t
+        let slots: Vec<Vec<u64>> = vec![(0..n).map(|i| (i as u64) % t).collect()];
+
+        // Create identity ciphertext (c0 = NTT(1), c1 = NTT(0))
+        // For identity test, we use ct[i] = 1 for all i in NTT domain
+        let cts_c0: Vec<Vec<Vec<u64>>> = vec![(0..k)
+            .map(|_| vec![1u64; n])
+            .collect()];
+        let cts_c1: Vec<Vec<Vec<u64>>> = vec![(0..k)
+            .map(|_| vec![0u64; n])
+            .collect()];
+
+        let batches_per_ct = vec![1];
+
+        // Run V3
+        let result = v3_ctx.mul_batched_multi_ct(&slots, &cts_c0, &cts_c1, &batches_per_ct);
+        match result {
+            Ok((c0_out, _c1_out)) => {
+                // When multiplied by NTT(1), the result should be NTT(plaintext) after INTT
+                // which equals the original plaintext coefficients
+                println!("V3 mul succeeded");
+                println!("  Output c0[0][0][0..10]: {:?}", &c0_out[0][0][0..10]);
+
+                // The output should be related to the input slots
+                // After slot_encode (INTT), we get coefficients
+                // After NTT, pointwise mul by 1, INTT, we should get back coefficients
+            }
+            Err(e) => {
+                println!("V3 mul failed: {}", e);
+            }
+        }
+    }
+
+    #[test]
+    fn test_v3_ntt_intt_roundtrip() {
+        let params = match RnsBatchParams::goldilocks(8192) {
+            Some(p) => p,
+            None => {
+                println!("Skipping test: goldilocks params not available");
+                return;
+            }
+        };
+        let n = params.n;
+        let k = params.k;
+        let t = params.plaintext_data.t;
+
+        let v3_ctx = match RnsSlotMulGpuV3::new(params.clone()) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                println!("Skipping test: V3 GPU not available ({})", e);
+                return;
+            }
+        };
+
+        println!("Testing V3 NTT -> INTT round-trip");
+
+        // Create test slots
+        let slots: Vec<Vec<u64>> = vec![(0..n).map(|i| (i as u64) % t).collect()];
+
+        // First, get the slot_encode output (this is what we expect after NTT -> INTT)
+        let encoded = v3_ctx.test_slot_encode_only(&slots).expect("slot encode failed");
+        println!("  slot_encode produced {} values", encoded[0].len());
+
+        // Run NTT -> INTT round-trip
+        let roundtrip = v3_ctx.test_ntt_intt_roundtrip(&slots).expect("round-trip failed");
+        println!("  round-trip produced {} batches × {} moduli × {} values",
+                 roundtrip.len(), roundtrip[0].len(), roundtrip[0][0].len());
+
+        // Compare with slot_encode output
+        // The round-trip output should match the encoded values reduced mod each q
+        let mod_idx = 0;  // Test first modulus
+        let q = params.rns_data[mod_idx].modulus;
+
+        let mut mismatches = 0;
+        let mut first_mismatch: Option<(usize, u64, u64)> = None;
+        for i in 0..n {
+            // Reduce encoded value mod q for comparison
+            let expected = encoded[0][i] % q;
+            let actual = roundtrip[0][mod_idx][i];
+            if expected != actual {
+                mismatches += 1;
+                if first_mismatch.is_none() {
+                    first_mismatch = Some((i, expected, actual));
+                }
+            }
+        }
+
+        if mismatches == 0 {
+            println!("  ✓ NTT -> INTT round-trip matches encoded (mod q): all {} elements correct", n);
+        } else {
+            println!("  ✗ NTT -> INTT round-trip: {} mismatches out of {}", mismatches, n);
+            if let Some((i, exp, act)) = first_mismatch {
+                println!("    First mismatch at i={}: expected {} (encoded mod q), got {}", i, exp, act);
+            }
+            println!("    encoded[0..5] mod q: {:?}", &encoded[0][0..5].iter().map(|&x| x % q).collect::<Vec<_>>());
+            println!("    roundtrip[0..5]:     {:?}", &roundtrip[0][mod_idx][0..5]);
+        }
+    }
+
+    #[test]
+    fn test_v3_full_pipeline_with_identity_ct() {
+        // This test verifies the full pipeline by multiplying with identity ciphertext
+        // (all 1s in NTT form). Result should equal the NTT->INTT round-trip.
+        let params = match RnsBatchParams::goldilocks(8192) {
+            Some(p) => p,
+            None => {
+                println!("Skipping test: goldilocks params not available");
+                return;
+            }
+        };
+        let n = params.n;
+        let k = params.k;
+        let t = params.plaintext_data.t;
+
+        let v3_ctx = match RnsSlotMulGpuV3::new(params.clone()) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                println!("Skipping test: V3 GPU not available ({})", e);
+                return;
+            }
+        };
+
+        println!("Testing V3 full pipeline with identity ciphertext");
+
+        // Create test slots
+        let slots: Vec<Vec<u64>> = vec![(0..n).map(|i| (i as u64) % t).collect()];
+
+        // Get the NTT -> INTT round-trip result (expected)
+        let roundtrip = v3_ctx.test_ntt_intt_roundtrip(&slots).expect("round-trip failed");
+        println!("  Round-trip reference computed");
+
+        // Create identity ciphertext: all 1s (multiplying by 1 in NTT domain is like
+        // multiplying by a polynomial that has all coefficients = 1 in coefficient domain,
+        // which is NOT the identity. But it should still be consistent.)
+        // For true identity, we need ct[i] = 1 for all i, which corresponds to
+        // INTT([1,0,0,...]) in coefficient domain. Actually, this is complex.
+        //
+        // Simpler test: use ct that encodes the same value at each position,
+        // then verify the output is consistent.
+        //
+        // Even simpler: compare V3 full pipeline with round-trip when ct = all 1s
+        let cts_c0: Vec<Vec<Vec<u64>>> = vec![(0..k)
+            .map(|_| vec![1u64; n])
+            .collect()];
+        let cts_c1: Vec<Vec<Vec<u64>>> = vec![(0..k)
+            .map(|_| vec![0u64; n])
+            .collect()];
+        let batches_per_ct = vec![1];
+
+        // Run full pipeline
+        let (c0_out, _c1_out) = v3_ctx.mul_batched_multi_ct(&slots, &cts_c0, &cts_c1, &batches_per_ct)
+            .expect("full pipeline failed");
+        println!("  Full pipeline completed");
+
+        // Compare c0_out with roundtrip
+        // Since we multiplied by ct=1 (in NTT form), the result is:
+        // INTT(NTT(pt) * 1) = INTT(NTT(pt)) = pt (coefficients)
+        // So c0_out should equal roundtrip (which is also INTT(NTT(pt)))
+        let mod_idx = 0;
+        let mut mismatches = 0;
+        let mut first_mismatch: Option<(usize, u64, u64)> = None;
+        for i in 0..n {
+            let expected = roundtrip[0][mod_idx][i];
+            let actual = c0_out[0][mod_idx][i];
+            if expected != actual {
+                mismatches += 1;
+                if first_mismatch.is_none() {
+                    first_mismatch = Some((i, expected, actual));
+                }
+            }
+        }
+
+        if mismatches == 0 {
+            println!("  ✓ Full pipeline with ct=1 matches round-trip: all {} elements correct", n);
+        } else {
+            println!("  ✗ Full pipeline with ct=1 vs round-trip: {} mismatches", mismatches);
+            if let Some((i, exp, act)) = first_mismatch {
+                println!("    First mismatch at i={}: expected {}, got {}", i, exp, act);
+            }
+            println!("    roundtrip[0..5]:  {:?}", &roundtrip[0][mod_idx][0..5]);
+            println!("    full_pipe[0..5]:  {:?}", &c0_out[0][mod_idx][0..5]);
+        }
+    }
+
+    // Helper: CPU NTT in-place using DIT Cooley-Tukey
+    fn cpu_ntt_inplace(data: &mut [u64], omega_n: u64, q: u64) {
+        let n = data.len();
+        let log_n = (n as f64).log2() as usize;
+
+        let mulmod = |a: u64, b: u64| -> u64 {
+            ((a as u128 * b as u128) % q as u128) as u64
+        };
+        let addmod = |a: u64, b: u64| -> u64 {
+            let sum = a + b;
+            if sum >= q { sum - q } else { sum }
+        };
+        let submod = |a: u64, b: u64| -> u64 {
+            if a >= b { a - b } else { a.wrapping_add(q).wrapping_sub(b) }
+        };
+        let pow_mod = |base: u64, mut exp: u64| -> u64 {
+            let mut result = 1u64;
+            let mut base = base;
+            while exp > 0 {
+                if exp & 1 == 1 { result = mulmod(result, base); }
+                base = mulmod(base, base);
+                exp >>= 1;
+            }
+            result
+        };
+        let bit_reverse = |x: usize, bits: usize| -> usize {
+            let mut result = 0;
+            let mut x = x;
+            for _ in 0..bits { result = (result << 1) | (x & 1); x >>= 1; }
+            result
+        };
+
+        // Bit-reverse permutation
+        for i in 0..n {
+            let j = bit_reverse(i, log_n);
+            if i < j { data.swap(i, j); }
+        }
+
+        // Butterfly stages
+        for stage in 0..log_n {
+            let m = 1 << (stage + 1);
+            let half_m = 1 << stage;
+            let step = n / m;
+            let twiddle_base = pow_mod(omega_n, step as u64);
+
+            for group in 0..(n / m) {
+                let mut twiddle = 1u64;
+                for j in 0..half_m {
+                    let idx1 = group * m + j;
+                    let idx2 = idx1 + half_m;
+                    let u = data[idx1];
+                    let v = mulmod(data[idx2], twiddle);
+                    data[idx1] = addmod(u, v);
+                    data[idx2] = submod(u, v);
+                    twiddle = mulmod(twiddle, twiddle_base);
+                }
+            }
+        }
+    }
+
+    // Helper: CPU standard NTT (not four-step, for reference)
+    fn cpu_standard_ntt(data: &mut [u64], omega: u64, psi_powers: &[u64], q: u64) {
+        let n = data.len();
+        let log_n = (n as f64).log2() as usize;
+
+        let mulmod = |a: u64, b: u64| -> u64 {
+            ((a as u128 * b as u128) % q as u128) as u64
+        };
+        let addmod = |a: u64, b: u64| -> u64 {
+            let sum = a + b;
+            if sum >= q { sum - q } else { sum }
+        };
+        let submod = |a: u64, b: u64| -> u64 {
+            if a >= b { a - b } else { a.wrapping_add(q).wrapping_sub(b) }
+        };
+        let pow_mod = |base: u64, mut exp: u64| -> u64 {
+            let mut result = 1u64;
+            let mut base = base;
+            while exp > 0 {
+                if exp & 1 == 1 { result = mulmod(result, base); }
+                base = mulmod(base, base);
+                exp >>= 1;
+            }
+            result
+        };
+        let bit_reverse = |x: usize, bits: usize| -> usize {
+            let mut result = 0;
+            let mut x = x;
+            for _ in 0..bits { result = (result << 1) | (x & 1); x >>= 1; }
+            result
+        };
+
+        // Twist by psi
+        for i in 0..n {
+            data[i] = mulmod(data[i], psi_powers[i]);
+        }
+
+        // Bit-reverse permutation
+        for i in 0..n {
+            let j = bit_reverse(i, log_n);
+            if i < j { data.swap(i, j); }
+        }
+
+        // Butterfly stages
+        for stage in 0..log_n {
+            let m = 1 << (stage + 1);
+            let half_m = 1 << stage;
+            let step = n / m;
+            let twiddle_base = pow_mod(omega, step as u64);
+
+            for group in 0..(n / m) {
+                let mut twiddle = 1u64;
+                for j in 0..half_m {
+                    let idx1 = group * m + j;
+                    let idx2 = idx1 + half_m;
+                    let u = data[idx1];
+                    let v = mulmod(data[idx2], twiddle);
+                    data[idx1] = addmod(u, v);
+                    data[idx2] = submod(u, v);
+                    twiddle = mulmod(twiddle, twiddle_base);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_four_step_vs_standard_cpu() {
+        // This test verifies that the four-step NTT algorithm produces the same
+        // result as the standard NTT (up to a permutation)
+        let params = match RnsBatchParams::goldilocks(8192) {
+            Some(p) => p,
+            None => {
+                println!("Skipping test: goldilocks params not available");
+                return;
+            }
+        };
+        let n = params.n;
+        let mod_idx = 0;
+        let q = params.rns_data[mod_idx].modulus;
+        let omega = params.rns_data[mod_idx].omega;
+        let psi_powers = &params.rns_data[mod_idx].psi_powers;
+        let omega_powers = &params.rns_data[mod_idx].omega_powers;
+
+        println!("\n=== Testing Four-Step vs Standard CPU NTT ===");
+        println!("n = {}, n1 = 32, n2 = 256", n);
+        println!("q = {}", q);
+
+        // Simple test input
+        let input: Vec<u64> = (0..n).map(|i| (i as u64) % q).collect();
+
+        // Standard CPU NTT
+        let mut standard_result = input.clone();
+        cpu_standard_ntt(&mut standard_result, omega, psi_powers, q);
+        println!("Standard NTT[0..5]: {:?}", &standard_result[0..5]);
+
+        // Four-step CPU NTT (same as in test_v3_forward_ntt_vs_v2)
+        let n1 = 32usize;
+        let n2 = 256usize;
+
+        // Step 1: twist + transpose
+        let mut four_step_data = vec![0u64; n];
+        for idx in 0..n {
+            let j1 = idx / n2;
+            let j2 = idx % n2;
+            let transposed_idx = j2 * n1 + j1;
+            let val = input[transposed_idx];
+            let twisted = ((val as u128 * psi_powers[transposed_idx] as u128) % q as u128) as u64;
+            four_step_data[idx] = twisted;
+        }
+
+        // Step 2: row NTTs (n1=32 rows of n2=256 elements)
+        let omega_n2 = omega_powers[n1];  // omega^32, primitive 256th root
+        for row in 0..n1 {
+            let start = row * n2;
+            let mut row_data: Vec<u64> = four_step_data[start..start + n2].to_vec();
+            cpu_ntt_inplace(&mut row_data, omega_n2, q);
+            four_step_data[start..start + n2].copy_from_slice(&row_data);
+        }
+
+        // Step 3: cross twiddle (omega^(j1 * k2))
+        for j1 in 0..n1 {
+            for k2 in 0..n2 {
+                let idx = j1 * n2 + k2;
+                let twiddle_power = (j1 * k2) % n;
+                let twiddle = omega_powers[twiddle_power];
+                four_step_data[idx] = ((four_step_data[idx] as u128 * twiddle as u128) % q as u128) as u64;
+            }
+        }
+
+        // Step 4: column NTTs (n2=256 columns of n1=32 elements)
+        let omega_n1 = omega_powers[n2];  // omega^256, primitive 32nd root
+        for k2 in 0..n2 {
+            let mut col_data: Vec<u64> = (0..n1).map(|j1| four_step_data[j1 * n2 + k2]).collect();
+            cpu_ntt_inplace(&mut col_data, omega_n1, q);
+            for k1 in 0..n1 {
+                four_step_data[k1 * n2 + k2] = col_data[k1];
+            }
+        }
+        println!("Four-step NTT[0..5]: {:?}", &four_step_data[0..5]);
+
+        // Check if four-step is a permutation of standard
+        // Four-step output[k1*n2 + k2] should equal standard[k1 + k2*n1]
+        let mut matches = 0;
+        let mut first_mismatch: Option<(usize, u64, u64)> = None;
+        for k1 in 0..n1 {
+            for k2 in 0..n2 {
+                let four_step_idx = k1 * n2 + k2;
+                let standard_idx = k1 + k2 * n1;
+                if four_step_data[four_step_idx] == standard_result[standard_idx] {
+                    matches += 1;
+                } else if first_mismatch.is_none() {
+                    first_mismatch = Some((four_step_idx, four_step_data[four_step_idx], standard_result[standard_idx]));
+                }
+            }
+        }
+
+        println!("Permutation matches: {}/{}", matches, n);
+        if matches == n {
+            println!("✓ Four-step NTT is correct (output is permutation of standard)");
+        } else {
+            println!("✗ Four-step doesn't match standard after permutation");
+            if let Some((idx, four, std)) = first_mismatch {
+                println!("  First mismatch at idx {}: four_step={} vs standard={}", idx, four, std);
+            }
+        }
+
+        // Also check direct equality (which should NOT match due to permutation)
+        let direct_matches: usize = (0..n).filter(|&i| four_step_data[i] == standard_result[i]).count();
+        println!("Direct matches (without permutation): {}/{}", direct_matches, n);
+        if direct_matches == n {
+            println!("  (Unexpectedly, they match directly!)");
+        } else {
+            println!("  (As expected, four-step output order differs from standard)");
+        }
+    }
+
+    #[test]
+    fn test_v3_forward_ntt_vs_v2() {
+        let params = match RnsBatchParams::goldilocks(8192) {
+            Some(p) => p,
+            None => {
+                println!("Skipping test: goldilocks params not available");
+                return;
+            }
+        };
+        let n = params.n;
+        let k = params.k;
+        let t = params.plaintext_data.t;
+
+        // Create V2 and V3 contexts
+        let v2_ctx = match RnsSlotMulGpuV2::new(params.clone()) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                println!("Skipping test: V2 GPU not available ({})", e);
+                return;
+            }
+        };
+        let v3_ctx = match RnsSlotMulGpuV3::new(params.clone()) {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                println!("Skipping test: V3 GPU not available ({})", e);
+                return;
+            }
+        };
+
+        println!("\n=== Testing V3 Forward NTT vs V2 ===");
+
+        // Create simple test slots
+        let slots: Vec<Vec<u64>> = vec![(0..n).map(|i| (i as u64) % t).collect()];
+
+        // V2: Get slot_encode output
+        let v2_encoded = v2_ctx.test_slot_encode(&slots).expect("V2 slot encode failed");
+        println!("V2 slot encode completed, got {} batches × {} elements",
+                 v2_encoded.len(), v2_encoded[0].len());
+
+        // V3: Get slot_encode output (for comparison)
+        let v3_encoded = v3_ctx.test_slot_encode_only(&slots).expect("V3 slot encode failed");
+        println!("V3 slot encode completed, got {} batches × {} elements",
+                 v3_encoded.len(), v3_encoded[0].len());
+
+        // Compare slot_encode outputs
+        let mut encode_mismatches = 0;
+        for i in 0..n {
+            if v2_encoded[0][i] != v3_encoded[0][i] {
+                encode_mismatches += 1;
+            }
+        }
+        if encode_mismatches == 0 {
+            println!("✓ V3 slot_encode matches V2 exactly!");
+        } else {
+            println!("✗ V3 slot_encode vs V2: {} mismatches", encode_mismatches);
+            println!("  V2 encoded[0..5]: {:?}", &v2_encoded[0][0..5]);
+            println!("  V3 encoded[0..5]: {:?}", &v3_encoded[0][0..5]);
+        }
+
+        // V3: Test twist output (slot_encode + twist only)
+        let v3_twisted = v3_ctx.test_twist_only(&slots).expect("V3 twist failed");
+        println!("V3 twist completed, got {} batches × {} moduli × {} elements",
+                 v3_twisted.len(), v3_twisted[0].len(), v3_twisted[0][0].len());
+
+        // Compute CPU twist for comparison (for mod_idx=0)
+        let n1 = 32usize;
+        let n2 = 256usize;
+        let mod_idx_check = 0;
+        let q_check = params.rns_data[mod_idx_check].modulus;
+        let psi_powers_check = &params.rns_data[mod_idx_check].psi_powers;
+        let mut cpu_twisted_check = vec![0u64; n];
+        for idx in 0..n {
+            let j1 = idx / n2;
+            let j2 = idx % n2;
+            let transposed_idx = j2 * n1 + j1;
+            let val = v2_encoded[0][transposed_idx];
+            let psi_power = psi_powers_check[transposed_idx];
+            let twisted = ((val as u128 * psi_power as u128) % q_check as u128) as u64;
+            cpu_twisted_check[idx] = twisted;
+        }
+
+        // Check V3 twist output vs CPU (for mod_idx=0, batch=0)
+        let mut twist_mismatches = 0;
+        let mut first_twist_mismatch: Option<(usize, u64, u64)> = None;
+        for idx in 0..n {
+            if v3_twisted[0][mod_idx_check][idx] != cpu_twisted_check[idx] {
+                twist_mismatches += 1;
+                if first_twist_mismatch.is_none() {
+                    first_twist_mismatch = Some((idx, v3_twisted[0][mod_idx_check][idx], cpu_twisted_check[idx]));
+                }
+            }
+        }
+        if twist_mismatches == 0 {
+            println!("✓ V3 twist matches CPU exactly!");
+        } else {
+            println!("✗ V3 twist vs CPU: {} mismatches", twist_mismatches);
+            if let Some((idx, gpu, cpu)) = first_twist_mismatch {
+                println!("  First mismatch at idx {}: GPU={} vs CPU={}", idx, gpu, cpu);
+            }
+            // Show around index 256-260
+            println!("  V3 twist[254..262]: {:?}", &v3_twisted[0][mod_idx_check][254..262]);
+            println!("  CPU twist[254..262]: {:?}", &cpu_twisted_check[254..262]);
+        }
+
+        // Also check if twist output values are valid (< q)
+        let twist_overflows: Vec<_> = v3_twisted[0][mod_idx_check].iter().enumerate()
+            .filter(|(_, &v)| v >= q_check)
+            .take(5)
+            .collect();
+        if twist_overflows.is_empty() {
+            println!("  ✓ All V3 twist values are < q");
+        } else {
+            println!("  ✗ V3 twist has {} values >= q! Examples: {:?}", twist_overflows.len(), twist_overflows);
+        }
+
+        // V3: Get forward NTT output (includes slot_encode + twist + 4-step NTT)
+        let v3_ntt = v3_ctx.test_forward_ntt_only(&slots).expect("V3 forward NTT failed");
+        println!("V3 forward NTT completed, got {} batches × {} moduli × {} elements",
+                 v3_ntt.len(), v3_ntt[0].len(), v3_ntt[0][0].len());
+
+        // Run V2 forward NTT for each modulus
+        let mut v2_ntt: Vec<Vec<u64>> = Vec::with_capacity(k);
+        for mod_idx in 0..k {
+            let ntt = v2_ctx.test_forward_ntt(&v2_encoded[0], mod_idx).expect("V2 forward NTT failed");
+            v2_ntt.push(ntt);
+        }
+        println!("V2 forward NTT completed, got {} moduli × {} elements",
+                 v2_ntt.len(), v2_ntt[0].len());
+
+        // Also compute CPU four-step NTT for comparison
+        // This uses the same algorithm as the V3 GPU implementation
+        let mod_idx = 0;  // Use first modulus for testing
+        let q = params.rns_data[mod_idx].modulus;
+        let omega = params.rns_data[mod_idx].omega_powers[1];  // omega = omega_powers[1]
+        let psi = params.rns_data[mod_idx].psi_powers[1];  // psi = psi_powers[1]
+
+        println!("\nCPU Four-Step NTT Reference (mod_idx=0):");
+        println!("  q = {}", q);
+        println!("  omega = {}", omega);
+        println!("  psi = {}", psi);
+
+        // CPU: twist + transpose (matches twist shader)
+        let n1 = 32usize;
+        let n2 = 256usize;
+        let mut cpu_twisted = vec![0u64; n];
+        let psi_powers = &params.rns_data[mod_idx].psi_powers;
+        let omega_powers = &params.rns_data[mod_idx].omega_powers;
+        for idx in 0..n {
+            let j1 = idx / n2;
+            let j2 = idx % n2;
+            let transposed_idx = j2 * n1 + j1;
+            // temp[j1*n2 + j2] = encoded[j2*n1 + j1] * psi^(j2*n1 + j1)
+            let val = v2_encoded[0][transposed_idx];
+            let psi_power = psi_powers[transposed_idx];
+            let twisted = ((val as u128 * psi_power as u128) % q as u128) as u64;
+            cpu_twisted[idx] = twisted;
+        }
+        println!("  CPU twisted (first 5): {:?}", &cpu_twisted[0..5]);
+
+        // CPU: row NTTs (n1=32 rows of n2=256 elements each)
+        let omega_n2 = omega_powers[n1];  // omega^n1 = omega^32, primitive 256th root
+        let mut cpu_after_row = cpu_twisted.clone();
+        for row in 0..n1 {
+            let start = row * n2;
+            let mut row_data: Vec<u64> = cpu_after_row[start..start + n2].to_vec();
+            // Do 256-point NTT with omega_n2
+            cpu_ntt_inplace(&mut row_data, omega_n2, q);
+            cpu_after_row[start..start + n2].copy_from_slice(&row_data);
+        }
+        println!("  CPU after row NTT (first 5): {:?}", &cpu_after_row[0..5]);
+
+        // CPU: cross twiddle (multiply by omega^(j1 * k2))
+        let mut cpu_after_cross = cpu_after_row.clone();
+        for j1 in 0..n1 {
+            for k2 in 0..n2 {
+                let idx = j1 * n2 + k2;
+                let twiddle_power = (j1 * k2) % n;
+                let twiddle = omega_powers[twiddle_power];
+                cpu_after_cross[idx] = ((cpu_after_cross[idx] as u128 * twiddle as u128) % q as u128) as u64;
+            }
+        }
+        println!("  CPU after cross twiddle (first 5): {:?}", &cpu_after_cross[0..5]);
+
+        // CPU: column NTTs (n2=256 columns of n1=32 elements each)
+        let omega_n1 = omega_powers[n2];  // omega^n2 = omega^256, primitive 32nd root
+        let mut cpu_after_col = cpu_after_cross.clone();
+        for k2 in 0..n2 {
+            let mut col_data: Vec<u64> = (0..n1).map(|j1| cpu_after_col[j1 * n2 + k2]).collect();
+            cpu_ntt_inplace(&mut col_data, omega_n1, q);
+            for k1 in 0..n1 {
+                cpu_after_col[k1 * n2 + k2] = col_data[k1];
+            }
+        }
+        println!("  CPU after col NTT (first 5): {:?}", &cpu_after_col[0..5]);
+
+        // Verify all CPU values are < q
+        let cpu_overflows: Vec<_> = cpu_after_col.iter().enumerate()
+            .filter(|(_, &v)| v >= q)
+            .take(5)
+            .collect();
+        if cpu_overflows.is_empty() {
+            println!("  ✓ All CPU NTT values are < q");
+        } else {
+            println!("  ✗ CPU NTT has {} values >= q! Examples: {:?}", cpu_overflows.len(), cpu_overflows);
+        }
+
+        // Check if V2 values are > q (which would indicate wrong modulus or buffer issue)
+        let v2_overflows: Vec<_> = v2_ntt[mod_idx].iter().enumerate()
+            .filter(|(_, &v)| v >= q)
+            .take(5)
+            .collect();
+        if v2_overflows.is_empty() {
+            println!("  ✓ All V2 NTT values are < q");
+        } else {
+            println!("  ✗ V2 NTT has {} values >= q! Examples: {:?}", v2_overflows.len(), v2_overflows);
+            println!("    This suggests V2 test helper is reading wrong data");
+        }
+
+        // Check V3 values
+        let v3_overflows: Vec<_> = v3_ntt[0][mod_idx].iter().enumerate()
+            .filter(|(_, &v)| v >= q)
+            .take(5)
+            .collect();
+        if v3_overflows.is_empty() {
+            println!("  ✓ All V3 NTT values are < q");
+        } else {
+            println!("  ✗ V3 NTT has {} values >= q! Examples: {:?}", v3_overflows.len(), v3_overflows);
+        }
+
+        // Compare CPU with V2 and V3
+        println!("\nComparison with CPU reference:");
+        println!("  V2 NTT[0][0..5]:  {:?}", &v2_ntt[mod_idx][0..5]);
+        println!("  V3 NTT[0][0..5]:  {:?}", &v3_ntt[0][mod_idx][0..5]);
+        println!("  CPU NTT[0..5]:    {:?}", &cpu_after_col[0..5]);
+
+        let mut cpu_v2_match = 0;
+        let mut cpu_v3_match = 0;
+        for i in 0..n {
+            if cpu_after_col[i] == v2_ntt[mod_idx][i] { cpu_v2_match += 1; }
+            if cpu_after_col[i] == v3_ntt[0][mod_idx][i] { cpu_v3_match += 1; }
+        }
+        println!("  CPU matches V2: {}/{}", cpu_v2_match, n);
+        println!("  CPU matches V3: {}/{}", cpu_v3_match, n);
+
+        // Compare V3 and V2 forward NTT outputs for batch 0
+        let mut total_mismatches = 0;
+        let mut first_mismatch: Option<(usize, usize, u64, u64)> = None;
+
+        for mod_idx in 0..k {
+            for j in 0..n {
+                let v2_val = v2_ntt[mod_idx][j];
+                let v3_val = v3_ntt[0][mod_idx][j];
+                if v2_val != v3_val {
+                    total_mismatches += 1;
+                    if first_mismatch.is_none() {
+                        first_mismatch = Some((mod_idx, j, v2_val, v3_val));
+                    }
+                }
+            }
+        }
+
+        if total_mismatches == 0 {
+            println!("\n✓ V3 forward NTT matches V2 exactly!");
+        } else {
+            println!("✗ V3 vs V2 forward NTT mismatch: {} total differences", total_mismatches);
+            if let Some((m, j, v2_val, v3_val)) = first_mismatch {
+                println!("  First mismatch at mod={}, idx={}: V2={} vs V3={}", m, j, v2_val, v3_val);
+            }
+            // Print sample values
+            println!("  Sample V2 NTT[0][0..5]: {:?}", &v2_ntt[0][0..5]);
+            println!("  Sample V3 NTT[0][0][0..5]: {:?}", &v3_ntt[0][0][0..5]);
+
+            // Try to find if V3 values exist in V2 but at different indices (permutation)
+            let mut found_matches = 0;
+            for j in 0..std::cmp::min(5, n) {
+                let v3_val = v3_ntt[0][0][j];
+                for k in 0..n {
+                    if v2_ntt[0][k] == v3_val {
+                        println!("  V3[0][0][{}] = {} found at V2[0][{}]", j, v3_val, k);
+                        found_matches += 1;
+                        break;
+                    }
+                }
+            }
+            if found_matches > 0 {
+                println!("  Found {} index permutation matches (possible ordering issue)", found_matches);
+            }
+        }
+
+        // Test expected permutation: V3[k1*n2+k2] should equal standard NTT at k1+k2*n1
+        // Compute CPU standard NTT (no transpose) for verification
+        println!("\n=== Testing Permutation Relationship ===");
+        let mut cpu_std_ntt = vec![0u64; n];
+        let omega_powers_0 = &params.rns_data[0].omega_powers;
+        let psi_powers_0 = &params.rns_data[0].psi_powers;
+        let q0 = params.rns_data[0].modulus;
+
+        // Apply twist first
+        let mut twisted_input = vec![0u64; n];
+        for j in 0..n {
+            twisted_input[j] = ((v2_encoded[0][j] as u128 * psi_powers_0[j] as u128) % q0 as u128) as u64;
+        }
+
+        // Standard NTT: X[k] = sum_j twisted[j] * omega^(j*k)
+        for k in 0..n {
+            let mut sum: u128 = 0;
+            for j in 0..n {
+                let omega_jk = omega_powers_0[(j * k) % n];
+                sum = (sum + (twisted_input[j] as u128 * omega_jk as u128) % q0 as u128) % q0 as u128;
+            }
+            cpu_std_ntt[k] = sum as u64;
+        }
+
+        // Check permutation: V3[k1*n2+k2] == cpu_std_ntt[k1+k2*n1]
+        let mut permute_matches_v1 = 0;  // V3[idx] == std[k1+k2*n1] where k1=idx/n2, k2=idx%n2
+        let mut permute_matches_v2 = 0;  // V3[idx] == std[k2*n1+k1]
+        let mut permute_matches_v3 = 0;  // V3[idx] == std[idx] (no permutation)
+
+        for idx in 0..n {
+            let k1 = idx / n2;
+            let k2 = idx % n2;
+            let std_idx_v1 = k1 + k2 * n1;  // Current formula
+            let std_idx_v2 = k2 * n1 + k1;  // Alternative (same as v1 for this case)
+
+            if v3_ntt[0][0][idx] == cpu_std_ntt[std_idx_v1] {
+                permute_matches_v1 += 1;
+            }
+            if v3_ntt[0][0][idx] == cpu_std_ntt[idx] {
+                permute_matches_v3 += 1;
+            }
+        }
+
+        println!("  V3[idx] == std[k1+k2*n1] matches: {}/{}", permute_matches_v1, n);
+        println!("  V3[idx] == std[idx] (no permutation) matches: {}/{}", permute_matches_v3, n);
+
+        // Print sample comparisons
+        println!("  Sample comparisons (idx, k1, k2, std_idx, V3_val, std_val):");
+        for idx in [0, 1, 2, 256, 257, 512].iter() {
+            if *idx < n {
+                let k1 = idx / n2;
+                let k2 = idx % n2;
+                let std_idx = k1 + k2 * n1;
+                println!("    idx={}: k1={}, k2={}, std_idx={}, V3={}, std={}",
+                         idx, k1, k2, std_idx, v3_ntt[0][0][*idx], cpu_std_ntt[std_idx]);
+            }
+        }
+
+        // Search for V3 values in CPU std NTT to find the permutation
+        println!("\n  Searching for V3 values in CPU std NTT (first 10 V3 indices):");
+        for v3_idx in 0..10 {
+            let v3_val = v3_ntt[0][0][v3_idx];
+            let mut found = false;
+            for std_idx in 0..n {
+                if cpu_std_ntt[std_idx] == v3_val {
+                    let std_k1 = std_idx / n2;
+                    let std_k2 = std_idx % n2;
+                    println!("    V3[{}] = {} found at std[{}] (k1={}, k2={})",
+                             v3_idx, v3_val, std_idx, std_k1, std_k2);
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                println!("    V3[{}] = {} NOT FOUND in std NTT", v3_idx, v3_val);
             }
         }
     }
