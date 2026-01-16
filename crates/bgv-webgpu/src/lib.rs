@@ -22,6 +22,7 @@ pub mod slot_mul_gpu;
 pub mod rns_slot_mul;
 pub mod rns_slot_mul_v2;
 pub mod rns_slot_mul_radix4;
+pub mod rns_slot_mul_v3;
 pub mod goldilocks_ntt;
 
 #[cfg(test)]
@@ -36,6 +37,7 @@ pub use slot_mul_gpu::{SlotMulGpuContext, TwiddleFactors};
 pub use rns_slot_mul::{RnsSlotMulGpu, RnsBatchParams, RnsModulusNttData, PlaintextNttData};
 pub use rns_slot_mul_v2::RnsSlotMulGpuV2;
 pub use rns_slot_mul_radix4::RnsSlotMulGpuRadix4;
+pub use rns_slot_mul_v3::RnsSlotMulGpuV3;
 pub use goldilocks_ntt::GoldilocksNttGpu;
 
 // Re-export old rotation types for backwards compatibility
