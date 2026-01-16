@@ -73,12 +73,14 @@ pub struct RnsSlotMulGpuRadix4 {
     slot_encode_pipeline: ComputePipeline,
     forward_ntt_pipeline: ComputePipeline,
     fused_mul_intt_pipeline: ComputePipeline,
+    standard_intt_pipeline: ComputePipeline,  // For polynomial interpolation (standard INTT)
 
     // Parameters
     params: RnsBatchParams,
 
     // Precomputed buffers
-    plaintext_twiddles_buffer: Buffer,
+    plaintext_twiddles_buffer: Buffer,        // zeta_inv_powers for twisted INTT
+    standard_intt_twiddles_buffer: Buffer,    // omega_inv_powers for standard INTT
     plaintext_params_buffer: Buffer,
     all_rns_twiddles_buffer: Buffer,
     all_rns_inv_twiddles_buffer: Buffer,
@@ -279,6 +281,17 @@ impl RnsSlotMulGpuRadix4 {
                 cache: None,
             });
 
+        // Create standard INTT pipeline (same shader as slot_encode, just uses different twiddles)
+        let standard_intt_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("standard_intt_radix4 pipeline"),
+                layout: None,
+                module: &slot_encode_shader,
+                entry_point: Some("slot_encode_batched"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
         // Create plaintext parameter buffer with omega_quarter values
         // For plaintext: zeta is 2n-th root, so omega = zeta^2 is n-th root
         // omega_quarter for forward NTT = omega^(n/4) = zeta^(n/2)
@@ -310,7 +323,7 @@ impl RnsSlotMulGpuRadix4 {
             usage: BufferUsages::UNIFORM,
         });
 
-        // Create plaintext twiddle buffer
+        // Create plaintext twiddle buffer (zeta_inv_powers for twisted INTT / slot encoding)
         let pt_twiddles_flat: Vec<u32> = pt_data
             .zeta_inv_powers
             .iter()
@@ -320,6 +333,19 @@ impl RnsSlotMulGpuRadix4 {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("plaintext_twiddles_radix4"),
                 contents: bytemuck::cast_slice(&pt_twiddles_flat),
+                usage: BufferUsages::STORAGE,
+            });
+
+        // Create standard INTT twiddle buffer (omega_inv_powers for polynomial interpolation)
+        let standard_intt_twiddles_flat: Vec<u32> = pt_data
+            .omega_inv_powers
+            .iter()
+            .flat_map(|&x| [x as u32, (x >> 32) as u32])
+            .collect();
+        let standard_intt_twiddles_buffer =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("standard_intt_twiddles_radix4"),
+                contents: bytemuck::cast_slice(&standard_intt_twiddles_flat),
                 usage: BufferUsages::STORAGE,
             });
 
@@ -547,8 +573,10 @@ impl RnsSlotMulGpuRadix4 {
             slot_encode_pipeline,
             forward_ntt_pipeline,
             fused_mul_intt_pipeline,
+            standard_intt_pipeline,
             params,
             plaintext_twiddles_buffer,
+            standard_intt_twiddles_buffer,
             plaintext_params_buffer,
             all_rns_twiddles_buffer,
             all_rns_inv_twiddles_buffer,
@@ -1162,6 +1190,293 @@ impl RnsSlotMulGpuRadix4 {
         });
         self.device.poll(wgpu::Maintain::Wait);
         rx.recv().map_err(|_| GpuError::MapFailed)?.map_err(|_| GpuError::MapFailed)?;
+
+        let data: Vec<u32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+        let data_u64: &[u64] = bytemuck::cast_slice(&data);
+
+        // Reshape to [num_batches][n]
+        let mut results: Vec<Vec<u64>> = vec![vec![0u64; n]; num_batches];
+        for batch_idx in 0..num_batches {
+            let base = batch_idx * n;
+            results[batch_idx].copy_from_slice(&data_u64[base..base + n]);
+        }
+
+        Ok(results)
+    }
+
+    /// Batched slot encoding (INTT) for Goldilocks field - async version for WASM.
+    ///
+    /// This is the GPU-accelerated inverse NTT that converts slot values to polynomial
+    /// coefficients. Operates on the plaintext modulus t (Goldilocks).
+    ///
+    /// # Arguments
+    /// * `slots` - Vector of slot vectors, each of length n
+    ///
+    /// # Returns
+    /// Vector of coefficient vectors, each of length n (polynomial coefficients mod t)
+    pub async fn slot_encode_batched_async(&self, slots: &[Vec<u64>]) -> Result<Vec<Vec<u64>>, GpuError> {
+        let n = self.params.n;
+        let num_batches = slots.len();
+
+        if num_batches == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Validate input sizes
+        for (i, slot_vec) in slots.iter().enumerate() {
+            if slot_vec.len() != n {
+                return Err(GpuError::InvalidParams(format!(
+                    "Slot vector {} has {} elements, expected {}", i, slot_vec.len(), n
+                )));
+            }
+        }
+
+        // Flatten slots
+        let mut slots_flat: Vec<u64> = vec![0u64; num_batches * n];
+        for (batch_idx, slot_vec) in slots.iter().enumerate() {
+            let base = batch_idx * n;
+            slots_flat[base..base + n].copy_from_slice(slot_vec);
+        }
+
+        // Upload to GPU
+        self.queue.write_buffer(
+            &self.preallocated_slots_buffer,
+            0,
+            bytemuck::cast_slice(&slots_flat),
+        );
+
+        // Update batch params
+        let log_n = (n as u32).trailing_zeros();
+        let batch_params = GpuBatchParams {
+            n: n as u32,
+            log_n,
+            num_batches: num_batches as u32,
+            num_moduli: self.params.k as u32,
+        };
+        self.queue.write_buffer(
+            &self.preallocated_batch_params_buffer,
+            0,
+            bytemuck::bytes_of(&batch_params),
+        );
+
+        // Create slot_encode bind group
+        let slot_encode_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("slot_encode_batched_bind_group_radix4"),
+            layout: &self.slot_encode_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.preallocated_batch_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.preallocated_slots_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.preallocated_encoded_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.plaintext_twiddles_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.plaintext_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Run slot_encode
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("slot_encode_batched_encoder_radix4"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("slot_encode_batched_radix4"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.slot_encode_pipeline);
+            pass.set_bind_group(0, &slot_encode_bind_group, &[]);
+            pass.dispatch_workgroups(num_batches as u32, 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Read back encoded buffer asynchronously
+        let result_size = (num_batches * n * 2 * 4) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("slot_encode_batched_staging_radix4"),
+            size: result_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("slot_encode_batched_copy_radix4"),
+            });
+        encoder.copy_buffer_to_buffer(&self.preallocated_encoded_buffer, 0, &staging, 0, result_size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Async buffer mapping
+        let slice = staging.slice(..);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.await
+            .map_err(|_| GpuError::MapFailed)?
+            .map_err(|_| GpuError::MapFailed)?;
+
+        let data: Vec<u32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
+        let data_u64: &[u64] = bytemuck::cast_slice(&data);
+
+        // Reshape to [num_batches][n]
+        let mut results: Vec<Vec<u64>> = vec![vec![0u64; n]; num_batches];
+        for batch_idx in 0..num_batches {
+            let base = batch_idx * n;
+            results[batch_idx].copy_from_slice(&data_u64[base..base + n]);
+        }
+
+        Ok(results)
+    }
+
+    /// Batched standard INTT for Goldilocks field - async version for WASM.
+    ///
+    /// This is the GPU-accelerated standard inverse NTT for polynomial interpolation.
+    /// Unlike `slot_encode_batched_async` which uses twisted INTT (for slot encoding),
+    /// this uses standard INTT (for interpolation at n-th roots of unity).
+    ///
+    /// # Arguments
+    /// * `evals` - Vector of evaluation vectors, each of length n (values at ω^0, ω^1, ..., ω^{n-1})
+    ///
+    /// # Returns
+    /// Vector of coefficient vectors, each of length n (polynomial coefficients mod t)
+    pub async fn standard_intt_batched_async(&self, evals: &[Vec<u64>]) -> Result<Vec<Vec<u64>>, GpuError> {
+        let n = self.params.n;
+        let num_batches = evals.len();
+
+        if num_batches == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Validate input sizes
+        for (i, eval_vec) in evals.iter().enumerate() {
+            if eval_vec.len() != n {
+                return Err(GpuError::InvalidParams(format!(
+                    "Eval vector {} has {} elements, expected {}", i, eval_vec.len(), n
+                )));
+            }
+        }
+
+        // Flatten evals
+        let mut evals_flat: Vec<u64> = vec![0u64; num_batches * n];
+        for (batch_idx, eval_vec) in evals.iter().enumerate() {
+            let base = batch_idx * n;
+            evals_flat[base..base + n].copy_from_slice(eval_vec);
+        }
+
+        // Upload to GPU
+        self.queue.write_buffer(
+            &self.preallocated_slots_buffer,
+            0,
+            bytemuck::cast_slice(&evals_flat),
+        );
+
+        // Update batch params
+        let log_n = (n as u32).trailing_zeros();
+        let batch_params = GpuBatchParams {
+            n: n as u32,
+            log_n,
+            num_batches: num_batches as u32,
+            num_moduli: self.params.k as u32,
+        };
+        self.queue.write_buffer(
+            &self.preallocated_batch_params_buffer,
+            0,
+            bytemuck::bytes_of(&batch_params),
+        );
+
+        // Create bind group using standard_intt_twiddles_buffer (omega_inv_powers)
+        let standard_intt_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("standard_intt_batched_bind_group_radix4"),
+            layout: &self.standard_intt_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.preallocated_batch_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.preallocated_slots_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.preallocated_encoded_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.standard_intt_twiddles_buffer.as_entire_binding(), // omega_inv_powers
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.plaintext_params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // Run standard INTT
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("standard_intt_batched_encoder_radix4"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("standard_intt_batched_radix4"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.standard_intt_pipeline);
+            pass.set_bind_group(0, &standard_intt_bind_group, &[]);
+            pass.dispatch_workgroups(num_batches as u32, 1, 1);
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Read back encoded buffer asynchronously
+        let result_size = (num_batches * n * 2 * 4) as u64;
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("standard_intt_batched_staging_radix4"),
+            size: result_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("standard_intt_batched_copy_radix4"),
+            });
+        encoder.copy_buffer_to_buffer(&self.preallocated_encoded_buffer, 0, &staging, 0, result_size);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Async buffer mapping
+        let slice = staging.slice(..);
+        let (tx, rx) = futures::channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.await
+            .map_err(|_| GpuError::MapFailed)?
+            .map_err(|_| GpuError::MapFailed)?;
 
         let data: Vec<u32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
         let data_u64: &[u64] = bytemuck::cast_slice(&data);

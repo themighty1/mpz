@@ -684,6 +684,8 @@ pub struct JVProver {
     timing_commit_ntt_extract_ms: f64,
     /// Commit phase breakdown: CT collapse time
     timing_commit_collapse_ms: f64,
+    /// Commit phase breakdown: Input MAC computation time
+    timing_input_mac_ms: f64,
 }
 
 /// Protocol phases for the optimized prover.
@@ -771,6 +773,7 @@ impl JVProver {
             timing_commit_reshape_ms: 0.0,
             timing_commit_ntt_extract_ms: 0.0,
             timing_commit_collapse_ms: 0.0,
+            timing_input_mac_ms: 0.0,
         }
     }
 
@@ -804,8 +807,8 @@ impl JVProver {
     /// Fields: (intt, collapse, poly_div, open, mk_poly, itpac, packing, setup, disclose,
     ///          commit_soldering, lpzk_accumulation, reveal_soldering, mk_binary, mk_sum,
     ///          open_polynomial, mk_commit_vole, mk_commit_packing,
-    ///          commit_gpu, commit_reshape, commit_ntt_extract, commit_collapse)
-    pub fn timing_breakdown(&self) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
+    ///          commit_gpu, commit_reshape, commit_ntt_extract, commit_collapse, input_mac)
+    pub fn timing_breakdown(&self) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
         (
             self.timing_intt_ms,
             self.timing_collapse_ms,
@@ -828,6 +831,7 @@ impl JVProver {
             self.timing_commit_reshape_ms,
             self.timing_commit_ntt_extract_ms,
             self.timing_commit_collapse_ms,
+            self.timing_input_mac_ms,
         )
     }
 
@@ -1405,12 +1409,6 @@ impl JVProver {
         self.packed_powers_chunks = setup_msg.packed_powers_chunks.clone();
         self.rns_public_key = setup_msg.rns_public_key.clone();
 
-        let intt_start = profile_start!();
-        if self.modulus == GOLDILOCKS {
-            self.intt_context = Some(InttContext::new(eval_points.len()));
-        }
-        profile_end!(intt_start, "[commit] INTT context: {:?}");
-
         let witness_len = self.witnesses[0].len();
         self.wire_polynomials = Vec::with_capacity(witness_len);
         self.itpac_commitments = Vec::with_capacity(witness_len);
@@ -1420,10 +1418,68 @@ impl JVProver {
         #[cfg(target_arch = "wasm32")]
         let intt_timing_start = web_sys::window().unwrap().performance().unwrap().now();
 
-        for pos in 0..witness_len {
-            let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
-            let poly = self.interpolate_values(&values, eval_points);
-            self.wire_polynomials.push(poly);
+        // GPU-accelerated polynomial interpolation for Goldilocks field
+        if self.modulus == GOLDILOCKS {
+            let interp_size = eval_points.len();
+
+            // GPU NTT shader requires minimum size of 512
+            // Fall back to CPU for smaller sizes
+            if interp_size >= 512 {
+                // Create GPU context for interpolation INTTs
+                match GoldilocksNttGpu::new_async(interp_size).await {
+                    Ok(interp_gpu) => {
+                        // Collect all witness value vectors and pad to interp_size
+                        let mut all_evals: Vec<Vec<u64>> = Vec::with_capacity(witness_len);
+                        for pos in 0..witness_len {
+                            let mut values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
+                            values.resize(interp_size, 0); // Pad with zeros
+                            all_evals.push(values);
+                        }
+
+                        // GPU-batched inverse NTT
+                        match interp_gpu.batched_inverse_ntt_async(&all_evals).await {
+                            Ok(polys) => {
+                                self.wire_polynomials = polys;
+                            }
+                            Err(e) => {
+                                eprintln!("[commit_gpu] GPU interpolation INTT failed: {}, falling back to CPU", e);
+                                // Fallback to CPU
+                                self.intt_context = Some(InttContext::new(interp_size));
+                                for pos in 0..witness_len {
+                                    let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
+                                    let poly = self.interpolate_values(&values, eval_points);
+                                    self.wire_polynomials.push(poly);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[commit_gpu] GPU interpolation context failed: {}, falling back to CPU", e);
+                        // Fallback to CPU
+                        self.intt_context = Some(InttContext::new(interp_size));
+                        for pos in 0..witness_len {
+                            let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
+                            let poly = self.interpolate_values(&values, eval_points);
+                            self.wire_polynomials.push(poly);
+                        }
+                    }
+                }
+            } else {
+                // Small size (< 512): use CPU INTT
+                self.intt_context = Some(InttContext::new(interp_size));
+                for pos in 0..witness_len {
+                    let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
+                    let poly = self.interpolate_values(&values, eval_points);
+                    self.wire_polynomials.push(poly);
+                }
+            }
+        } else {
+            // Non-Goldilocks: use Lagrange interpolation (CPU)
+            for pos in 0..witness_len {
+                let values: Vec<u64> = self.witnesses.iter().map(|w| w.get(pos)).collect();
+                let poly = self.interpolate_values(&values, eval_points);
+                self.wire_polynomials.push(poly);
+            }
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -1514,6 +1570,9 @@ impl JVProver {
 
         // Step 9 from paper: Commit to input polynomial coefficients as IT-MACs
         let input_mac_start = profile_start!();
+        #[cfg(target_arch = "wasm32")]
+        let input_mac_timing_start = web_sys::window().unwrap().performance().unwrap().now();
+
         self.input_coeff_macs = Vec::with_capacity(self.num_inputs);
 
         for input_idx in 0..self.num_inputs {
@@ -1527,6 +1586,11 @@ impl JVProver {
             }
 
             self.input_coeff_macs.push(coeff_macs);
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_input_mac_ms += web_sys::window().unwrap().performance().unwrap().now() - input_mac_timing_start;
         }
         profile_end!(input_mac_start, "[commit] input MACs ({} inputs): {:?}", self.num_inputs);
 
@@ -1841,6 +1905,60 @@ impl JVProver {
         let slot_encoder = SlotEncoder::new_direct(bgv_params.n, t)
             .expect("slot encoder should work for blinding");
 
+        // Pre-compute blinder coefficients for chunk 0 using batched GPU slot encoding (INTT)
+        // This moves ~240 INTTs from CPU to GPU, saving ~2+ seconds
+        #[cfg(target_arch = "wasm32")]
+        let blinding_precompute_start = web_sys::window().unwrap().performance().unwrap().now();
+
+        let moduli = rns_params.moduli();
+        let blinder_coeffs: Option<Vec<Vec<u64>>> = if num_chunks > 0 {
+            // Pre-generate all blinder slot values for chunk 0
+            let all_blinder_slots: Vec<Vec<u64>> = (0..num_polys)
+                .map(|poly_idx| {
+                    let vole_blinder = vole_blinders[poly_idx];
+                    let mut rng = Prg::from_seed(Block::from([(poly_idx + seed_offset) as u8; 16]));
+
+                    let mut blinders = Vec::with_capacity(slot_count);
+                    let mut sum: u128 = 0;
+                    for _ in 0..slot_count - 1 {
+                        let r: u64 = rng.random::<u64>() % t;
+                        blinders.push(r);
+                        sum = (sum + r as u128) % t as u128;
+                    }
+                    let r_last = ((vole_blinder as u128 + t as u128 - sum) % t as u128) as u64;
+                    blinders.push(r_last);
+                    blinders
+                })
+                .collect();
+
+            // Use GPU slot_encode (radix-4 INTT) which already does twisted INTT
+            #[cfg(target_arch = "wasm32")]
+            wasm_log!("[IT-PAC] Using GPU batched slot_encode for {} blinder polynomials...", num_polys);
+
+            match gpu_ctx.slot_encode_batched_async(&all_blinder_slots).await {
+                Ok(coeffs) => {
+                    // slot_encode uses zeta_inv_powers twiddles, so it already produces
+                    // correct twisted INTT coefficients - no post-untwist needed
+                    Some(coeffs)
+                }
+                Err(e) => {
+                    #[cfg(target_arch = "wasm32")]
+                    wasm_log!("[IT-PAC] GPU slot_encode failed: {:?}, falling back to CPU", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let precompute_time = web_sys::window().unwrap().performance().unwrap().now() - blinding_precompute_start;
+            // Track GPU blinder precompute time in accumulated_gpu_time_ms
+            accumulated_gpu_time_ms += precompute_time;
+            wasm_log!("[IT-PAC] Blinder precompute time: {:.2}ms (GPU INTT: {})", precompute_time, blinder_coeffs.is_some());
+        }
+
         #[cfg(target_arch = "wasm32")]
         wasm_log!("[IT-PAC] Starting GPU slot multiplication for {} chunks (max {} chunks per GPU call)...", num_chunks, max_chunks_per_call);
 
@@ -1979,21 +2097,47 @@ impl JVProver {
 
                     // Apply blinding for chunk 0
                     let ct = if global_chunk_idx == 0 {
-                        let vole_blinder = vole_blinders[poly_idx];
-                        let mut rng = Prg::from_seed(Block::from([(poly_idx + seed_offset) as u8; 16]));
+                        if let Some(ref precomputed_coeffs) = blinder_coeffs {
+                            // Fast path: use pre-computed GPU INTT coefficients
+                            // Apply scale + subtract directly to c0 residues
+                            let coeffs = &precomputed_coeffs[poly_idx];
+                            let mut new_c0 = group_c0_results[batch_idx].clone();
 
-                        // Generate blinders: r_0..r_{n-2} random, r_{n-1} = vole_u - sum
-                        let mut blinders = Vec::with_capacity(slot_count);
-                        let mut sum: u128 = 0;
-                        for _ in 0..slot_count - 1 {
-                            let r: u64 = rng.random::<u64>() % t;
-                            blinders.push(r);
-                            sum = (sum + r as u128) % t as u128;
+                            for (mod_idx, &q_i) in moduli.iter().enumerate() {
+                                let delta_i = q_i / t;
+                                for (coeff_idx, &c) in coeffs.iter().enumerate() {
+                                    // scaled = (c % t) * delta_i mod q_i
+                                    let c_mod_t = c % t;
+                                    let scaled = ((c_mod_t as u128 * delta_i as u128) % q_i as u128) as u64;
+                                    // c0 = c0 - scaled mod q_i
+                                    let old = new_c0[mod_idx][coeff_idx];
+                                    new_c0[mod_idx][coeff_idx] = ((old as u128 + q_i as u128 - scaled as u128) % q_i as u128) as u64;
+                                }
+                            }
+
+                            RnsCiphertext::from_residues(
+                                new_c0,
+                                group_c1_results[batch_idx].clone(),
+                                rns_params.clone(),
+                                bgv_params.clone(),
+                            )
+                        } else {
+                            // Fallback: CPU INTT (original path)
+                            let vole_blinder = vole_blinders[poly_idx];
+                            let mut rng = Prg::from_seed(Block::from([(poly_idx + seed_offset) as u8; 16]));
+
+                            let mut blinders = Vec::with_capacity(slot_count);
+                            let mut sum: u128 = 0;
+                            for _ in 0..slot_count - 1 {
+                                let r: u64 = rng.random::<u64>() % t;
+                                blinders.push(r);
+                                sum = (sum + r as u128) % t as u128;
+                            }
+                            let r_last = ((vole_blinder as u128 + t as u128 - sum) % t as u128) as u64;
+                            blinders.push(r_last);
+
+                            ct.sub_plaintext_slots_with_encoder(&blinders, &slot_encoder)
                         }
-                        let r_last = ((vole_blinder as u128 + t as u128 - sum) % t as u128) as u64;
-                        blinders.push(r_last);
-
-                        ct.sub_plaintext_slots_with_encoder(&blinders, &slot_encoder)
                     } else {
                         ct
                     };

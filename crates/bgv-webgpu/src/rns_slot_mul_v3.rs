@@ -1868,80 +1868,15 @@ impl RnsSlotMulGpuV3 {
             let _ = tx1.send(result);
         });
 
-        #[cfg(target_arch = "wasm32")]
-        web_sys::console::log_1(&"[V3] Awaiting buffer maps...".into());
+        // Wait for buffer maps - same pattern as Radix4
+        self.device.poll(wgpu::Maintain::Wait);
 
-        // In WASM, we need to poll the device and yield to event loop repeatedly
-        #[cfg(target_arch = "wasm32")]
-        {
-            use std::pin::Pin;
-            use std::task::{Context, Poll};
-            use futures::Future;
-            use wasm_bindgen::prelude::*;
-            use wasm_bindgen_futures::JsFuture;
-
-            // Helper to yield to event loop
-            async fn yield_now() {
-                let promise = js_sys::Promise::resolve(&JsValue::undefined());
-                let _ = JsFuture::from(promise).await;
-            }
-
-            let mut rx0 = rx0;
-            let mut rx1 = rx1;
-            let mut poll_count = 0u32;
-
-            // Poll rx0 until ready
-            loop {
-                self.device.poll(wgpu::Maintain::Poll);
-                poll_count += 1;
-                if poll_count % 100 == 0 {
-                    web_sys::console::log_1(&format!("[V3] Poll iteration {}", poll_count).into());
-                }
-                let waker = futures::task::noop_waker();
-                let mut cx = Context::from_waker(&waker);
-                match Pin::new(&mut rx0).poll(&mut cx) {
-                    Poll::Ready(result) => {
-                        web_sys::console::log_1(&format!("[V3] C0 ready after {} polls", poll_count).into());
-                        result.map_err(|_| GpuError::MapFailed)?
-                            .map_err(|_| GpuError::MapFailed)?;
-                        break;
-                    }
-                    Poll::Pending => {
-                        // Yield to event loop
-                        yield_now().await;
-                    }
-                }
-            }
-            web_sys::console::log_1(&"[V3] C0 map complete".into());
-
-            // Poll rx1 until ready
-            loop {
-                self.device.poll(wgpu::Maintain::Poll);
-                let waker = futures::task::noop_waker();
-                let mut cx = Context::from_waker(&waker);
-                match Pin::new(&mut rx1).poll(&mut cx) {
-                    Poll::Ready(result) => {
-                        result.map_err(|_| GpuError::MapFailed)?
-                            .map_err(|_| GpuError::MapFailed)?;
-                        break;
-                    }
-                    Poll::Pending => {
-                        yield_now().await;
-                    }
-                }
-            }
-        }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.device.poll(wgpu::Maintain::Wait);
-            rx0.await
-                .map_err(|_| GpuError::MapFailed)?
-                .map_err(|_| GpuError::MapFailed)?;
-            rx1.await
-                .map_err(|_| GpuError::MapFailed)?
-                .map_err(|_| GpuError::MapFailed)?;
-        }
+        rx0.await
+            .map_err(|_| GpuError::MapFailed)?
+            .map_err(|_| GpuError::MapFailed)?;
+        rx1.await
+            .map_err(|_| GpuError::MapFailed)?
+            .map_err(|_| GpuError::MapFailed)?;
 
         let c0_data: Vec<u32> = bytemuck::cast_slice(&c0_slice.get_mapped_range()).to_vec();
         let c1_data: Vec<u32> = bytemuck::cast_slice(&c1_slice.get_mapped_range()).to_vec();

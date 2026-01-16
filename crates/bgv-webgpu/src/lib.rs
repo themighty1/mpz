@@ -24,6 +24,7 @@ pub mod rns_slot_mul_v2;
 pub mod rns_slot_mul_radix4;
 pub mod rns_slot_mul_v3;
 pub mod goldilocks_ntt;
+// pub mod gpu_blinding;  // TODO: Fix Device/Queue cloning issues
 
 #[cfg(test)]
 mod recmo_test;

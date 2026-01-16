@@ -90,8 +90,12 @@ pub struct PlaintextNttData {
     pub n_inv: u64,
     /// Barrett mu for t.
     pub mu: u128,
-    /// Inverse twiddle factors for INTT (slot encoding).
+    /// Inverse twiddle factors for twisted INTT (slot encoding).
+    /// zeta_inv_powers[i] = zeta_inv^i for i = 0..n
     pub zeta_inv_powers: Vec<u64>,
+    /// Inverse twiddle factors for standard INTT (polynomial interpolation).
+    /// omega_inv_powers[i] = omega_inv^i = (zeta^2)^{-i} for i = 0..n
+    pub omega_inv_powers: Vec<u64>,
 }
 
 impl PlaintextNttData {
@@ -108,8 +112,15 @@ impl PlaintextNttData {
         let n_inv = mod_inverse(n as u64, t);
         let mu = (1u128 << 127) / (t as u128) * 2;
 
-        // Compute inverse powers for INTT
+        // Compute inverse powers for twisted INTT (slot encoding)
+        // zeta_inv_powers[i] = zeta_inv^i
         let zeta_inv_powers = compute_powers(zeta_inv, n, t);
+
+        // Compute inverse powers for standard INTT (polynomial interpolation)
+        // omega = zeta^2 (n-th root of unity)
+        // omega_inv = zeta_inv^2
+        let omega_inv = mod_mul(zeta_inv, zeta_inv, t);
+        let omega_inv_powers = compute_powers(omega_inv, n, t);
 
         Some(Self {
             t,
@@ -118,6 +129,7 @@ impl PlaintextNttData {
             n_inv,
             mu,
             zeta_inv_powers,
+            omega_inv_powers,
         })
     }
 }

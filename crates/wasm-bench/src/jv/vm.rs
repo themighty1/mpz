@@ -341,6 +341,7 @@ pub struct TimingBreakdown {
     pub commit_reshape_ms: f64,
     pub commit_ntt_extract_ms: f64,
     pub commit_collapse_ms: f64,
+    pub input_mac_ms: f64,
     // Benchmark-level timing (total call time, includes internal timing)
     pub vole_pool_ms: f64,
     pub prover_new_ms: f64,
@@ -358,7 +359,7 @@ pub struct TimingBreakdown {
 
 #[cfg(target_arch = "wasm32")]
 impl TimingBreakdown {
-    fn from_prover_timing(t: (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)) -> Self {
+    fn from_prover_timing(t: (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)) -> Self {
         Self {
             intt_ms: t.0,
             collapse_ms: t.1,
@@ -381,6 +382,7 @@ impl TimingBreakdown {
             commit_reshape_ms: t.18,
             commit_ntt_extract_ms: t.19,
             commit_collapse_ms: t.20,
+            input_mac_ms: t.21,
             ..Default::default()
         }
     }
@@ -439,21 +441,32 @@ impl TimingBreakdown {
         print_row("Loop/other overhead", overhead_ms);
         web_sys::console::log_1(&"╠═════════════════════════════════════╧═══════════════╧═════════╧══════════════╣".into());
 
-        // COMMIT PHASE CPU/GPU BREAKDOWN
-        web_sys::console::log_1(&"║                     COMMIT PHASE BREAKDOWN (CPU vs GPU)                      ║".into());
+        // COMMIT PHASE BREAKDOWN - ALL COMPONENTS
+        web_sys::console::log_1(&"║                     COMMIT PHASE BREAKDOWN (ALL COMPONENTS)                  ║".into());
         web_sys::console::log_1(&"╠═════════════════════════════════════╤═══════════════╤═════════╤══════════════╣".into());
         web_sys::console::log_1(&"║ Operation                           │    Total (ms) │      %  │   Avg (ms)   ║".into());
         web_sys::console::log_1(&"╟─────────────────────────────────────┼───────────────┼─────────┼──────────────╢".into());
 
-        print_row("  GPU: Slot multiplication", self.commit_gpu_ms);
-        print_row("  CPU: Reshape/blinding", self.commit_reshape_ms);
-        print_row("  CPU: NTT extraction", self.commit_ntt_extract_ms);
-        print_row("  CPU: CT collapse", self.commit_collapse_ms);
+        // All commit phase components in order of execution
+        print_row("  1. INTT (poly interpolation)", self.intt_ms);
+        print_row("  2. IT-PAC creation", self.itpac_ms);
+        print_row("  3. GPU: Slot multiplication", self.commit_gpu_ms);
+        print_row("     - CPU: Reshape/blinding", self.commit_reshape_ms);
+        print_row("     - CPU: NTT extraction", self.commit_ntt_extract_ms);
+        print_row("     - CPU: CT collapse", self.commit_collapse_ms);
+        print_row("  4. 2-way packing", self.packing_ms);
+        print_row("  5. Input MAC computation", self.input_mac_ms);
 
-        // Calculate commit overhead (total commit time - tracked time)
-        let commit_tracked = self.commit_gpu_ms + self.commit_reshape_ms + self.commit_ntt_extract_ms + self.commit_collapse_ms;
+        // Calculate commit overhead (total commit time - all tracked components)
+        let commit_tracked = self.intt_ms + self.itpac_ms +
+                            self.commit_gpu_ms + self.commit_reshape_ms +
+                            self.commit_ntt_extract_ms + self.commit_collapse_ms +
+                            self.packing_ms + self.input_mac_ms;
         let commit_overhead = self.commit_ms - commit_tracked;
         print_row("  Untracked/overhead", commit_overhead);
+
+        web_sys::console::log_1(&"╟─────────────────────────────────────┼───────────────┼─────────┼──────────────╢".into());
+        print_row("  TOTAL commit_ms", self.commit_ms);
 
         web_sys::console::log_1(&"╠═════════════════════════════════════╧═══════════════╧═════════╧══════════════╣".into());
 
@@ -753,6 +766,7 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
                 total_timing.commit_reshape_ms += timing.commit_reshape_ms;
                 total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
                 total_timing.commit_collapse_ms += timing.commit_collapse_ms;
+                total_timing.input_mac_ms += timing.input_mac_ms;
                 // Benchmark-level timing (total call times)
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
@@ -916,6 +930,7 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
                 total_timing.commit_reshape_ms += timing.commit_reshape_ms;
                 total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
                 total_timing.commit_collapse_ms += timing.commit_collapse_ms;
+                total_timing.input_mac_ms += timing.input_mac_ms;
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
                 total_timing.prover_setup_ms += timing.prover_setup_ms;
@@ -1075,6 +1090,7 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
                 total_timing.commit_reshape_ms += timing.commit_reshape_ms;
                 total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
                 total_timing.commit_collapse_ms += timing.commit_collapse_ms;
+                total_timing.input_mac_ms += timing.input_mac_ms;
                 // Benchmark-level timing (total call times)
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
@@ -1214,6 +1230,7 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
                 total_timing.commit_reshape_ms += timing.commit_reshape_ms;
                 total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
                 total_timing.commit_collapse_ms += timing.commit_collapse_ms;
+                total_timing.input_mac_ms += timing.input_mac_ms;
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
                 total_timing.prover_setup_ms += timing.prover_setup_ms;
