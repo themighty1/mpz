@@ -342,6 +342,8 @@ pub struct TimingBreakdown {
     pub commit_ntt_extract_ms: f64,
     pub commit_collapse_ms: f64,
     pub input_mac_ms: f64,
+    pub vanish_poly_ms: f64,
+    pub setup_data_ms: f64,
     // Benchmark-level timing (total call time, includes internal timing)
     pub vole_pool_ms: f64,
     pub prover_new_ms: f64,
@@ -359,7 +361,7 @@ pub struct TimingBreakdown {
 
 #[cfg(target_arch = "wasm32")]
 impl TimingBreakdown {
-    fn from_prover_timing(t: (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)) -> Self {
+    fn from_prover_timing(t: (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64)) -> Self {
         Self {
             intt_ms: t.0,
             collapse_ms: t.1,
@@ -383,6 +385,8 @@ impl TimingBreakdown {
             commit_ntt_extract_ms: t.19,
             commit_collapse_ms: t.20,
             input_mac_ms: t.21,
+            vanish_poly_ms: t.22,
+            setup_data_ms: t.23,
             ..Default::default()
         }
     }
@@ -448,6 +452,8 @@ impl TimingBreakdown {
         web_sys::console::log_1(&"╟─────────────────────────────────────┼───────────────┼─────────┼──────────────╢".into());
 
         // All commit phase components in order of execution
+        print_row("  0. Vanishing poly computation", self.vanish_poly_ms);
+        print_row("  0. Setup data cloning", self.setup_data_ms);
         print_row("  1. INTT (poly interpolation)", self.intt_ms);
         print_row("  2. IT-PAC creation", self.itpac_ms);
         print_row("  3. GPU: Slot multiplication", self.commit_gpu_ms);
@@ -458,7 +464,8 @@ impl TimingBreakdown {
         print_row("  5. Input MAC computation", self.input_mac_ms);
 
         // Calculate commit overhead (total commit time - all tracked components)
-        let commit_tracked = self.intt_ms + self.itpac_ms +
+        let commit_tracked = self.vanish_poly_ms + self.setup_data_ms +
+                            self.intt_ms + self.itpac_ms +
                             self.commit_gpu_ms + self.commit_reshape_ms +
                             self.commit_ntt_extract_ms + self.commit_collapse_ms +
                             self.packing_ms + self.input_mac_ms;
@@ -767,6 +774,8 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
                 total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
                 total_timing.commit_collapse_ms += timing.commit_collapse_ms;
                 total_timing.input_mac_ms += timing.input_mac_ms;
+                total_timing.vanish_poly_ms += timing.vanish_poly_ms;
+                total_timing.setup_data_ms += timing.setup_data_ms;
                 // Benchmark-level timing (total call times)
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
@@ -931,6 +940,8 @@ async fn run_vm_bench_async(n: u32, reps: usize) -> Result<BenchResult, String> 
                 total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
                 total_timing.commit_collapse_ms += timing.commit_collapse_ms;
                 total_timing.input_mac_ms += timing.input_mac_ms;
+                total_timing.vanish_poly_ms += timing.vanish_poly_ms;
+                total_timing.setup_data_ms += timing.setup_data_ms;
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
                 total_timing.prover_setup_ms += timing.prover_setup_ms;
@@ -1091,6 +1102,8 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
                 total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
                 total_timing.commit_collapse_ms += timing.commit_collapse_ms;
                 total_timing.input_mac_ms += timing.input_mac_ms;
+                total_timing.vanish_poly_ms += timing.vanish_poly_ms;
+                total_timing.setup_data_ms += timing.setup_data_ms;
                 // Benchmark-level timing (total call times)
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
@@ -1231,6 +1244,8 @@ async fn run_vm_bench_async_main_thread(n: u32, reps: usize) -> Result<BenchResu
                 total_timing.commit_ntt_extract_ms += timing.commit_ntt_extract_ms;
                 total_timing.commit_collapse_ms += timing.commit_collapse_ms;
                 total_timing.input_mac_ms += timing.input_mac_ms;
+                total_timing.vanish_poly_ms += timing.vanish_poly_ms;
+                total_timing.setup_data_ms += timing.setup_data_ms;
                 total_timing.vole_pool_ms += timing.vole_pool_ms;
                 total_timing.prover_new_ms += timing.prover_new_ms;
                 total_timing.prover_setup_ms += timing.prover_setup_ms;

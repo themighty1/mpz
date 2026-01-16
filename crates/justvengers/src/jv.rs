@@ -686,6 +686,10 @@ pub struct JVProver {
     timing_commit_collapse_ms: f64,
     /// Commit phase breakdown: Input MAC computation time
     timing_input_mac_ms: f64,
+    /// Commit phase breakdown: Vanishing polynomial computation time
+    timing_vanish_poly_ms: f64,
+    /// Commit phase breakdown: Setup data cloning time
+    timing_setup_data_ms: f64,
 }
 
 /// Protocol phases for the optimized prover.
@@ -774,6 +778,8 @@ impl JVProver {
             timing_commit_ntt_extract_ms: 0.0,
             timing_commit_collapse_ms: 0.0,
             timing_input_mac_ms: 0.0,
+            timing_vanish_poly_ms: 0.0,
+            timing_setup_data_ms: 0.0,
         }
     }
 
@@ -807,8 +813,9 @@ impl JVProver {
     /// Fields: (intt, collapse, poly_div, open, mk_poly, itpac, packing, setup, disclose,
     ///          commit_soldering, lpzk_accumulation, reveal_soldering, mk_binary, mk_sum,
     ///          open_polynomial, mk_commit_vole, mk_commit_packing,
-    ///          commit_gpu, commit_reshape, commit_ntt_extract, commit_collapse, input_mac)
-    pub fn timing_breakdown(&self) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
+    ///          commit_gpu, commit_reshape, commit_ntt_extract, commit_collapse, input_mac,
+    ///          vanish_poly, setup_data)
+    pub fn timing_breakdown(&self) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
         (
             self.timing_intt_ms,
             self.timing_collapse_ms,
@@ -832,6 +839,8 @@ impl JVProver {
             self.timing_commit_ntt_extract_ms,
             self.timing_commit_collapse_ms,
             self.timing_input_mac_ms,
+            self.timing_vanish_poly_ms,
+            self.timing_setup_data_ms,
         )
     }
 
@@ -1395,19 +1404,36 @@ impl JVProver {
         }
 
         self.eval_points = Some(eval_points.to_vec());
-        // Compute and cache vanishing polynomials (same as non-async version)
+
+        // Compute and cache vanishing polynomials
+        #[cfg(target_arch = "wasm32")]
+        let vanish_timing_start = web_sys::window().unwrap().performance().unwrap().now();
         let vanish_start = profile_start!();
+
         self.vanishing_poly = Some(compute_vanishing_poly(eval_points, self.modulus));
         let actual_eval_points = &eval_points[..self.r.min(eval_points.len())];
         self.vanishing_poly_r = Some(compute_vanishing_poly(actual_eval_points, self.modulus));
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_vanish_poly_ms += web_sys::window().unwrap().performance().unwrap().now() - vanish_timing_start;
+        }
         profile_end!(vanish_start, "[commit] vanishing_polys ({} and {} points): {:?}", eval_points.len(), actual_eval_points.len());
+
+        // Clone setup data
+        #[cfg(target_arch = "wasm32")]
+        let setup_data_timing_start = web_sys::window().unwrap().performance().unwrap().now();
 
         self.vole_pool = Some(vole_pool);
         self.ahe_seed_commitment = Some(setup_msg.ahe_seed_commitment);
         self.ahe_public_key = Some(setup_msg.ahe_public_key.clone());
-
         self.packed_powers_chunks = setup_msg.packed_powers_chunks.clone();
         self.rns_public_key = setup_msg.rns_public_key.clone();
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.timing_setup_data_ms += web_sys::window().unwrap().performance().unwrap().now() - setup_data_timing_start;
+        }
 
         let witness_len = self.witnesses[0].len();
         self.wire_polynomials = Vec::with_capacity(witness_len);
