@@ -1,8 +1,9 @@
 //! Prover-side logic for the QuickSilver polynomial proof.
 
 use crate::{
-    Field, ProofMessage, ProverVope, SubfieldOf,
+    DEFAULT_SSP, Field, ProofMessage, ProverVope, SubfieldOf,
     circuit::{Circuit, CircuitNode},
+    soundness::max_evaluations,
 };
 
 /// Prover for the QuickSilver polynomial proof.
@@ -22,11 +23,29 @@ pub struct Prover<E: Field> {
     /// Length `d_max` (degrees 0 through `d_max - 1`; the highest-degree
     /// coefficient is not sent).
     accumulators: Vec<E>,
+    /// Maximum cumulative number of evaluations permitted under the
+    /// configured SSP.
+    max_evaluations: u64,
+    /// Number of evaluations accumulated so far across all `accumulate`
+    /// calls.
+    eval_count: u64,
 }
 
 impl<E: Field> Prover<E> {
-    /// Create a new prover with the given constraint circuits.
+    /// Create a new prover with the given constraint circuits, enforcing the
+    /// default statistical security parameter of [`DEFAULT_SSP`] bits.
     pub fn new(circuits: Vec<Circuit<E>>) -> Self {
+        Self::with_statistical_security_bits(circuits, DEFAULT_SSP)
+    }
+
+    /// Create a new prover that enforces `ssp` bits of statistical security.
+    ///
+    /// Panics if `ssp < `[`DEFAULT_SSP`].
+    pub fn with_statistical_security_bits(circuits: Vec<Circuit<E>>, ssp: u32) -> Self {
+        assert!(
+            ssp >= DEFAULT_SSP,
+            "ssp must be at least DEFAULT_SSP ({DEFAULT_SSP}); got {ssp}"
+        );
         let d_max = circuits.iter().map(|c| c.degree()).max().unwrap_or(0);
         let layouts: Vec<CircuitLayout> =
             circuits.iter().map(CircuitLayout::from_circuit).collect();
@@ -38,6 +57,8 @@ impl<E: Field> Prover<E> {
             scratch: vec![E::zero(); max_scratch],
             d_max,
             accumulators: vec![E::zero(); d_max],
+            max_evaluations: max_evaluations(E::BIT_SIZE, ssp, d_max),
+            eval_count: 0,
         }
     }
 
@@ -52,11 +73,20 @@ impl<E: Field> Prover<E> {
         evaluations: &[(usize, &[E], &[W])],
         chi: E,
     ) -> Result<(), ProverError> {
+        let new_count = self.eval_count.saturating_add(evaluations.len() as u64);
+        if new_count > self.max_evaluations {
+            return Err(ErrorRepr::SoundnessBudget {
+                max: self.max_evaluations,
+                attempted: new_count,
+            }
+            .into());
+        }
         let mut chi_power = E::one();
         for &(poly_id, macs, values) in evaluations {
             self.evaluate_circuit(poly_id, macs, values, chi_power)?;
             chi_power = chi_power * chi;
         }
+        self.eval_count = new_count;
         Ok(())
     }
 
@@ -237,6 +267,13 @@ impl<E: Field> Prover<E> {
         // d+1 coefficients, minus the highest-degree one (not sent) = d.
         self.d_max
     }
+
+    /// Override the SSP-derived cap on cumulative `accumulate` count.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_max_evaluations(&mut self, n: u64) {
+        self.max_evaluations = n;
+    }
 }
 
 /// Scratch-buffer layout for one circuit.
@@ -291,4 +328,60 @@ enum ErrorRepr {
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "SSP budget exceeded: accumulating this batch would make T = {attempted}, but the configured statistical security parameter permits at most {max} evaluations"
+    )]
+    SoundnessBudget { max: u64, attempted: u64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::circuit::CircuitBuilder;
+    use mpz_fields::gf2_64::Gf2_64;
+
+    fn and_gate_circuit() -> Circuit<Gf2_64> {
+        let mut cb = CircuitBuilder::new();
+        let w0 = cb.var(0);
+        let w1 = cb.var(1);
+        let w2 = cb.var(2);
+        let prod = cb.mul(w0, w1);
+        let out = cb.add(prod, w2);
+        cb.build(out)
+    }
+
+    #[test]
+    fn with_statistical_security_bits_rejects_ssp_below_default() {
+        let result = std::panic::catch_unwind(|| {
+            Prover::<Gf2_64>::with_statistical_security_bits(
+                vec![and_gate_circuit()],
+                DEFAULT_SSP - 1,
+            )
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn accumulate_rejects_batch_past_budget() {
+        let mut p = Prover::<Gf2_64>::new(vec![and_gate_circuit()]);
+        p.set_max_evaluations(1);
+
+        let macs = vec![Gf2_64(0); 3];
+        let values = vec![false; 3];
+        let chi = Gf2_64(1);
+
+        p.accumulate(&[(0, macs.as_slice(), values.as_slice())], chi)
+            .expect("first batch fits in budget");
+
+        let err = p
+            .accumulate(&[(0, macs.as_slice(), values.as_slice())], chi)
+            .expect_err("second batch must exceed budget");
+        assert!(matches!(
+            err.0,
+            ErrorRepr::SoundnessBudget {
+                max: 1,
+                attempted: 2
+            }
+        ));
+    }
 }

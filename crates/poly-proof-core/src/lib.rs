@@ -12,11 +12,30 @@
 //!
 //! - **`W: SubfieldOf<E>`** — the witness value type, a subfield element that
 //!   embeds into `E` (e.g., `bool` for F_2, or `u64` for F_{2^64}).
+//!
+//! ## Soundness budget
+//!
+//! Soundness of the proof rests on Schwartz-Zippel over `E`: for a batch of
+//! `T` evaluations of constraints with maximum degree `d_max`, a cheating
+//! prover succeeds with probability at most `(T + d_max) / |E|`.
+//!
+//! [`prover::Prover`] and [`verifier::Verifier`] therefore cap the cumulative
+//! batch size across all [`accumulate`](prover::Prover::accumulate) calls.
+//! The cap is chosen so that the resulting error stays at most `2⁻ˢˢᵖ`, where
+//! the statistical security parameter (SSP) defaults to [`DEFAULT_SSP`] bits.
+//! Callers can raise the SSP via
+//! [`Prover::with_statistical_security_bits`](prover::Prover::with_statistical_security_bits)
+//! or
+//! [`Verifier::with_statistical_security_bits`](verifier::Verifier::with_statistical_security_bits).
+//!
+//! Once the cap is reached, `accumulate` returns a `SoundnessBudget` error;
+//! callers must either start a fresh session or widen `E`.
 
 pub mod circuit;
 #[cfg(any(test, feature = "fixture"))]
 pub mod fixture;
 pub mod prover;
+pub(crate) mod soundness;
 pub mod verifier;
 
 use std::fmt::Debug;
@@ -26,6 +45,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod subfield;
 pub use subfield::SubfieldOf;
+
+/// Default — and minimum — statistical security parameter (SSP), in bits.
+pub const DEFAULT_SSP: u32 = 40;
 
 // ---------------------------------------------------------------------------
 // Protocol types
