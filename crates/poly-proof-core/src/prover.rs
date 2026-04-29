@@ -225,6 +225,14 @@ impl<E: Field> Prover<E> {
                         }
                     }
                 }
+                // Negate every coefficient of the operand.
+                CircuitNode::Neg(a) => {
+                    let len = out_deg + 1;
+                    let a_off = layout.node_offsets[a];
+                    for k in 0..len {
+                        scratch[offset + k] = -scratch[a_off + k];
+                    }
+                }
                 // Add two coefficient vectors. The lower-degree operand
                 // is degree-shifted to match the higher-degree one.
                 CircuitNode::Add(a, b) => {

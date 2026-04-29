@@ -21,6 +21,8 @@ pub enum CircuitNode<E> {
     Mul(NodeId, NodeId),
     /// Add two sub-expressions. Degree = max(deg(a), deg(b)).
     Add(NodeId, NodeId),
+    /// Negate a sub-expression. Degree = deg(a).
+    Neg(NodeId),
 }
 
 /// An arithmetic circuit representing a constraint polynomial.
@@ -77,6 +79,7 @@ impl<E: Field> Circuit<E> {
                 CircuitNode::Const(c) => c,
                 CircuitNode::Mul(a, b) => node_vals[a].mul(node_vals[b]),
                 CircuitNode::Add(a, b) => node_vals[a].add(node_vals[b]),
+                CircuitNode::Neg(a) => -node_vals[a],
             };
             node_vals.push(val);
         }
@@ -147,6 +150,19 @@ impl<E: Field> CircuitBuilder<E> {
     pub fn add(&mut self, a: NodeId, b: NodeId) -> NodeId {
         let deg = self.node_degrees[a].max(self.node_degrees[b]);
         self.push(CircuitNode::Add(a, b), deg)
+    }
+
+    /// Negate a sub-expression. Degree = deg(a).
+    pub fn neg(&mut self, a: NodeId) -> NodeId {
+        let deg = self.node_degrees[a];
+        self.push(CircuitNode::Neg(a), deg)
+    }
+
+    /// Subtract `b` from `a`. Sugar for `add(a, neg(b))` — works over
+    /// any field characteristic.
+    pub fn sub(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        let neg_b = self.neg(b);
+        self.add(a, neg_b)
     }
 
     /// Freeze the circuit, declaring `output` as the root.
@@ -466,6 +482,39 @@ mod tests {
         assert_eq!(
             circuit.evaluate(&[F17(16), F17(1), F17(1), F17(16)]),
             F17(8),
+        );
+    }
+
+    /// `cb.sub(a, b)` must compute `a − b` honestly over a field where
+    /// `+` and `−` differ — exercises the case the old `cb.add(a, b)`
+    /// shortcut couldn't handle. F17 has characteristic 17, so this is
+    /// a non-char-2 sanity check.
+    #[test]
+    fn test_circuit_evaluate_sub_over_prime_field() {
+        let mut cb = CircuitBuilder::<F17>::new();
+        let a = cb.var(0);
+        let b = cb.var(1);
+        let out = cb.sub(a, b);
+        let circuit = cb.build(out);
+
+        // 5 − 3 = 2.
+        assert_eq!(circuit.evaluate(&[F17(5), F17(3)]), F17(2));
+        // 3 − 5 = −2 ≡ 15 (mod 17).
+        assert_eq!(circuit.evaluate(&[F17(3), F17(5)]), F17(15));
+        // 0 − 0 = 0.
+        assert_eq!(circuit.evaluate(&[F17(0), F17(0)]), F17(0));
+
+        // `cb.add(a, b)` would have given `5 + 3 = 8` for the first case
+        // — confirms `sub` is materially different from `add` here.
+        let mut cb2 = CircuitBuilder::<F17>::new();
+        let a2 = cb2.var(0);
+        let b2 = cb2.var(1);
+        let add_out = cb2.add(a2, b2);
+        let add_circuit = cb2.build(add_out);
+        assert_ne!(
+            circuit.evaluate(&[F17(5), F17(3)]),
+            add_circuit.evaluate(&[F17(5), F17(3)]),
+            "sub and add must give different results over a non-char-2 field"
         );
     }
 }

@@ -164,6 +164,7 @@ impl<E: Field> Verifier<E> {
                     };
                     va + vb
                 }
+                CircuitNode::Neg(a) => -node_vals[a],
             };
             node_vals.push(val);
         }
