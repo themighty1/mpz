@@ -51,7 +51,12 @@ tokio = { workspace = true, features = [
     "macros",
     "rt",
     "rt-multi-thread",
+    "time",
 ] }
+# TEMPORARY (debug repro): pure-mux budget repro needs a real SYN mux.
+# Remove with tests/tmp_mux_budget_ot.rs after pin-down.
+tlsn-mux = { path = "../../../tlsn-utils-syn/mux/mux" }
+tokio-util = { workspace = true, features = ["compat"] }
 
 [[bench]]
 name = "shared"
