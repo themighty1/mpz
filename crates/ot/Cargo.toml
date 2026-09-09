@@ -54,8 +54,9 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 # TEMPORARY (debug repro): pure-mux budget repro needs a real SYN mux.
-# Remove with tests/tmp_mux_budget_ot.rs after pin-down.
-tlsn-mux = { path = "../../../tlsn-utils-syn/mux/mux" }
+# Git dep so the tmp branch builds in CI. Remove with
+# tests/tmp_mux_budget_ot.rs after pin-down.
+tlsn-mux = { git = "https://github.com/themighty1/tlsn-utils", branch = "feat/mux-syn-opener" }
 tokio-util = { workspace = true, features = ["compat"] }
 
 [[bench]]
